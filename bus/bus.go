@@ -2,29 +2,27 @@
 package bus
 
 import (
-	"strconv"
 	"sync"
 )
 
 // -----------------------------------------------------------------------------
-// Topics
+// Tokens + Topics
 // -----------------------------------------------------------------------------
 
-// Topic is a sequence of tokens, eg. {"sensor", "temp", "1"}. We should ensure
-// all strings used in this are interned as constants by the services
-type Topic []string
-
-// NumStrings holds precomputed string representations of small integers. There
-// may be a better way of doing this
-var NumStrings []string
-
-func init() {
-	const max = 100 // tunable
-	NumStrings = make([]string, max)
-	for i := 0; i < max; i++ {
-		NumStrings[i] = strconv.Itoa(i)
-	}
+// Token is a single element in a topic path.
+// It can be either a string or an integer.
+type Token struct {
+	kind byte // 0 = string, 1 = int
+	sval string
+	ival int
 }
+
+// Constructors
+func S(s string) Token { return Token{kind: 0, sval: s} }
+func I(i int) Token    { return Token{kind: 1, ival: i} }
+
+// Topic is a sequence of tokens.
+type Topic []Token
 
 // -----------------------------------------------------------------------------
 // Message
@@ -56,7 +54,7 @@ func (s *Subscription) Unsubscribe()             { s.bus.unsubscribe(s.topic, s)
 // -----------------------------------------------------------------------------
 
 type node struct {
-	children map[string]*node
+	children map[Token]*node
 	subs     []*Subscription
 	retained *Message
 }
@@ -88,14 +86,14 @@ func (b *Bus) Subscribe(topic Topic) *Subscription {
 	defer b.mu.Unlock()
 
 	n := b.root
-	for _, t := range topic {
+	for _, tok := range topic {
 		if n.children == nil {
-			n.children = make(map[string]*node)
+			n.children = make(map[Token]*node)
 		}
-		child, ok := n.children[t]
+		child, ok := n.children[tok]
 		if !ok {
 			child = &node{}
-			n.children[t] = child
+			n.children[tok] = child
 		}
 		n = child
 	}
@@ -131,7 +129,7 @@ func (b *Bus) Publish(msg *Message) {
 				return
 			}
 			// We need to create the path for a retained message.
-			n.children = make(map[string]*node)
+			n.children = make(map[Token]*node)
 		}
 
 		child, exists := n.children[token]
