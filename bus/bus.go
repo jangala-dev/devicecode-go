@@ -43,11 +43,12 @@ type Subscription struct {
 	topic Topic
 	ch    chan *Message
 	bus   *Bus
+	conn  *Connection // owning connection
 }
 
 func (s *Subscription) Topic() Topic             { return s.topic }
 func (s *Subscription) Channel() <-chan *Message { return s.ch }
-func (s *Subscription) Unsubscribe()             { s.bus.unsubscribe(s.topic, s) }
+func (s *Subscription) Unsubscribe()             { s.conn.Unsubscribe(s) }
 
 // -----------------------------------------------------------------------------
 // Trie node
@@ -80,8 +81,8 @@ func NewBus(queueLen int) *Bus {
 	}
 }
 
-// Subscribe registers a subscription to a topic.
-func (b *Bus) Subscribe(topic Topic) *Subscription {
+// addSubscription inserts a subscription into the trie.
+func (b *Bus) addSubscription(topic Topic, sub *Subscription) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -98,11 +99,6 @@ func (b *Bus) Subscribe(topic Topic) *Subscription {
 		n = child
 	}
 
-	sub := &Subscription{
-		topic: topic,
-		ch:    make(chan *Message, b.qLen),
-		bus:   b,
-	}
 	n.subs = append(n.subs, sub)
 
 	// Deliver retained message if present.
@@ -112,7 +108,6 @@ func (b *Bus) Subscribe(topic Topic) *Subscription {
 		default:
 		}
 	}
-	return sub
 }
 
 // Publish delivers a message to all subscribers of its topic.
@@ -121,24 +116,18 @@ func (b *Bus) Publish(msg *Message) {
 	defer b.mu.Unlock()
 
 	n := b.root
-	// Walk the trie for the topic. Only create nodes if we MUST (for retained messages).
 	for _, token := range msg.Topic {
 		if n.children == nil {
-			// No children at this level. Can we short-circuit?
-			if !msg.Retained { // we can exit early.
+			if !msg.Retained {
 				return
 			}
-			// We need to create the path for a retained message.
 			n.children = make(map[Token]*node)
 		}
-
 		child, exists := n.children[token]
 		if !exists {
-			// Node for this token doesn't exist. Can we short-circuit?
-			if !msg.Retained { // we can exit early.
+			if !msg.Retained {
 				return
 			}
-			// We need to create the node for a retained message.
 			child = &node{}
 			n.children[token] = child
 		}
@@ -149,7 +138,8 @@ func (b *Bus) Publish(msg *Message) {
 	for _, sub := range n.subs {
 		select {
 		case sub.ch <- msg:
-		default: // drop oldest message if subscriber queue is full
+		default:
+			// drop oldest if queue full
 			<-sub.ch
 			sub.ch <- msg
 		}
@@ -202,5 +192,71 @@ func (b *Bus) unsubscribe(topic Topic, sub *Subscription) {
 		} else {
 			break
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Connection
+// -----------------------------------------------------------------------------
+
+type Connection struct {
+	bus  *Bus
+	subs []*Subscription
+	mu   sync.Mutex
+	id   string // placeholder for future identity/auth
+}
+
+// NewConnection creates a new connection bound to this bus.
+func (b *Bus) NewConnection(id string) *Connection {
+	return &Connection{
+		bus: b,
+		id:  id,
+	}
+}
+
+// Publish sends a message via the bus.
+func (c *Connection) Publish(msg *Message) {
+	c.bus.Publish(msg)
+}
+
+// Subscribe registers a subscription owned by this connection.
+func (c *Connection) Subscribe(topic Topic) *Subscription {
+	sub := &Subscription{
+		topic: topic,
+		ch:    make(chan *Message, c.bus.qLen),
+		bus:   c.bus,
+		conn:  c,
+	}
+	c.bus.addSubscription(topic, sub)
+	c.mu.Lock()
+	c.subs = append(c.subs, sub)
+	c.mu.Unlock()
+	return sub
+}
+
+// Unsubscribe removes a subscription owned by this connection.
+func (c *Connection) Unsubscribe(sub *Subscription) {
+	c.bus.unsubscribe(sub.topic, sub)
+	c.mu.Lock()
+	for i, s := range c.subs {
+		if s == sub {
+			c.subs = append(c.subs[:i], c.subs[i+1:]...)
+			break
+		}
+	}
+	c.mu.Unlock()
+	close(sub.ch)
+}
+
+// Disconnect closes all subscriptions and clears them.
+func (c *Connection) Disconnect() {
+	c.mu.Lock()
+	subs := c.subs
+	c.subs = nil
+	c.mu.Unlock()
+
+	for _, sub := range subs {
+		c.bus.unsubscribe(sub.topic, sub)
+		close(sub.ch)
 	}
 }

@@ -13,14 +13,15 @@ const (
 
 func TestBasicPubSub(t *testing.T) {
 	b := NewBus(4)
+	conn := b.NewConnection("test")
 
-	sub := b.Subscribe(Topic{S(TopicConfig), S(TopicGeo)})
+	sub := conn.Subscribe(Topic{S(TopicConfig), S(TopicGeo)})
 
 	msg := &Message{
 		Topic:   Topic{S(TopicConfig), S(TopicGeo)},
 		Payload: "hello",
 	}
-	b.Publish(msg)
+	conn.Publish(msg)
 
 	select {
 	case got := <-sub.Channel():
@@ -34,15 +35,16 @@ func TestBasicPubSub(t *testing.T) {
 
 func TestRetainedMessage(t *testing.T) {
 	b := NewBus(2)
+	conn := b.NewConnection("test")
 
 	msg := &Message{
 		Topic:    Topic{S(TopicConfig), S(TopicGeo)},
 		Payload:  "persist",
 		Retained: true,
 	}
-	b.Publish(msg)
+	conn.Publish(msg)
 
-	sub := b.Subscribe(Topic{S(TopicConfig), S(TopicGeo)})
+	sub := conn.Subscribe(Topic{S(TopicConfig), S(TopicGeo)})
 
 	select {
 	case got := <-sub.Channel():
