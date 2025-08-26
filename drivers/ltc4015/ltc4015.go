@@ -1,5 +1,15 @@
-// Package ltc4015 provides a TinyGo driver for the LTC4015
-// multi-chemistry battery charger controller with I2C interface.
+// Package ltc4015 provides a minimal TinyGo driver for the LTC4015
+// multi-chemistry synchronous buck battery charger.
+//
+// Design notes (datasheet references):
+// • I2C/SMBus, 400kHz, read/write word protocol; data-low then data-high
+//   (see “I2C TIMING DIAGRAM” and SMBus READ/WRITE WORD protocol). :contentReference[oaicite:0]{index=0}
+// • Default 7-bit address = 0b1101000 (from “ADDRESS I2C Address 1101_000[R/W]b”). :contentReference[oaicite:1]{index=1}
+// • Telemetry register map & scaling (VBAT, VIN, VSYS, IBAT, IIN, DIE_TEMP, NTC_RATIO, BSR). :contentReference[oaicite:2]{index=2}
+// • System status, charger/charge-status alerts, and clear-on-write-0 behaviour. :contentReference[oaicite:3]{index=3}
+// • Limit alert enables / limits and Coulomb counter controls. :contentReference[oaicite:4]{index=4}
+// • Coulomb counter qLSB formula and QCOUNT registers. :contentReference[oaicite:5]{index=5}
+
 package ltc4015
 
 import (
@@ -8,397 +18,342 @@ import (
 	"tinygo.org/x/drivers"
 )
 
-var (
-	ErrTx    = errors.New("i2c transaction failed")
-	ErrAlert = errors.New("alert active")
+// Chemistry selects scaling where chemistries differ in the datasheet.
+type Chemistry uint8
+
+const (
+	ChemUnknown  Chemistry = iota
+	ChemLithium            // Li-Ion / LiFePO4 use VBAT per-cell factor 192.264µV/LSB.
+	ChemLeadAcid           // Lead-acid uses 128.176µV/LSB per cell.
 )
 
-// Device represents a connection to an LTC4015 device over I2C.
-type Device struct {
-	bus     drivers.I2C
+// Config holds driver configuration known at compile-/bring-up time.
+type Config struct {
+	// If zero, AddressDefault is used.
 	Address uint16
 
-	// Measurement scaling configuration
-	rsnsb   int64 // battery sense resistor in µΩ
-	rsnsi   int64 // input sense resistor in µΩ
-	lithium bool
-	cells   int
+	// Sense resistors in micro-ohms for battery (RSNSB) and input (RSNSI).
+	// Used for integer current scaling (no floats).
+	RSNSB_uOhm uint32
+	RSNSI_uOhm uint32
 
-	// External resistor values for scaling (in mΩ for divider ratios)
-	rntc  int64
-	rbsrt int64
-	rbsrb int64
-	rvin1 int64
-	rvin2 int64
+	// Cell count. If 0, read from CHEM_CELLS (bits 3:0).
+	Cells uint8
 
-	// Reusable buffers
-	wbuf [3]byte
-	rbuf [2]byte
-	abuf [1]byte
+	// Chemistry hint; if ChemUnknown, a lithium-style scaling is assumed unless explicitly set by caller.
+	// (You can also infer behaviour from board-level configuration if desired.)
+	Chem Chemistry
+
+	// Coulomb counter options (see qLSB formula and registers).
+	QCountPrescale uint16 // if 0, leave hardware default
 }
 
-// Config contains user-defined parameters for the LTC4015 device.
-type Config struct {
-	RSNSB   float32 // Battery sense resistor in ohms
-	RSNSI   float32 // Input sense resistor in ohms
-	Lithium bool    // true for lithium-ion, false for lead-acid
-	Cells   int     // Cell count (lead-acid only)
+// Device is the LTC4015 handle.
+type Device struct {
+	i2c   drivers.I2C
+	addr  uint16
+	cells uint8
+	chem  Chemistry
 
-	RNTC  float32 // Thermistor reference resistor in ohms
-	RBSRT float32 // BSR divider top resistor in ohms
-	RBSRB float32 // BSR divider bottom resistor in ohms
-	RVIN1 float32 // VIN divider top resistor in ohms
-	RVIN2 float32 // VIN divider bottom resistor in ohms
+	rsnsB_uOhm uint32
+	rsnsI_uOhm uint32
 
-	Address  uint16 // I2C address (defaults to 0x68)
-	Features uint16 // Initial CONFIG_BITS mask
+	// Tx/Rx buffers to avoid per-call allocations (slices made from these).
+	w [3]byte
+	r [2]byte
 }
 
-// DefaultConfig provides safe defaults based on a typical demo board.
-var DefaultConfig = Config{
-	RSNSB:   0.01,
-	RSNSI:   0.01,
-	Lithium: true,
-	Cells:   1,
-
-	RNTC:  10000.0,
-	RBSRT: 100000.0,
-	RBSRB: 10000.0,
-	RVIN1: 100000.0,
-	RVIN2: 10000.0,
-
-	Address:  DeviceAddress,
-	Features: 0,
-}
-
-// New returns a new Device instance.
-func New(bus drivers.I2C) Device {
-	return Device{
-		bus:     bus,
-		Address: DeviceAddress,
+// New returns a driver instance. Call Configure to finalise setup.
+func New(i2c drivers.I2C, cfg Config) *Device {
+	addr := cfg.Address
+	if addr == 0 {
+		addr = AddressDefault
+	}
+	chem := cfg.Chem
+	if chem == ChemUnknown {
+		// Default to lithium-style scaling unless caller sets lead-acid explicitly.
+		chem = ChemLithium
+	}
+	return &Device{
+		i2c:        i2c,
+		addr:       addr,
+		cells:      cfg.Cells,
+		chem:       chem,
+		rsnsB_uOhm: cfg.RSNSB_uOhm,
+		rsnsI_uOhm: cfg.RSNSI_uOhm,
 	}
 }
 
-// Configure applies the provided configuration.
+// Configure finalises initial settings, optionally reads cell count,
+// and configures the Coulomb counter if requested.
 func (d *Device) Configure(cfg Config) error {
-	d.rsnsb = int64(cfg.RSNSB * 1e6) // Ω → µΩ
-	d.rsnsi = int64(cfg.RSNSI * 1e6)
-	d.lithium = cfg.Lithium
-	d.cells = cfg.Cells
-
-	d.rntc = int64(cfg.RNTC * 1000)   // Ω → mΩ
-	d.rbsrt = int64(cfg.RBSRT * 1000) // Ω → mΩ
-	d.rbsrb = int64(cfg.RBSRB * 1000)
-	d.rvin1 = int64(cfg.RVIN1 * 1000)
-	d.rvin2 = int64(cfg.RVIN2 * 1000)
-
-	if cfg.Address != 0 {
-		d.Address = cfg.Address
+	if cfg.Cells != 0 {
+		d.cells = cfg.Cells
+	} else {
+		// Read CHEM_CELLS to get pins-based cell count (bits 3:0). :contentReference[oaicite:10]{index=10}
+		v, err := d.readWord(regChemCells)
+		if err == nil {
+			d.cells = uint8(v & 0x000F)
+		}
 	}
-	if cfg.Features != 0 {
-		if err := d.writeRegister(REG_CONFIG_BITS, cfg.Features); err != nil {
+	if cfg.Chem != ChemUnknown {
+		d.chem = cfg.Chem
+	}
+	if cfg.RSNSB_uOhm != 0 {
+		d.rsnsB_uOhm = cfg.RSNSB_uOhm
+	}
+	if cfg.RSNSI_uOhm != 0 {
+		d.rsnsI_uOhm = cfg.RSNSI_uOhm
+	}
+	// Coulomb counter prescale and enable (CONFIG_BITS bit2 en_qcount). :contentReference[oaicite:11]{index=11}
+	if cfg.QCountPrescale != 0 {
+		if err := d.writeWord(regQCountPrescale, cfg.QCountPrescale); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *Device) readRegisterSigned(reg byte) (int16, error) {
-	u, err := d.readRegister(reg)
-	return int16(u), err
+// ConfigBits returns the raw CONFIG_BITS register value.
+func (d *Device) ConfigBits() (uint16, error) {
+	return d.readWord(regConfigBits)
 }
 
-// ------------------
-// I2C (internal)
-// ------------------
+// SetConfigBits writes the raw CONFIG_BITS register.
+func (d *Device) SetConfigBits(v uint16) error {
+	return d.writeWord(regConfigBits, v)
+}
 
-func (d *Device) readRegister(reg byte) (uint16, error) {
-	d.wbuf[0] = reg
-	err := d.bus.Tx(d.Address, d.wbuf[:1], d.rbuf[:])
+// helper to set/clear a single bit in CONFIG_BITS
+func (d *Device) setConfigBit(bit int, enable bool) error {
+	v, err := d.readWord(regConfigBits)
 	if err != nil {
-		return 0, ErrTx
+		return err
 	}
-	return uint16(d.rbuf[1])<<8 | uint16(d.rbuf[0]), nil
+	if enable {
+		v |= 1 << bit
+	} else {
+		v &^= 1 << bit
+	}
+	return d.writeWord(regConfigBits, v)
 }
 
-func (d *Device) writeRegister(reg byte, value uint16) error {
-	d.wbuf[0] = reg
-	d.wbuf[1] = byte(value & 0xFF)
-	d.wbuf[2] = byte((value >> 8) & 0xFF)
-	return d.bus.Tx(d.Address, d.wbuf[:3], nil)
+// SuspendCharger enables or disables the suspend_charger bit.
+func (d *Device) SuspendCharger(enable bool) error {
+	return d.setConfigBit(cfgSuspendCharger, enable)
 }
 
-func (d *Device) isBitSet(reg byte, mask uint16) (bool, error) {
-	val, err := d.readRegister(reg)
+// RunBSR triggers a battery series resistance measurement.
+// The device clears the bit itself once done.
+func (d *Device) RunBSR() error {
+	return d.setConfigBit(cfgRunBSR, true)
+}
+
+// EnableQCount enables or disables the Coulomb counter.
+func (d *Device) EnableQCount(enable bool) error {
+	return d.setConfigBit(cfgEnableQCount, enable)
+}
+
+// ForceMeasSystemOn keeps measurement system active without VIN.
+func (d *Device) ForceMeasSystemOn(enable bool) error {
+	return d.setConfigBit(cfgForceMeasSysOn, enable)
+}
+
+// EnableMPPTI2C enables or disables MPPT control via I2C.
+func (d *Device) EnableMPPTI2C(enable bool) error {
+	return d.setConfigBit(cfgMPPTEnableI2C, enable)
+}
+
+// ---------- Telemetry (integer units) ----------
+
+// BatteryMilliVPerCell returns VBAT per-cell in millivolts (signed).
+// Li chemistries: 192.264µV/LSB per cell; Lead-acid: 128.176µV/LSB per cell. :contentReference[oaicite:12]{index=12}
+func (d *Device) BatteryMilliVPerCell() (int32, error) {
+	raw, err := d.readS16(regVBAT)
+	if err != nil {
+		return 0, err
+	}
+	// Scale to microvolts per cell using integers (avoid float):
+	// Li: 192.264µV -> 192264 nV per LSB; Lead: 128176 nV per LSB.
+	var nVperLSB int64 = 192264
+	if d.chem == ChemLeadAcid {
+		nVperLSB = 128176
+	}
+	uV := (int64(raw) * nVperLSB) / 1000 // convert nV->uV
+	// millivolts:
+	return int32(uV / 1000), nil
+}
+
+// BatteryMilliVPack returns pack voltage (per-cell * cells) in millivolts.
+func (d *Device) BatteryMilliVPack() (int32, error) {
+	perCell, err := d.BatteryMilliVPerCell()
+	if err != nil {
+		return 0, err
+	}
+	if d.cells == 0 {
+		// Fallback if cell pins not read/available.
+		return perCell, nil
+	}
+	return perCell * int32(d.cells), nil
+}
+
+// VinMilliV returns VIN in millivolts. 1.648mV/LSB. :contentReference[oaicite:13]{index=13}
+func (d *Device) VinMilliV() (int32, error) {
+	raw, err := d.readS16(regVIN)
+	if err != nil {
+		return 0, err
+	}
+	// 1.648 mV = 1648 µV per LSB.
+	uV := int64(raw) * 1648
+	return int32(uV / 1000), nil
+}
+
+// VsysMilliV returns VSYS in millivolts. 1.648mV/LSB. :contentReference[oaicite:14]{index=14}
+func (d *Device) VsysMilliV() (int32, error) {
+	raw, err := d.readS16(regVSYS)
+	if err != nil {
+		return 0, err
+	}
+	uV := int64(raw) * 1648
+	return int32(uV / 1000), nil
+}
+
+// IbatMilliA returns battery current in milliamps (signed).
+// IBAT LSB is 1.46487µV across RSNSB (two's complement). I[mA]= raw*1.46487µV / RSNSB. :contentReference[oaicite:15]{index=15}
+func (d *Device) IbatMilliA() (int32, error) {
+	if d.rsnsB_uOhm == 0 {
+		return 0, errors.New("RSNSB_uOhm not set")
+	}
+	raw, err := d.readS16(regIBAT)
+	if err != nil {
+		return 0, err
+	}
+	// Use picovolts to keep precision: 1.46487µV = 1,464,870 pV per LSB.
+	// I[uA] = raw * 1,464,870 / RSNSB_uOhm  => I[mA] = I[uA]/1000
+	uA := (int64(raw) * 1464870) / int64(d.rsnsB_uOhm)
+	return int32(uA / 1000), nil
+}
+
+// IinMilliA returns input current in milliamps (signed).
+// IIN LSB is 1.46487µV across RSNSI. :contentReference[oaicite:16]{index=16}
+func (d *Device) IinMilliA() (int32, error) {
+	if d.rsnsI_uOhm == 0 {
+		return 0, errors.New("RSNSI_uOhm not set")
+	}
+	raw, err := d.readS16(regIIN)
+	if err != nil {
+		return 0, err
+	}
+	uA := (int64(raw) * 1464870) / int64(d.rsnsI_uOhm)
+	return int32(uA / 1000), nil
+}
+
+// DieMilliC returns die temperature in milli-°C.
+// T[°C] = (DIE_TEMP – 12010)/45.6  ⇒ milli-°C = (raw-12010)*10000/456. :contentReference[oaicite:17]{index=17}
+func (d *Device) DieMilliC() (int32, error) {
+	raw, err := d.readS16(regDieTemp)
+	if err != nil {
+		return 0, err
+	}
+	mC := (int64(raw) - 12010) * 10000 / 456
+	return int32(mC), nil
+}
+
+// BSRMicroOhmPerCell returns per-cell battery series resistance in micro-ohms.
+// Lithium: Ω/cell = (BSR/500)*RSNSB; Lead-acid: (BSR/750)*RSNSB. :contentReference[oaicite:18]{index=18}
+func (d *Device) BSRMicroOhmPerCell() (uint32, error) {
+	if d.rsnsB_uOhm == 0 {
+		return 0, errors.New("RSNSB_uOhm not set")
+	}
+	raw, err := d.readWord(regBSR)
+	if err != nil {
+		return 0, err
+	}
+	div := int64(500)
+	if d.chem == ChemLeadAcid {
+		div = 750
+	}
+	uOhm := (int64(raw) * int64(d.rsnsB_uOhm)) / div
+	if uOhm < 0 {
+		uOhm = 0
+	}
+	return uint32(uOhm), nil
+}
+
+// MeasSystemValid reports whether telemetry is ready (MEAS_SYS_VALID bit0). :contentReference[oaicite:19]{index=19}
+func (d *Device) MeasSystemValid() (bool, error) {
+	v, err := d.readWord(regMeasSysValid)
 	if err != nil {
 		return false, err
 	}
-	return val&mask != 0, nil
+	return (v & 0x0001) != 0, nil
 }
 
-// ------------------
-// Alerts
-// ------------------
+// SystemStatus returns the raw SYSTEM_STATUS register (0x39). :contentReference[oaicite:20]{index=20}
+func (d *Device) SystemStatus() (uint16, error) { return d.readWord(regSystemStatus) }
 
-func (d *Device) AlertMeasSysValid() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_MEAS_SYS_VALID)
-}
-func (d *Device) AlertQCountLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_QCOUNT_LOW)
-}
-func (d *Device) AlertQCountHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_QCOUNT_HIGH)
-}
-func (d *Device) AlertVBATLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VBAT_LOW)
-}
-func (d *Device) AlertVBATHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VBAT_HIGH)
-}
-func (d *Device) AlertVINLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VIN_LOW)
-}
-func (d *Device) AlertVINHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VIN_HIGH)
-}
-func (d *Device) AlertVSYSLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VSYS_LOW)
-}
-func (d *Device) AlertVSYSHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_VSYS_HIGH)
-}
-func (d *Device) AlertIINHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_IIN_HIGH)
-}
-func (d *Device) AlertIBATLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_IBAT_LOW)
-}
-func (d *Device) AlertTempHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_TEMP_HIGH)
-}
-func (d *Device) AlertBSRHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_BSR_HIGH)
-}
-func (d *Device) AlertNTCRatioHigh() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_NTC_RATIO_HIGH)
-}
-func (d *Device) AlertNTCRatioLow() (bool, error) {
-	return d.isBitSet(REG_LIMIT_ALERT_STATUS, ALERT_NTC_RATIO_LOW)
+// ---------- Alerts (enable, read, clear) ----------
+
+// EnableLimitAlerts writes EN_LIMIT_ALERTS (0x0D). Set bits per datasheet table. :contentReference[oaicite:21]{index=21}
+func (d *Device) EnableLimitAlerts(mask uint16) error { return d.writeWord(regEnLimitAlerts, mask) }
+
+// EnableChargerStateAlerts writes EN_CHARGER_STATE_ALERTS (0x0E). :contentReference[oaicite:22]{index=22}
+func (d *Device) EnableChargerStateAlerts(mask uint16) error {
+	return d.writeWord(regEnChargerStAlerts, mask)
 }
 
-// ------------------
-// Charger States (live, REG_CHARGER_STATE = 0x34)
-// ------------------
-
-func (d *Device) StateEqualize() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_EQUALIZE)
-}
-func (d *Device) StateAbsorb() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_ABSORB)
-}
-func (d *Device) StateSuspend() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_SUSPEND)
-}
-func (d *Device) StatePrecharge() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_PRECHARGE)
-}
-func (d *Device) StateCCCV() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_CC_CV)
-}
-func (d *Device) StateNTCPause() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_NTC_PAUSE)
-}
-func (d *Device) StateTimerTerm() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_TIMER_TERM)
-}
-func (d *Device) StateCOverXTerm() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_C_OVER_X_TERM)
-}
-func (d *Device) StateMaxChargeFault() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_MAX_CHARGE_FAULT)
-}
-func (d *Device) StateBatteryMissing() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_BAT_MISSING)
-}
-func (d *Device) StateBatteryShort() (bool, error) {
-	return d.isBitSet(REG_CHARGER_STATE, STATE_BAT_SHORT)
+// EnableChargeStatusAlerts writes EN_CHARGE_STATUS_ALERTS (0x0F). :contentReference[oaicite:23]{index=23}
+func (d *Device) EnableChargeStatusAlerts(mask uint16) error {
+	return d.writeWord(regEnChargeStAlerts, mask)
 }
 
-// ------------------
-// Charger Status (live, REG_CHARGE_STATUS = 0x35)
-// ------------------
+// Read/Clear R/Clear alert registers. Writing 0 clears asserted bits. :contentReference[oaicite:24]{index=24}
+func (d *Device) ReadLimitAlerts() (uint16, error)        { return d.readWord(regLimitAlerts) }
+func (d *Device) ReadChargerStateAlerts() (uint16, error) { return d.readWord(regChargerStateAlert) }
+func (d *Device) ReadChargeStatusAlerts() (uint16, error) { return d.readWord(regChargeStatAlerts) }
 
-func (d *Device) StatusUVCLActive() (bool, error) {
-	return d.isBitSet(REG_CHARGE_STATUS, STATUS_UVCL_ACTIVE)
-}
-func (d *Device) StatusIINLimit() (bool, error) {
-	return d.isBitSet(REG_CHARGE_STATUS, STATUS_IIN_LIMIT)
-}
-func (d *Device) StatusCCActive() (bool, error) {
-	return d.isBitSet(REG_CHARGE_STATUS, STATUS_CC_ACTIVE)
-}
-func (d *Device) StatusCVActive() (bool, error) {
-	return d.isBitSet(REG_CHARGE_STATUS, STATUS_CV_ACTIVE)
-}
+func (d *Device) ClearLimitAlerts() error        { return d.writeWord(regLimitAlerts, 0x0000) }
+func (d *Device) ClearChargerStateAlerts() error { return d.writeWord(regChargerStateAlert, 0x0000) }
+func (d *Device) ClearChargeStatusAlerts() error { return d.writeWord(regChargeStatAlerts, 0x0000) }
 
-// ------------------
-// System Status
-// ------------------
+// ---------- Coulomb counter ----------
 
-func (d *Device) SysChargerEnabled() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_CHARGER_ENABLED)
-}
-func (d *Device) SysMPPTEnabled() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_MPPT_EN_PIN)
-}
-func (d *Device) SysEqualizeRequested() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_EQUALIZE_REQUESTED)
-}
-func (d *Device) SysDRVCCGood() (bool, error) { return d.isBitSet(REG_SYSTEM_STATUS, SYS_DRVCC_GOOD) }
-func (d *Device) SysCellCountError() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_CELL_COUNT_ERROR)
-}
-func (d *Device) SysOkToCharge() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_OK_TO_CHARGE)
-}
-func (d *Device) SysNoRT() (bool, error) { return d.isBitSet(REG_SYSTEM_STATUS, SYS_NO_RT) }
-func (d *Device) SysThermalShutdown() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_THERMAL_SHUTDOWN)
-}
-func (d *Device) SysVINOVLO() (bool, error) { return d.isBitSet(REG_SYSTEM_STATUS, SYS_VIN_OVLO) }
-func (d *Device) SysVINGreaterVBAT() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_VIN_GT_VBAT)
-}
-func (d *Device) SysINTVCCGT4V3() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_INTVCC_GT_4V3)
-}
-func (d *Device) SysINTVCCGT2V8() (bool, error) {
-	return d.isBitSet(REG_SYSTEM_STATUS, SYS_INTVCC_GT_2V8)
+// SetQCount sets the QCOUNT accumulator (0x13). :contentReference[oaicite:25]{index=25}
+func (d *Device) SetQCount(v uint16) error { return d.writeWord(regQCount, v) }
+
+// QCount reads the QCOUNT accumulator (0x13). :contentReference[oaicite:26]{index=26}
+func (d *Device) QCount() (uint16, error) { return d.readWord(regQCount) }
+
+// SetQCountLimits sets QCOUNT_LO/H I alert limits (0x10/0x11). :contentReference[oaicite:27]{index=27}
+func (d *Device) SetQCountLimits(lo, hi uint16) error {
+	if err := d.writeWord(regQCountLoLimit, lo); err != nil {
+		return err
+	}
+	return d.writeWord(regQCountHiLimit, hi)
 }
 
-// ------------------
-// Engineering Values (fixed-point arithmetic)
-// ------------------
+// SetQCountPrescale sets QCOUNT_PRESCALE_FACTOR (0x12). :contentReference[oaicite:28]{index=28}
+func (d *Device) SetQCountPrescale(p uint16) error { return d.writeWord(regQCountPrescale, p) }
 
-// ReadVBAT returns the battery voltage in millivolts.
-func (d *Device) ReadVBAT() (int32, error) {
-	u, err := d.readRegister(REG_VBAT)
-	if err != nil {
+// ---------- Low-level SMBus read/write word (little-endian: LOW then HIGH) ----------
+
+func (d *Device) readWord(reg byte) (uint16, error) {
+	d.w[0] = reg
+	if err := d.i2c.Tx(d.addr, d.w[:1], d.r[:2]); err != nil {
 		return 0, err
 	}
-	if d.cells < MIN_CELLS {
-		d.cells = MIN_CELLS
-	}
-	lsb := int64(LSB_VBAT_LI_uV)
-	if !d.lithium {
-		lsb = int64(LSB_VBAT_LA_uV)
-	}
-	uV := int64(u) * lsb * int64(d.cells)
-	return int32(uV / 1_000_000), nil
+	// low then high per SMBus READ WORD. :contentReference[oaicite:29]{index=29}
+	return uint16(d.r[0]) | uint16(d.r[1])<<8, nil
 }
 
-// ReadVIN returns the input voltage in millivolts.
-func (d *Device) ReadVIN() (int32, error) {
-	val, err := d.readRegister(REG_VIN)
-	if err != nil {
-		return 0, err
-	}
-	uV := int64(val) * LSB_VIN_uV
-	return int32(uV / 1000), nil
+func (d *Device) readS16(reg byte) (int16, error) {
+	u, err := d.readWord(reg)
+	return int16(u), err
 }
 
-// ReadVSYS returns the system voltage in millivolts.
-func (d *Device) ReadVSYS() (int32, error) {
-	val, err := d.readRegister(REG_VSYS)
-	if err != nil {
-		return 0, err
-	}
-	uV := int64(val) * LSB_VSYS_uV
-	return int32(uV / 1000), nil
-}
-
-// ReadIBAT returns the battery current in milliamps.
-func (d *Device) ReadIBAT() (int32, error) {
-	raw, err := d.readRegisterSigned(REG_IBAT)
-	if err != nil {
-		return 0, err
-	}
-	if d.rsnsb == 0 {
-		return 0, ErrTx
-	}
-	// µA = raw * 1,464,870 / RSNSB(µΩ)
-	uA := int64(raw) * LSB_CURR_nA * 1000 / d.rsnsb
-	return int32(uA / 1_000), nil
-}
-
-// ReadIIN returns the input current in milliamps.
-func (d *Device) ReadIIN() (int32, error) {
-	raw, err := d.readRegisterSigned(REG_IIN)
-	if err != nil {
-		return 0, err
-	}
-	if d.rsnsi == 0 {
-		return 0, ErrTx
-	}
-	uA := int64(raw) * LSB_CURR_nA * 1000 / d.rsnsi
-	return int32(uA / 1_000), nil
-}
-
-// ReadDieTemp returns die temperature in tenths of °C (×0.1 °C).
-func (d *Device) ReadDieTemp() (int32, error) {
-	val, err := d.readRegister(REG_DIETEMP)
-	if err != nil {
-		return 0, err
-	}
-	// tenths = 10*(val - OFFSET)/45.6  → integer-safe form: (val - OFFSET)*100/456
-	tenths := (int64(val) - TEMP_OFFSET) * TEMP_SCALE_FACTOR / TEMP_SCALE_X10
-	return int32(tenths), nil
-}
-
-// ReadNTCRatio returns the NTC ratio as a percentage (0–100).
-func (d *Device) ReadNTCRatio() (int32, error) {
-	u, err := d.readRegister(REG_NTC_RATIO)
-	if err != nil {
-		return 0, err
-	}
-	return int32(int64(u) * NTC_RATIO_SCALE_PCT / NTC_RATIO_DEN), nil
-}
-
-// ReadBSRResistance returns battery series resistance in micro-ohms (µΩ).
-func (d *Device) ReadBSRResistance() (int32, error) {
-	val, err := d.readRegister(REG_BSR)
-	if err != nil {
-		return 0, err
-	}
-	if d.cells < 1 {
-		d.cells = 1
-	}
-	den := int64(BSR_DEN_LI)
-	if !d.lithium {
-		den = BSR_DEN_LA
-	}
-	// per-cell Ω = (val/den)*RSNSB; return total µΩ
-	μΩperCell := int64(val) * d.rsnsb / den
-	total := μΩperCell * int64(d.cells)
-	return int32(total), nil
-}
-
-// ReadCoulombCount returns accumulated charge in mAh.
-func (d *Device) ReadCoulombCount() (int32, error) {
-	qc, err := d.readRegister(REG_QCOUNT)
-	if err != nil {
-		return 0, err
-	}
-	ps, err := d.readRegister(REG_QCOUNT_PRESCALE)
-	if err != nil {
-		return 0, err
-	}
-	if d.rsnsb == 0 {
-		return 0, ErrTx
-	}
-	// mAh = QCOUNT * PRESCALE * 1e9 / (8333.33*3600 * RSNSB(µΩ))
-	// 8333.33*3600 ≈ 29,999,988 (per datasheet 8333.33)
-	num := int64(qc) * int64(ps) * QCOUNT_NUM_SCALE
-	den := int64(d.rsnsb) * QCOUNT_DEN_CONST
-	return int32(num / den), nil
+func (d *Device) writeWord(reg byte, val uint16) error {
+	d.w[0] = reg
+	d.w[1] = byte(val & 0xFF)        // low byte
+	d.w[2] = byte((val >> 8) & 0xFF) // high byte
+	return d.i2c.Tx(d.addr, d.w[:3], nil)
 }

@@ -10,70 +10,90 @@ import (
 func main() {
 	time.Sleep(2 * time.Second)
 	machine.Serial.Configure(machine.UARTConfig{})
+
 	println("LTC4015 Pico test starting...")
 
-	i2c := machine.I2C0
-	err := i2c.Configure(machine.I2CConfig{
+	// Configure I2C0 (Pico default).
+	machine.I2C0.Configure(machine.I2CConfig{
+		Frequency: 400 * machine.KHz,
 		SDA:       machine.I2C0_SDA_PIN,
 		SCL:       machine.I2C0_SCL_PIN,
-		Frequency: 400 * machine.KHz, // safe default
 	})
-	if err != nil {
-		println("could not configure i2c:", err)
-		return
-	}
 
-	// Create device instance
-	dev := ltc4015.New(machine.I2C0)
-
-	// Apply configuration (example: lithium battery, 2 cells, 10 mΩ sense resistors)
 	cfg := ltc4015.Config{
-		RSNSB:    0.00333, // 10 mΩ battery sense resistor
-		RSNSI:    0.00167, // 10 mΩ input sense resistor
-		Lithium:  false,
-		Cells:    6,
-		Features: 0, // no extra features enabled yet
-		RNTC:     10000.0,
-		RBSRT:    100000.0,
-		RBSRB:    10000.0,
-		RVIN1:    100000.0,
-		RVIN2:    10000.0,
-		Address:  0x68,
+		RSNSB_uOhm: 3330, // 0.00333Ω
+		RSNSI_uOhm: 1670, // 0.00167Ω
+		Cells:      6,
+		Chem:       ltc4015.ChemLeadAcid,
 	}
+
+	dev := ltc4015.New(machine.I2C0, cfg)
 	if err := dev.Configure(cfg); err != nil {
-		println("failed to configure LTC4015:", err.Error())
-		return
+		println("configure error")
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
+
+	println("LTC4015 Lead-Acid 6-cell test starting")
+
+	// Explicitly enable Coulomb counter
+	_ = dev.EnableQCount(true)
+
+	// Optionally force measurement system on without VIN
+	_ = dev.ForceMeasSystemOn(true)
+
+	_ = dev.EnableLimitAlerts(0xFFFF)
+	_ = dev.EnableChargerStateAlerts(0xFFFF)
+	_ = dev.EnableChargeStatusAlerts(0xFFFF)
 
 	for {
-		// Read supply voltages
-		vin, _ := dev.ReadVIN()   // mV
-		vsys, _ := dev.ReadVSYS() // mV
-		vbat, _ := dev.ReadVBAT() // mV
-
-		// Read currents
-		iin, _ := dev.ReadIIN()   // mA
-		ibat, _ := dev.ReadIBAT() // mA
-
-		// Read temperature
-		temp, _ := dev.ReadDieTemp() // tenths of °C
-
-		print("VIN=", vin, " mV\n")
-		print("IIN=", iin, " mA\n")
-		print("VSYS=", vsys, " mV\n")
-		print("Temp=", temp, " (tenths °C)\n")
-
-		batt_missing, _ := dev.StateBatteryMissing()
-		println("batt_missing: ", batt_missing)
-		batt_shorted, _ := dev.StateBatteryShort()
-
-		if !batt_missing && !batt_shorted {
-			print("VBAT=", vbat, " mV\n")
-			print("IBAT=", ibat, " mA\n")
+		valid, err := dev.MeasSystemValid()
+		if err != nil {
+			println("MEAS_SYS_VALID error")
+			time.Sleep(time.Second)
+			continue
+		}
+		if !valid {
+			println("Measurement system not valid yet")
+			time.Sleep(time.Second)
+			continue
 		}
 
-		print("\n")
+		vcell, _ := dev.BatteryMilliVPerCell()
+		vpack, _ := dev.BatteryMilliVPack()
+		vin, _ := dev.VinMilliV()
+		vsys, _ := dev.VsysMilliV()
+		ibat, _ := dev.IbatMilliA()
+		iin, _ := dev.IinMilliA()
+		temp, _ := dev.DieMilliC()
+		bsr, _ := dev.BSRMicroOhmPerCell()
+		qc, _ := dev.QCount()
+		sys, _ := dev.SystemStatus()
+		limAlerts, _ := dev.ReadLimitAlerts()
+		chrStAlerts, _ := dev.ReadChargerStateAlerts()
+		chrgAlerts, _ := dev.ReadChargeStatusAlerts()
 
-		time.Sleep(time.Second)
+		println("------------------------------------------")
+		println("VBAT per cell (mV):", vcell)
+		println("VBAT pack (mV):", vpack)
+		println("VIN (mV):", vin)
+		println("VSYS (mV):", vsys)
+		println("IBAT (mA):", ibat)
+		println("IIN (mA):", iin)
+		println("Die Temp (mC):", temp) // milli-degrees Celsius
+		println("BSR/cell (µΩ):", bsr)
+		println("QCOUNT:", qc)
+
+		println("SystemStatus reg:", sys)
+		println("Limit Alerts reg:", limAlerts)
+		println("ChargerStateAlerts reg:", chrStAlerts)
+		println("ChargeStatusAlerts reg:", chrgAlerts)
+
+		_ = dev.ClearLimitAlerts()
+		_ = dev.ClearChargerStateAlerts()
+		_ = dev.ClearChargeStatusAlerts()
+
+		time.Sleep(2 * time.Second)
 	}
 }
