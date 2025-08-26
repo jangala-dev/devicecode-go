@@ -294,7 +294,7 @@ func (d *Device) ReadVBAT() (int32, error) {
 		lsb = int64(LSB_VBAT_LA_uV)
 	}
 	uV := int64(u) * lsb * int64(d.cells)
-	return int32(uV / 1000), nil
+	return int32(uV / 1_000_000), nil
 }
 
 // ReadVIN returns the input voltage in millivolts.
@@ -328,7 +328,7 @@ func (d *Device) ReadIBAT() (int32, error) {
 	}
 	// µA = raw * 1,464,870 / RSNSB(µΩ)
 	uA := int64(raw) * LSB_CURR_nA * 1000 / d.rsnsb
-	return int32(uA / 1000), nil
+	return int32(uA / 1_000), nil
 }
 
 // ReadIIN returns the input current in milliamps.
@@ -341,7 +341,7 @@ func (d *Device) ReadIIN() (int32, error) {
 		return 0, ErrTx
 	}
 	uA := int64(raw) * LSB_CURR_nA * 1000 / d.rsnsi
-	return int32(uA / 1000), nil
+	return int32(uA / 1_000), nil
 }
 
 // ReadDieTemp returns die temperature in tenths of °C (×0.1 °C).
