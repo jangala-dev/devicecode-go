@@ -88,42 +88,48 @@ const (
 )
 
 // CHARGER_STATE (0x34, mutually exclusive where applicable)
+type ChargerState uint16
+
 const (
-	stEqualizeCharge     = 10
-	stAbsorbCharge       = 9
-	stChargerSuspended   = 8
-	stPrecharge          = 7
-	stCcCvCharge         = 6
-	stNtcPause           = 5
-	stTimerTerm          = 4
-	stCOverXTerm         = 3
-	stMaxChargeTimeFault = 2
-	stBatMissingFault    = 1 // battery missing
-	stBatShortFault      = 0 // shorted battery
+	StEqualizeCharge     ChargerState = 1 << 10
+	StAbsorbCharge       ChargerState = 1 << 9
+	StChargerSuspended   ChargerState = 1 << 8
+	StPrecharge          ChargerState = 1 << 7
+	StCcCvCharge         ChargerState = 1 << 6
+	StNTCPause           ChargerState = 1 << 5
+	StTimerTerm          ChargerState = 1 << 4
+	StCOverXTerm         ChargerState = 1 << 3
+	StMaxChargeTimeFault ChargerState = 1 << 2
+	StBatMissingFault    ChargerState = 1 << 1
+	StBatShortFault      ChargerState = 1 << 0
 )
 
 // CHARGE_STATUS (0x35, mutually exclusive while charging)
+type ChargeStatus uint16
+
 const (
-	csVinUvclActive  = 3
-	csIinLimitActive = 2
-	csConstCurrent   = 1
-	csConstVoltage   = 0
+	CsVinUvclActive  ChargeStatus = 1 << 3
+	CsIinLimitActive ChargeStatus = 1 << 2
+	CsConstCurrent   ChargeStatus = 1 << 1
+	CsConstVoltage   ChargeStatus = 1 << 0
 )
 
 // SYSTEM_STATUS (0x39)
+type SystemStatus uint16
+
 const (
-	sysChargerEnabled  = 13
-	sysMpptEnPin       = 11
-	sysEqualizeReq     = 10
-	sysDrvccGood       = 9
-	sysCellCountError  = 8
-	sysOkToCharge      = 6
-	sysNoRt            = 5
-	sysThermalShutdown = 4
-	sysVinOvlo         = 3
-	sysVinGtVbat       = 2 // VIN ≥ ~200 mV above VBAT
-	sysIntvccGt4p3V    = 1
-	sysIntvccGt2p8V    = 0
+	SysChargerEnabled  SystemStatus = 1 << 13
+	SysMpptEnPin       SystemStatus = 1 << 11
+	SysEqualizeReq     SystemStatus = 1 << 10
+	SysDrvccGood       SystemStatus = 1 << 9
+	SysCellCountError  SystemStatus = 1 << 8
+	SysOkToCharge      SystemStatus = 1 << 6
+	SysNoRt            SystemStatus = 1 << 5
+	SysThermalShutdown SystemStatus = 1 << 4
+	SysVinOvlo         SystemStatus = 1 << 3
+	SysVinGtVbat       SystemStatus = 1 << 2
+	SysIntvccGt4p3V    SystemStatus = 1 << 1
+	SysIntvccGt2p8V    SystemStatus = 1 << 0
 )
 
 // LIMIT_ALERTS (0x36, read/clear)

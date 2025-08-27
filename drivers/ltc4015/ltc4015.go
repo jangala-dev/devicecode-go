@@ -18,6 +18,8 @@ import (
 	"tinygo.org/x/drivers"
 )
 
+// ---------- Types and configuration ----------
+
 // Chemistry selects scaling where chemistries differ in the datasheet.
 type Chemistry uint8
 
@@ -105,7 +107,7 @@ func (d *Device) Configure(cfg Config) error {
 	if cfg.RSNSI_uOhm != 0 {
 		d.rsnsI_uOhm = cfg.RSNSI_uOhm
 	}
-	// Coulomb counter prescale and enable (CONFIG_BITS bit2 en_qcount). :contentReference[oaicite:11]{index=11}
+	// Coulomb counter prescale (CONFIG_BITS en_qcount is handled via EnableQCount()).
 	if cfg.QCountPrescale != 0 {
 		if err := d.writeWord(regQCountPrescale, cfg.QCountPrescale); err != nil {
 			return err
@@ -113,6 +115,8 @@ func (d *Device) Configure(cfg Config) error {
 	}
 	return nil
 }
+
+// ---------- CONFIG_BITS control ----------
 
 // ConfigBits returns the raw CONFIG_BITS register value.
 func (d *Device) ConfigBits() (uint16, error) {
@@ -292,22 +296,92 @@ func (d *Device) MeasSystemValid() (bool, error) {
 // SystemStatus returns the raw SYSTEM_STATUS register (0x39). :contentReference[oaicite:20]{index=20}
 func (d *Device) SystemStatus() (uint16, error) { return d.readWord(regSystemStatus) }
 
-// ---------- Alerts (enable, read, clear) ----------
+// ---------- Alerts & limits: user-friendly setters ----------
 
-// EnableLimitAlerts writes EN_LIMIT_ALERTS (0x0D). Set bits per datasheet table. :contentReference[oaicite:21]{index=21}
-func (d *Device) EnableLimitAlerts(mask uint16) error { return d.writeWord(regEnLimitAlerts, mask) }
-
-// EnableChargerStateAlerts writes EN_CHARGER_STATE_ALERTS (0x0E). :contentReference[oaicite:22]{index=22}
-func (d *Device) EnableChargerStateAlerts(mask uint16) error {
-	return d.writeWord(regEnChargerStAlerts, mask)
+// VBAT limits are per-cell (same format as VBAT). Lithium 192.264µV/LSB; Lead-acid 128.176µV/LSB.
+func (d *Device) SetVBATWindow_mVPerCell(lo_mV, hi_mV int32) error {
+	if err := d.writeWord(regVBATLoAlertLimit, d.toVBATCode(lo_mV)); err != nil {
+		return err
+	}
+	return d.writeWord(regVBATHiAlertLimit, d.toVBATCode(hi_mV))
 }
 
-// EnableChargeStatusAlerts writes EN_CHARGE_STATUS_ALERTS (0x0F). :contentReference[oaicite:23]{index=23}
-func (d *Device) EnableChargeStatusAlerts(mask uint16) error {
-	return d.writeWord(regEnChargeStAlerts, mask)
+// VIN/VSYS limits use 1.648mV per LSB.
+func (d *Device) SetVINWindow_mV(lo_mV, hi_mV int32) error {
+	if err := d.writeWord(regVINLoAlertLimit, d.toCode_1p648mV_LSB(lo_mV)); err != nil {
+		return err
+	}
+	return d.writeWord(regVINHiAlertLimit, d.toCode_1p648mV_LSB(hi_mV))
 }
 
-// Read/Clear R/Clear alert registers. Writing 0 clears asserted bits. :contentReference[oaicite:24]{index=24}
+func (d *Device) SetVSYSWindow_mV(lo_mV, hi_mV int32) error {
+	if err := d.writeWord(regVSYSLoAlertLimit, d.toCode_1p648mV_LSB(lo_mV)); err != nil {
+		return err
+	}
+	return d.writeWord(regVSYSHiAlertLimit, d.toCode_1p648mV_LSB(hi_mV))
+}
+
+// IIN_HI in mA (1.46487µV/RSNSI per LSB).
+func (d *Device) SetIINHigh_mA(mA int32) error {
+	if d.rsnsI_uOhm == 0 {
+		return errors.New("RSNSI_uOhm not set")
+	}
+	code := d.currCode(mA, d.rsnsI_uOhm)
+	return d.writeWord(regIINHiAlertLimit, code)
+}
+
+// IBAT_LO in mA (alert when charge current falls below threshold).
+func (d *Device) SetIBATLow_mA(mA int32) error {
+	if d.rsnsB_uOhm == 0 {
+		return errors.New("RSNSB_uOhm not set")
+	}
+	code := d.currCode(mA, d.rsnsB_uOhm)
+	return d.writeWord(regIBATLoAlertLimit, code)
+}
+
+// Die temperature high limit in milli-°C. raw = 12010 + 45.6*°C.
+func (d *Device) SetDieTempHigh_mC(mC int32) error {
+	raw := int64(12010) + (int64(456)*int64(mC))/10000
+	return d.writeWord(regDieTempHiAlertLimit, uint16(int16(raw)))
+}
+
+// BSR high limit in µΩ per cell. Lithium uses /500, lead-acid /750.
+func (d *Device) SetBSRHigh_uOhmPerCell(uOhm uint32) error {
+	if d.rsnsB_uOhm == 0 {
+		return errors.New("RSNSB_uOhm not set")
+	}
+	div := int64(500)
+	if d.chem == ChemLeadAcid {
+		div = 750
+	}
+	raw := (int64(uOhm) * div) / int64(d.rsnsB_uOhm)
+	if raw < 0 {
+		raw = 0
+	}
+	return d.writeWord(regBSRHiAlertLimit, uint16(raw))
+}
+
+// NTC ratio limits in raw code units (left raw to avoid board-dependent thermistor maths).
+func (d *Device) SetNTCRatioWindowRaw(hi, lo uint16) error {
+	if err := d.writeWord(regNTCRatioHiAlertLimit, hi); err != nil {
+		return err
+	}
+	return d.writeWord(regNTCRatioLoAlertLimit, lo)
+}
+
+// ---------- Alerts: enable (typed), read, clear ----------
+
+func (d *Device) EnableLimitAlertsMask(mask LimitEnable) error {
+	return d.writeWord(regEnLimitAlerts, uint16(mask))
+}
+func (d *Device) EnableChargerStateAlertsMask(mask ChargerStateEnable) error {
+	return d.writeWord(regEnChargerStAlerts, uint16(mask))
+}
+func (d *Device) EnableChargeStatusAlertsMask(mask ChargeStatusEnable) error {
+	return d.writeWord(regEnChargeStAlerts, uint16(mask))
+}
+
+// Read/Clear R/Clear alert registers. Writing 0 clears asserted bits.
 func (d *Device) ReadLimitAlerts() (uint16, error)        { return d.readWord(regLimitAlerts) }
 func (d *Device) ReadChargerStateAlerts() (uint16, error) { return d.readWord(regChargerStateAlert) }
 func (d *Device) ReadChargeStatusAlerts() (uint16, error) { return d.readWord(regChargeStatAlerts) }
@@ -315,6 +389,96 @@ func (d *Device) ReadChargeStatusAlerts() (uint16, error) { return d.readWord(re
 func (d *Device) ClearLimitAlerts() error        { return d.writeWord(regLimitAlerts, 0x0000) }
 func (d *Device) ClearChargerStateAlerts() error { return d.writeWord(regChargerStateAlert, 0x0000) }
 func (d *Device) ClearChargeStatusAlerts() error { return d.writeWord(regChargeStatAlerts, 0x0000) }
+
+// High-level convenience to set limits then enable chosen alert classes.
+type AlertLimits struct {
+	// Per-cell VBAT window (mV/cell). If both are zero, VBAT limits are not set.
+	VBATLo_mVPerCell int32
+	VBATHi_mVPerCell int32
+
+	// VIN/VSYS windows (mV). If both are zero, window is not set.
+	VINLo_mV, VINHi_mV   int32
+	VSYSLo_mV, VSYSHi_mV int32
+
+	// Currents (mA). Zero leaves the limit unchanged.
+	IINHi_mA  int32
+	IBATLo_mA int32
+
+	// Die temperature high limit (m°C). Zero leaves unchanged.
+	DieTempHi_mC int32
+
+	// Battery series resistance high limit (µΩ/cell). Zero leaves unchanged.
+	BSRHi_uOhmPerCell uint32
+
+	// NTC ratio raw window; both zero leaves unchanged.
+	NTCRatioHiRaw, NTCRatioLoRaw uint16
+
+	// Enable masks to apply after limits are written (0 leaves disabled).
+	EnableLimits       LimitEnable
+	EnableChargerState ChargerStateEnable
+	EnableChargeStatus ChargeStatusEnable
+}
+
+func (d *Device) ConfigureAlerts(a AlertLimits) error {
+	// Write only if non-zero (keeps semantics simple and allocation-free).
+	if a.VBATLo_mVPerCell|a.VBATHi_mVPerCell != 0 {
+		if err := d.SetVBATWindow_mVPerCell(a.VBATLo_mVPerCell, a.VBATHi_mVPerCell); err != nil {
+			return err
+		}
+	}
+	if a.VINLo_mV|a.VINHi_mV != 0 {
+		if err := d.SetVINWindow_mV(a.VINLo_mV, a.VINHi_mV); err != nil {
+			return err
+		}
+	}
+	if a.VSYSLo_mV|a.VSYSHi_mV != 0 {
+		if err := d.SetVSYSWindow_mV(a.VSYSLo_mV, a.VSYSHi_mV); err != nil {
+			return err
+		}
+	}
+	if a.IINHi_mA != 0 {
+		if err := d.SetIINHigh_mA(a.IINHi_mA); err != nil {
+			return err
+		}
+	}
+	if a.IBATLo_mA != 0 {
+		if err := d.SetIBATLow_mA(a.IBATLo_mA); err != nil {
+			return err
+		}
+	}
+	if a.DieTempHi_mC != 0 {
+		if err := d.SetDieTempHigh_mC(a.DieTempHi_mC); err != nil {
+			return err
+		}
+	}
+	if a.BSRHi_uOhmPerCell != 0 {
+		if err := d.SetBSRHigh_uOhmPerCell(a.BSRHi_uOhmPerCell); err != nil {
+			return err
+		}
+	}
+	if a.NTCRatioHiRaw|a.NTCRatioLoRaw != 0 {
+		if err := d.SetNTCRatioWindowRaw(a.NTCRatioHiRaw, a.NTCRatioLoRaw); err != nil {
+			return err
+		}
+	}
+	// Now enable masks (0 leaves them disabled).
+	if a.EnableLimits != 0 {
+		if err := d.EnableLimitAlertsMask(a.EnableLimits); err != nil {
+			return err
+		}
+	}
+	if a.EnableChargerState != 0 {
+		if err := d.EnableChargerStateAlertsMask(a.EnableChargerState); err != nil {
+			return err
+		}
+	}
+	if a.EnableChargeStatus != 0 {
+		if err := d.EnableChargeStatusAlertsMask(a.EnableChargeStatus); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // ---------- Coulomb counter ----------
 
@@ -356,4 +520,33 @@ func (d *Device) writeWord(reg byte, val uint16) error {
 	d.w[1] = byte(val & 0xFF)        // low byte
 	d.w[2] = byte((val >> 8) & 0xFF) // high byte
 	return d.i2c.Tx(d.addr, d.w[:3], nil)
+}
+
+// ---------- Private scaling helpers (integer arithmetic only) ----------
+
+func (d *Device) toVBATCode(mV int32) uint16 {
+	// Use nV to avoid fractions; Li: 192,264 nV/LSB; Lead-acid: 128,176 nV/LSB.
+	nVperLSB := int64(192264)
+	if d.chem == ChemLeadAcid {
+		nVperLSB = 128176
+	}
+	// code = (mV * 1e6 nV) / nVperLSB, rounded
+	code := (int64(mV)*1000000 + nVperLSB/2) / nVperLSB
+	return uint16(int16(code))
+}
+
+func (d *Device) toCode_1p648mV_LSB(mV int32) uint16 {
+	// 1.648 mV = 1,648,000 nV per LSB.
+	const nVperLSB = 1648000
+	code := (int64(mV)*1000000000 + nVperLSB/2) / nVperLSB // mV->nV then divide
+	return uint16(int16(code))
+}
+
+func (d *Device) currCode(mA int32, rsns_uOhm uint32) uint16 {
+	// I[uA] = code * 1.46487µV / RSNS ⇒ code = I[uA] * RSNS / 1.46487µV.
+	// Use pV to keep precision: 1.46487µV = 1,464,870 pV.
+	const pVperLSB = 1464870
+	uA := int64(mA) * 1000
+	code := (uA*int64(rsns_uOhm) + pVperLSB/2) / pVperLSB
+	return uint16(int16(code))
 }
