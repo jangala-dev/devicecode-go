@@ -538,7 +538,7 @@ func (d *Device) toVBATCode(mV int32) uint16 {
 func (d *Device) toCode_1p648mV_LSB(mV int32) uint16 {
 	// 1.648 mV = 1,648,000 nV per LSB.
 	const nVperLSB = 1648000
-	code := (int64(mV)*1000000000 + nVperLSB/2) / nVperLSB // mV->nV then divide
+	code := (int64(mV)*1000000 + nVperLSB/2) / nVperLSB // mV->nV then divide
 	return uint16(int16(code))
 }
 
