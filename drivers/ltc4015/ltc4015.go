@@ -3,12 +3,12 @@
 //
 // Design notes (datasheet references):
 // • I2C/SMBus, 400kHz, read/write word protocol; data-low then data-high
-//   (see “I2C TIMING DIAGRAM” and SMBus READ/WRITE WORD protocol). :contentReference[oaicite:0]{index=0}
-// • Default 7-bit address = 0b1101000 (from “ADDRESS I2C Address 1101_000[R/W]b”). :contentReference[oaicite:1]{index=1}
-// • Telemetry register map & scaling (VBAT, VIN, VSYS, IBAT, IIN, DIE_TEMP, NTC_RATIO, BSR). :contentReference[oaicite:2]{index=2}
-// • System status, charger/charge-status alerts, and clear-on-write-0 behaviour. :contentReference[oaicite:3]{index=3}
-// • Limit alert enables / limits and Coulomb counter controls. :contentReference[oaicite:4]{index=4}
-// • Coulomb counter qLSB formula and QCOUNT registers. :contentReference[oaicite:5]{index=5}
+//   (see “I2C TIMING DIAGRAM” and SMBus READ/WRITE WORD protocol).
+// • Default 7-bit address = 0b1101000 (from “ADDRESS I2C Address 1101_000[R/W]b”).
+// • Telemetry register map & scaling (VBAT, VIN, VSYS, IBAT, IIN, DIE_TEMP, NTC_RATIO, BSR).
+// • System status, charger/charge-status alerts, and clear-on-write-0 behaviour.
+// • Limit alert enables / limits and Coulomb counter controls.
+// • Coulomb counter qLSB formula and QCOUNT registers.
 
 package ltc4015
 
@@ -92,7 +92,7 @@ func (d *Device) Configure(cfg Config) error {
 	if cfg.Cells != 0 {
 		d.cells = cfg.Cells
 	} else {
-		// Read CHEM_CELLS to get pins-based cell count (bits 3:0). :contentReference[oaicite:10]{index=10}
+		// Read CHEM_CELLS to get pins-based cell count (bits 3:0).
 		v, err := d.readWord(regChemCells)
 		if err == nil {
 			d.cells = uint8(v & 0x000F)
@@ -171,7 +171,7 @@ func (d *Device) EnableMPPTI2C(enable bool) error {
 // ---------- Telemetry (integer units) ----------
 
 // BatteryMilliVPerCell returns VBAT per-cell in millivolts (signed).
-// Li chemistries: 192.264µV/LSB per cell; Lead-acid: 128.176µV/LSB per cell. :contentReference[oaicite:12]{index=12}
+// Li chemistries: 192.264µV/LSB per cell; Lead-acid: 128.176µV/LSB per cell.
 func (d *Device) BatteryMilliVPerCell() (int32, error) {
 	raw, err := d.readS16(regVBAT)
 	if err != nil {
@@ -201,7 +201,7 @@ func (d *Device) BatteryMilliVPack() (int32, error) {
 	return perCell * int32(d.cells), nil
 }
 
-// VinMilliV returns VIN in millivolts. 1.648mV/LSB. :contentReference[oaicite:13]{index=13}
+// VinMilliV returns VIN in millivolts. 1.648mV/LSB.
 func (d *Device) VinMilliV() (int32, error) {
 	raw, err := d.readS16(regVIN)
 	if err != nil {
@@ -212,7 +212,7 @@ func (d *Device) VinMilliV() (int32, error) {
 	return int32(uV / 1000), nil
 }
 
-// VsysMilliV returns VSYS in millivolts. 1.648mV/LSB. :contentReference[oaicite:14]{index=14}
+// VsysMilliV returns VSYS in millivolts. 1.648mV/LSB.
 func (d *Device) VsysMilliV() (int32, error) {
 	raw, err := d.readS16(regVSYS)
 	if err != nil {
@@ -223,7 +223,7 @@ func (d *Device) VsysMilliV() (int32, error) {
 }
 
 // IbatMilliA returns battery current in milliamps (signed).
-// IBAT LSB is 1.46487µV across RSNSB (two's complement). I[mA]= raw*1.46487µV / RSNSB. :contentReference[oaicite:15]{index=15}
+// IBAT LSB is 1.46487µV across RSNSB (two's complement). I[mA]= raw*1.46487µV / RSNSB.
 func (d *Device) IbatMilliA() (int32, error) {
 	if d.rsnsB_uOhm == 0 {
 		return 0, errors.New("RSNSB_uOhm not set")
@@ -239,7 +239,7 @@ func (d *Device) IbatMilliA() (int32, error) {
 }
 
 // IinMilliA returns input current in milliamps (signed).
-// IIN LSB is 1.46487µV across RSNSI. :contentReference[oaicite:16]{index=16}
+// IIN LSB is 1.46487µV across RSNSI.
 func (d *Device) IinMilliA() (int32, error) {
 	if d.rsnsI_uOhm == 0 {
 		return 0, errors.New("RSNSI_uOhm not set")
@@ -253,7 +253,7 @@ func (d *Device) IinMilliA() (int32, error) {
 }
 
 // DieMilliC returns die temperature in milli-°C.
-// T[°C] = (DIE_TEMP – 12010)/45.6  ⇒ milli-°C = (raw-12010)*10000/456. :contentReference[oaicite:17]{index=17}
+// T[°C] = (DIE_TEMP – 12010)/45.6  ⇒ milli-°C = (raw-12010)*10000/456.
 func (d *Device) DieMilliC() (int32, error) {
 	raw, err := d.readS16(regDieTemp)
 	if err != nil {
@@ -264,7 +264,7 @@ func (d *Device) DieMilliC() (int32, error) {
 }
 
 // BSRMicroOhmPerCell returns per-cell battery series resistance in micro-ohms.
-// Lithium: Ω/cell = (BSR/500)*RSNSB; Lead-acid: (BSR/750)*RSNSB. :contentReference[oaicite:18]{index=18}
+// Lithium: Ω/cell = (BSR/500)*RSNSB; Lead-acid: (BSR/750)*RSNSB.
 func (d *Device) BSRMicroOhmPerCell() (uint32, error) {
 	if d.rsnsB_uOhm == 0 {
 		return 0, errors.New("RSNSB_uOhm not set")
@@ -293,7 +293,7 @@ func (d *Device) MeasSystemValid() (bool, error) {
 	return (v & 0x0001) != 0, nil
 }
 
-// SystemStatus returns the raw SYSTEM_STATUS register (0x39). :contentReference[oaicite:20]{index=20}
+// SystemStatus returns the raw SYSTEM_STATUS register (0x39).
 func (d *Device) SystemStatus() (uint16, error) { return d.readWord(regSystemStatus) }
 
 // ---------- Alerts & limits: user-friendly setters ----------
@@ -482,13 +482,13 @@ func (d *Device) ConfigureAlerts(a AlertLimits) error {
 
 // ---------- Coulomb counter ----------
 
-// SetQCount sets the QCOUNT accumulator (0x13). :contentReference[oaicite:25]{index=25}
+// SetQCount sets the QCOUNT accumulator (0x13).
 func (d *Device) SetQCount(v uint16) error { return d.writeWord(regQCount, v) }
 
-// QCount reads the QCOUNT accumulator (0x13). :contentReference[oaicite:26]{index=26}
+// QCount reads the QCOUNT accumulator (0x13).
 func (d *Device) QCount() (uint16, error) { return d.readWord(regQCount) }
 
-// SetQCountLimits sets QCOUNT_LO/H I alert limits (0x10/0x11). :contentReference[oaicite:27]{index=27}
+// SetQCountLimits sets QCOUNT_LO/H I alert limits (0x10/0x11).
 func (d *Device) SetQCountLimits(lo, hi uint16) error {
 	if err := d.writeWord(regQCountLoLimit, lo); err != nil {
 		return err
@@ -496,7 +496,7 @@ func (d *Device) SetQCountLimits(lo, hi uint16) error {
 	return d.writeWord(regQCountHiLimit, hi)
 }
 
-// SetQCountPrescale sets QCOUNT_PRESCALE_FACTOR (0x12). :contentReference[oaicite:28]{index=28}
+// SetQCountPrescale sets QCOUNT_PRESCALE_FACTOR (0x12).
 func (d *Device) SetQCountPrescale(p uint16) error { return d.writeWord(regQCountPrescale, p) }
 
 // ---------- Low-level SMBus read/write word (little-endian: LOW then HIGH) ----------
@@ -506,7 +506,7 @@ func (d *Device) readWord(reg byte) (uint16, error) {
 	if err := d.i2c.Tx(d.addr, d.w[:1], d.r[:2]); err != nil {
 		return 0, err
 	}
-	// low then high per SMBus READ WORD. :contentReference[oaicite:29]{index=29}
+	// low then high per SMBus READ WORD.
 	return uint16(d.r[0]) | uint16(d.r[1])<<8, nil
 }
 
