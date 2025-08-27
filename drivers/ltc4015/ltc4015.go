@@ -14,6 +14,7 @@ package ltc4015
 
 import (
 	"errors"
+	"math"
 
 	"tinygo.org/x/drivers"
 )
@@ -173,7 +174,7 @@ func (d *Device) EnableMPPTI2C(enable bool) error {
 // BatteryMilliVPerCell returns VBAT per-cell in millivolts (signed).
 // Li chemistries: 192.264µV/LSB per cell; Lead-acid: 128.176µV/LSB per cell.
 func (d *Device) BatteryMilliVPerCell() (int32, error) {
-	raw, err := d.readS16(regVBAT)
+	raw, err := d.readWord(regVBAT)
 	if err != nil {
 		return 0, err
 	}
@@ -184,7 +185,6 @@ func (d *Device) BatteryMilliVPerCell() (int32, error) {
 		nVperLSB = 128176
 	}
 	uV := (int64(raw) * nVperLSB) / 1000 // convert nV->uV
-	// millivolts:
 	return int32(uV / 1000), nil
 }
 
@@ -203,7 +203,7 @@ func (d *Device) BatteryMilliVPack() (int32, error) {
 
 // VinMilliV returns VIN in millivolts. 1.648mV/LSB.
 func (d *Device) VinMilliV() (int32, error) {
-	raw, err := d.readS16(regVIN)
+	raw, err := d.readWord(regVIN)
 	if err != nil {
 		return 0, err
 	}
@@ -214,7 +214,7 @@ func (d *Device) VinMilliV() (int32, error) {
 
 // VsysMilliV returns VSYS in millivolts. 1.648mV/LSB.
 func (d *Device) VsysMilliV() (int32, error) {
-	raw, err := d.readS16(regVSYS)
+	raw, err := d.readWord(regVSYS)
 	if err != nil {
 		return 0, err
 	}
@@ -281,7 +281,7 @@ func (d *Device) BSRMicroOhmPerCell() (uint32, error) {
 	return uint32(uOhm), nil
 }
 
-// MeasSystemValid reports whether telemetry is ready (MEAS_SYS_VALID bit0). :contentReference[oaicite:19]{index=19}
+// MeasSystemValid reports whether telemetry is ready (MEAS_SYS_VALID bit0).
 func (d *Device) MeasSystemValid() (bool, error) {
 	v, err := d.readWord(regMeasSysValid)
 	if err != nil {
@@ -521,29 +521,41 @@ func (d *Device) writeWord(reg byte, val uint16) error {
 
 // ---------- Private scaling helpers (integer arithmetic only) ----------
 
+// clamp16 bounds an int64 into the signed 16-bit range
+// and returns the encoded uint16 form.
+func clamp16(v int64) uint16 {
+	if v > math.MaxInt16 {
+		v = math.MaxInt16
+	}
+	if v < math.MinInt16 {
+		v = math.MinInt16
+	}
+	return uint16(int16(v))
+}
+
+// toVBATCode converts millivolts-per-cell into the raw register code.
+// Li: 192.264µV/LSB; Lead-acid: 128.176µV/LSB.
 func (d *Device) toVBATCode(mV int32) uint16 {
-	// Use nV to avoid fractions; Li: 192,264 nV/LSB; Lead-acid: 128,176 nV/LSB.
 	nVperLSB := int64(192264)
 	if d.chem == ChemLeadAcid {
 		nVperLSB = 128176
 	}
-	// code = (mV * 1e6 nV) / nVperLSB, rounded
-	code := (int64(mV)*1000000 + nVperLSB/2) / nVperLSB
-	return uint16(int16(code))
+	code := (int64(mV)*1_000_000 + nVperLSB/2) / nVperLSB
+	return clamp16(code)
 }
 
+// toCode_1p648mV_LSB converts a millivolt value into raw code units (1.648mV/LSB).
 func (d *Device) toCode_1p648mV_LSB(mV int32) uint16 {
-	// 1.648 mV = 1,648,000 nV per LSB.
-	const nVperLSB = 1648000
-	code := (int64(mV)*1000000 + nVperLSB/2) / nVperLSB // mV->nV then divide
-	return uint16(int16(code))
+	const nVperLSB = 1_648_000
+	code := (int64(mV)*1_000_000 + nVperLSB/2) / nVperLSB
+	return clamp16(code)
 }
 
+// currCode converts a current threshold in mA into the raw register code
+// given a sense resistor value in micro-ohms.
 func (d *Device) currCode(mA int32, rsns_uOhm uint32) uint16 {
-	// I[uA] = code * 1.46487µV / RSNS ⇒ code = I[uA] * RSNS / 1.46487µV.
-	// Use pV to keep precision: 1.46487µV = 1,464,870 pV.
-	const pVperLSB = 1464870
+	const pVperLSB = 1_464_870
 	uA := int64(mA) * 1000
 	code := (uA*int64(rsns_uOhm) + pVperLSB/2) / pVperLSB
-	return uint16(int16(code))
+	return clamp16(code)
 }
