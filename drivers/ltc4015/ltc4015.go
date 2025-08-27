@@ -278,9 +278,6 @@ func (d *Device) BSRMicroOhmPerCell() (uint32, error) {
 		div = 750
 	}
 	uOhm := (int64(raw) * int64(d.rsnsB_uOhm)) / div
-	if uOhm < 0 {
-		uOhm = 0
-	}
 	return uint32(uOhm), nil
 }
 
