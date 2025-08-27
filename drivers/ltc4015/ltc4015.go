@@ -339,7 +339,7 @@ func (d *Device) SetIBATLow_mA(mA int32) error {
 // Die temperature high limit in milli-°C. raw = 12010 + 45.6*°C.
 func (d *Device) SetDieTempHigh_mC(mC int32) error {
 	raw := int64(12010) + (int64(456)*int64(mC))/10000
-	return d.writeWord(regDieTempHiAlertLimit, uint16(int16(raw)))
+	return d.writeWord(regDieTempHiAlertLimit, clamp16(raw))
 }
 
 // BSR high limit in µΩ per cell. Lithium uses /500, lead-acid /750.
@@ -352,10 +352,7 @@ func (d *Device) SetBSRHigh_uOhmPerCell(uOhm uint32) error {
 		div = 750
 	}
 	raw := (int64(uOhm) * div) / int64(d.rsnsB_uOhm)
-	if raw < 0 {
-		raw = 0
-	}
-	return d.writeWord(regBSRHiAlertLimit, uint16(raw))
+	return d.writeWord(regBSRHiAlertLimit, clamp16(raw))
 }
 
 // NTC ratio limits in raw code units (left raw to avoid board-dependent thermistor maths).
