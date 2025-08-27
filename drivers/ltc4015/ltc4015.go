@@ -493,6 +493,48 @@ func (d *Device) SetQCountLimits(lo, hi uint16) error {
 // SetQCountPrescale sets QCOUNT_PRESCALE_FACTOR (0x12).
 func (d *Device) SetQCountPrescale(p uint16) error { return d.writeWord(regQCountPrescale, p) }
 
+// qCountLSBnC returns qLSB in nanoCoulombs per tick.
+// This avoids floats: nanoCoulombs = 1e-9 C.
+func (d *Device) qCountLSBnC(prescale uint16) (uint64, error) {
+	if d.rsnsB_uOhm == 0 {
+		return 0, errors.New("RSNSB_uOhm not set")
+	}
+	// KQC = 8333.33 Hz/V ≈ 833333/100 (scaled to avoid float).
+	const kqc_num = 833333
+	const kqc_den = 100
+
+	// RSNS in micro-ohm → ohm = RSNS / 1e6.
+	// Formula: qLSB = prescale / (KQC * RSNS).
+	// Scale into nC: qLSB[nC] = (prescale * 1e9) / (KQC * RSNS[Ω]).
+	num := uint64(prescale) * 1_000_000_000 * kqc_den
+	den := uint64(kqc_num) * uint64(d.rsnsB_uOhm)
+	return num / den, nil
+}
+
+// CoulombsDelta converts a delta-QCOUNT into Coulombs (integer, in µC).
+func (d *Device) CoulombsDelta(deltaQ int32, prescale uint16) (int64, error) {
+	qlsb, err := d.qCountLSBnC(prescale) // in nC
+	if err != nil {
+		return 0, err
+	}
+	// deltaQ * qlsb[nC] → nC. Divide by 1000 → µC.
+	return (int64(deltaQ) * int64(qlsb)) / 1000, nil
+}
+
+// MilliAmpHoursDelta converts a delta-QCOUNT into mAh.
+// mAh = (Coulombs / 3600) * 1000.
+func (d *Device) MilliAmpHoursDelta(deltaQ int32, prescale uint16) (int32, error) {
+	qlsb, err := d.qCountLSBnC(prescale) // nC
+	if err != nil {
+		return 0, err
+	}
+	// ΔQ[nC] = deltaQ * qlsb.
+	nC := int64(deltaQ) * int64(qlsb)
+	// Convert: 1 mAh = 3.6 C = 3.6e9 nC.
+	mAh := nC / 3_600_000_000
+	return int32(mAh), nil
+}
+
 // ---------- Low-level SMBus read/write word (little-endian: LOW then HIGH) ----------
 
 func (d *Device) readWord(reg byte) (uint16, error) {
