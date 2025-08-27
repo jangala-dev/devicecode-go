@@ -15,8 +15,8 @@ const (
 // Register map (16-bit word registers)
 // -----------------------------------------------------------------------------
 
-// --- Alert limit threshold registers (write your thresholds here; formats
-// match the corresponding telemetry registers). VBAT limits are per-cell.
+// Alert limit threshold registers (write thresholds here; formats match telemetry).
+// VBAT limits are per-cell.
 const (
 	regVBATLoAlertLimit     = 0x01 // VBAT format (per-cell)
 	regVBATHiAlertLimit     = 0x02 // VBAT format (per-cell)
@@ -32,14 +32,14 @@ const (
 	regNTCRatioLoAlertLimit = 0x0C // NTC_RATIO raw format (hot)
 )
 
-// --- Alert enable registers (set bitmasks below with Enable* helpers).
+// Alert enable registers.
 const (
 	regEnLimitAlerts     = 0x0D // R/W
 	regEnChargerStAlerts = 0x0E // R/W
 	regEnChargeStAlerts  = 0x0F // R/W
 )
 
-// --- Coulomb counter registers.
+// Coulomb counter registers.
 const (
 	regQCountLoLimit  = 0x10 // R/W
 	regQCountHiLimit  = 0x11 // R/W
@@ -47,14 +47,14 @@ const (
 	regQCount         = 0x13 // R/W
 )
 
-// --- Configuration / control registers.
+// Configuration / control registers.
 const (
 	regConfigBits      = 0x14 // R/W
 	regIinLimitSetting = 0x15 // R/W
 	regVinUvclSetting  = 0x16 // R/W
 )
 
-// --- Readouts / status registers.
+// Readouts / status registers.
 const (
 	regChargerState      = 0x34 // R
 	regChargeStatus      = 0x35 // R/Clear
@@ -79,12 +79,14 @@ const (
 // -----------------------------------------------------------------------------
 
 // CONFIG_BITS (0x14)
+type ConfigBits uint16
+
 const (
-	cfgSuspendCharger = 8
-	cfgRunBSR         = 5
-	cfgForceMeasSysOn = 4
-	cfgMPPTEnableI2C  = 3
-	cfgEnableQCount   = 2
+	CfgSuspendCharger ConfigBits = 1 << 8
+	CfgRunBSR         ConfigBits = 1 << 5
+	CfgForceMeasSysOn ConfigBits = 1 << 4
+	CfgMPPTEnableI2C  ConfigBits = 1 << 3
+	CfgEnableQCount   ConfigBits = 1 << 2
 )
 
 // CHARGER_STATE (0x34, mutually exclusive where applicable)
@@ -102,16 +104,6 @@ const (
 	StMaxChargeTimeFault ChargerState = 1 << 2
 	StBatMissingFault    ChargerState = 1 << 1
 	StBatShortFault      ChargerState = 1 << 0
-)
-
-// CHARGE_STATUS (0x35, mutually exclusive while charging)
-type ChargeStatus uint16
-
-const (
-	CsVinUvclActive  ChargeStatus = 1 << 3
-	CsIinLimitActive ChargeStatus = 1 << 2
-	CsConstCurrent   ChargeStatus = 1 << 1
-	CsConstVoltage   ChargeStatus = 1 << 0
 )
 
 // SYSTEM_STATUS (0x39)
@@ -132,75 +124,65 @@ const (
 	SysIntvccGt2p8V    SystemStatus = 1 << 0
 )
 
-// LIMIT_ALERTS (0x36, read/clear)
-const (
-	laMeasSysValidAlert = 15
-	// bit14 reserved
-	laQcountLoAlert   = 13
-	laQcountHiAlert   = 12
-	laVbatLoAlert     = 11
-	laVbatHiAlert     = 10
-	laVinLoAlert      = 9
-	laVinHiAlert      = 8
-	laVsysLoAlert     = 7
-	laVsysHiAlert     = 6
-	laIinHiAlert      = 5
-	laIbatLoAlert     = 4
-	laDieTempHiAlert  = 3
-	laBsrHiAlert      = 2
-	laNtcRatioHiAlert = 1 // cold
-	laNtcRatioLoAlert = 0 // hot
-)
-
 // -----------------------------------------------------------------------------
-// Typed enable masks (for EN_* registers)
+// Typed masks using alias pattern (enables ↔ alerts share bit definitions)
 // -----------------------------------------------------------------------------
 
-// EN_LIMIT_ALERTS (0x0D)
-type LimitEnable uint16
+// LIMIT_ALERTS / EN_LIMIT_ALERTS (0x36 / 0x0D)
+type LimitBits uint16
+type LimitEnable = LimitBits
+type LimitAlerts = LimitBits
 
 const (
-	EnMeasSysValid LimitEnable = 1 << 15
+	LaMeasSysValid LimitBits = 1 << 15
 	// bit14 reserved
-	EnQCountLo   LimitEnable = 1 << 13
-	EnQCountHi   LimitEnable = 1 << 12
-	EnVBATLo     LimitEnable = 1 << 11
-	EnVBATHi     LimitEnable = 1 << 10
-	EnVINLo      LimitEnable = 1 << 9
-	EnVINHi      LimitEnable = 1 << 8
-	EnVSYSLo     LimitEnable = 1 << 7
-	EnVSYSHi     LimitEnable = 1 << 6
-	EnIINHi      LimitEnable = 1 << 5
-	EnIBATLo     LimitEnable = 1 << 4
-	EnDieTempHi  LimitEnable = 1 << 3
-	EnBSRHi      LimitEnable = 1 << 2
-	EnNTCRatioHi LimitEnable = 1 << 1 // cold
-	EnNTCRatioLo LimitEnable = 1 << 0 // hot
+	LaQCountLo   LimitBits = 1 << 13
+	LaQCountHi   LimitBits = 1 << 12
+	LaVBATLo     LimitBits = 1 << 11
+	LaVBATHi     LimitBits = 1 << 10
+	LaVINLo      LimitBits = 1 << 9
+	LaVINHi      LimitBits = 1 << 8
+	LaVSYSLo     LimitBits = 1 << 7
+	LaVSYSHi     LimitBits = 1 << 6
+	LaIINHi      LimitBits = 1 << 5
+	LaIBATLo     LimitBits = 1 << 4
+	LaDieTempHi  LimitBits = 1 << 3
+	LaBSRHi      LimitBits = 1 << 2
+	LaNTCRatioHi LimitBits = 1 << 1 // cold
+	LaNTCRatioLo LimitBits = 1 << 0 // hot
 )
 
-// EN_CHARGER_STATE_ALERTS (0x0E)
-type ChargerStateEnable uint16
+// CHARGER_STATE_ALERTS / EN_CHARGER_STATE_ALERTS (0x37 / 0x0E)
+type ChargerStateBits uint16
+type ChargerStateEnable = ChargerStateBits
+type ChargerStateAlerts = ChargerStateBits
 
 const (
-	EnEqualizeCharge     ChargerStateEnable = 1 << 10
-	EnAbsorbCharge       ChargerStateEnable = 1 << 9
-	EnChargerSuspended   ChargerStateEnable = 1 << 8
-	EnPrecharge          ChargerStateEnable = 1 << 7
-	EnCCCVCharge         ChargerStateEnable = 1 << 6
-	EnNTCPause           ChargerStateEnable = 1 << 5
-	EnTimerTerm          ChargerStateEnable = 1 << 4
-	EnCOverXTerm         ChargerStateEnable = 1 << 3
-	EnMaxChargeTimeFault ChargerStateEnable = 1 << 2
-	EnBatMissingFault    ChargerStateEnable = 1 << 1
-	EnBatShortFault      ChargerStateEnable = 1 << 0
+	CsEqualizeCharge     ChargerStateBits = 1 << 10
+	CsAbsorbCharge       ChargerStateBits = 1 << 9
+	CsChargerSuspended   ChargerStateBits = 1 << 8
+	CsPrecharge          ChargerStateBits = 1 << 7
+	CsCCCVCharge         ChargerStateBits = 1 << 6
+	CsNTCPause           ChargerStateBits = 1 << 5
+	CsTimerTerm          ChargerStateBits = 1 << 4
+	CsCOverXTerm         ChargerStateBits = 1 << 3
+	CsMaxChargeTimeFault ChargerStateBits = 1 << 2
+	CsBatMissingFault    ChargerStateBits = 1 << 1
+	CsBatShortFault      ChargerStateBits = 1 << 0
 )
 
-// EN_CHARGE_STATUS_ALERTS (0x0F)
-type ChargeStatusEnable uint16
+// CHARGE_STATUS bits reused across status (0x35), enables (0x0F), and alerts (0x38).
+type ChargeStatusBits uint16
 
+// Aliases by register context
+type ChargeStatus = ChargeStatusBits       // 0x35 (read-only status)
+type ChargeStatusEnable = ChargeStatusBits // 0x0F (enable mask)
+type ChargeStatusAlerts = ChargeStatusBits // 0x38 (R/Clear)
+
+// Bit definitions (one set only)
 const (
-	EnVinUVCLActive   ChargeStatusEnable = 1 << 3
-	EnIinLimitActive  ChargeStatusEnable = 1 << 2
-	EnConstantCurrent ChargeStatusEnable = 1 << 1
-	EnConstantVoltage ChargeStatusEnable = 1 << 0
+	CsVinUvclActive  ChargeStatusBits = 1 << 3
+	CsIinLimitActive ChargeStatusBits = 1 << 2
+	CsConstCurrent   ChargeStatusBits = 1 << 1
+	CsConstVoltage   ChargeStatusBits = 1 << 0
 )

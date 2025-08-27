@@ -147,38 +147,37 @@ func main() {
 
 	println("LTC4015 Lead-Acid 6-cell test starting")
 
-	// Explicitly enable Coulomb counter
-	_ = dev.EnableQCount(true)
-
-	// Optionally force measurement system on without VIN
-	_ = dev.ForceMeasSystemOn(true)
+	// Enable Coulomb counter and keep measurement system on (typed config bits).
+	_ = dev.SetConfigBits(ltc4015.CfgEnableQCount | ltc4015.CfgForceMeasSysOn)
+	// Example: trigger a BSR run (self-clearing bit in hardware).
+	// _ = dev.SetConfigBits(ltc4015.CfgRunBSR)
 
 	// Enable all documented LIMIT alerts (excludes reserved bit 14)
 	_ = dev.EnableLimitAlertsMask(
-		ltc4015.EnMeasSysValid |
-			ltc4015.EnQCountLo | ltc4015.EnQCountHi |
-			ltc4015.EnVBATLo | ltc4015.EnVBATHi |
-			ltc4015.EnVINLo | ltc4015.EnVINHi |
-			ltc4015.EnVSYSLo | ltc4015.EnVSYSHi |
-			ltc4015.EnIINHi | ltc4015.EnIBATLo |
-			ltc4015.EnDieTempHi | ltc4015.EnBSRHi |
-			ltc4015.EnNTCRatioHi | ltc4015.EnNTCRatioLo,
+		ltc4015.LaMeasSysValid |
+			ltc4015.LaQCountLo | ltc4015.LaQCountHi |
+			ltc4015.LaVBATLo | ltc4015.LaVBATHi |
+			ltc4015.LaVINLo | ltc4015.LaVINHi |
+			ltc4015.LaVSYSLo | ltc4015.LaVSYSHi |
+			ltc4015.LaIINHi | ltc4015.LaIBATLo |
+			ltc4015.LaDieTempHi | ltc4015.LaBSRHi |
+			ltc4015.LaNTCRatioHi | ltc4015.LaNTCRatioLo,
 	)
 
 	// Enable all documented CHARGER_STATE alerts
 	_ = dev.EnableChargerStateAlertsMask(
-		ltc4015.EnEqualizeCharge | ltc4015.EnAbsorbCharge |
-			ltc4015.EnChargerSuspended | ltc4015.EnPrecharge |
-			ltc4015.EnCCCVCharge | ltc4015.EnNTCPause |
-			ltc4015.EnTimerTerm | ltc4015.EnCOverXTerm |
-			ltc4015.EnMaxChargeTimeFault | ltc4015.EnBatMissingFault |
-			ltc4015.EnBatShortFault,
+		ltc4015.CsEqualizeCharge | ltc4015.CsAbsorbCharge |
+			ltc4015.CsChargerSuspended | ltc4015.CsPrecharge |
+			ltc4015.CsCCCVCharge | ltc4015.CsNTCPause |
+			ltc4015.CsTimerTerm | ltc4015.CsCOverXTerm |
+			ltc4015.CsMaxChargeTimeFault | ltc4015.CsBatMissingFault |
+			ltc4015.CsBatShortFault,
 	)
 
 	// Enable all documented CHARGE_STATUS alerts
 	_ = dev.EnableChargeStatusAlertsMask(
-		ltc4015.EnVinUVCLActive | ltc4015.EnIinLimitActive |
-			ltc4015.EnConstantCurrent | ltc4015.EnConstantVoltage,
+		ltc4015.CsVinUvclActive | ltc4015.CsIinLimitActive |
+			ltc4015.CsConstCurrent | ltc4015.CsConstVoltage,
 	)
 
 	for {
@@ -203,6 +202,7 @@ func main() {
 		temp, _ := dev.DieMilliC()
 		bsr, _ := dev.BSRMicroOhmPerCell()
 		qc, _ := dev.QCount()
+
 		sys, _ := dev.SystemStatus()
 		limAlerts, _ := dev.ReadLimitAlerts()
 		chrStAlerts, _ := dev.ReadChargerStateAlerts()
@@ -215,15 +215,15 @@ func main() {
 		println("VSYS (mV):", vsys)
 		println("IBAT (mA):", ibat)
 		println("IIN (mA):", iin)
-		println("Die Temp (mC):", temp) // milli-degrees Celsius
+		println("Die Temp (mC):", temp)
 		println("BSR/cell (µΩ):", bsr)
 		println("QCOUNT:", qc)
 
-		// Decoded registers
-		printFlags("SystemStatus", sys, systemStatusBits)
-		printFlags("Limit Alerts", limAlerts, limitAlertBits)
-		printFlags("Charger State Alerts", chrStAlerts, chargerStateAlertBits)
-		printFlags("Charge Status Alerts", chrgAlerts, chargeStatusAlertBits)
+		// Decoded registers (cast typed masks to uint16 for printFlags)
+		printFlags("SystemStatus", uint16(sys), systemStatusBits)
+		printFlags("Limit Alerts", uint16(limAlerts), limitAlertBits)
+		printFlags("Charger State Alerts", uint16(chrStAlerts), chargerStateAlertBits)
+		printFlags("Charge Status Alerts", uint16(chrgAlerts), chargeStatusAlertBits)
 
 		// Clear alert latches after reporting
 		_ = dev.ClearLimitAlerts()
