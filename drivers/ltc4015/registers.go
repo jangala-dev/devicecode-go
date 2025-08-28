@@ -9,6 +9,7 @@ package ltc4015
 const (
 	// 7-bit I2C address (1101_000b).
 	AddressDefault = 0x68
+	ARAAddress     = 0x19 // Alert Response Address (read-only)
 )
 
 // -----------------------------------------------------------------------------
@@ -53,9 +54,6 @@ const (
 	regIinLimitSetting = 0x15 // R/W
 	regVinUvclSetting  = 0x16 // R/W
 )
-
-// --- SMBus ARA
-const ARAAddress = 0x19 // Alert Response Address (read-only)
 
 // --- Charger targets/timers and config
 const (
