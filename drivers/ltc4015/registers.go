@@ -104,7 +104,7 @@ const (
 	CfgEnableQCount   ConfigBits = 1 << 2
 )
 
-// CONFIG_BITS (0x14)
+// CHARGER_CONFIG_BITS (0x29)
 type ChargerCfgBits uint16
 
 const (
