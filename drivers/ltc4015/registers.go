@@ -9,7 +9,6 @@ package ltc4015
 const (
 	// 7-bit I2C address (1101_000b).
 	AddressDefault = 0x68
-	ARAAddress     = 0x19 // Alert Response Address (read-only)
 )
 
 // -----------------------------------------------------------------------------
@@ -55,7 +54,10 @@ const (
 	regVinUvclSetting  = 0x16 // R/W
 )
 
-// --- Charger targets/timers and config
+// --- SMBus ARA
+const ARAAddress = 0x19 // Alert Response Address (read-only)
+
+// --- Charger targets/timers and config (note: some parts are read-only in fixed-chem modes)
 const (
 	regIChargeTarget   = 0x1A // ICHARGE_TARGET (R/W)      [5-bit field]
 	regVChargeSetting  = 0x1B // VCHARGE_SETTING (R/W)     [6-bit field, LA use]
@@ -67,6 +69,13 @@ const (
 	regMaxAbsorbTime   = 0x2B
 	regVEqualizeDelta  = 0x2C // VEQUALIZE_DELTA (R/W)     [LA, per-cell]
 	regEqualizeTime    = 0x2D // EQUALIZE_TIME (R/W)       [s]
+)
+
+// Effective DAC read-backs (applied targets after algorithms/JEITA)
+const (
+	regIChargeDAC  = 0x44 // ICHARGE_DAC (R)
+	regVChargeDAC  = 0x45 // VCHARGE_DAC (R)
+	regIinLimitDAC = 0x46 // IIN_LIMIT_DAC (R)
 )
 
 // Readouts / status registers.
@@ -113,7 +122,7 @@ const (
 	CfgEnJEITA            ChargerCfgBits = 1 << 0
 )
 
-// CHARGER_STATE (0x34, mutually exclusive where applicable)
+// CHARGER_STATE (0x34)
 type ChargerState uint16
 
 const (

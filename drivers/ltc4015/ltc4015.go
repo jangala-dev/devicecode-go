@@ -1,13 +1,6 @@
-// Package ltc4015 provides a minimal TinyGo driver for the LTC4015
-// multi-chemistry synchronous buck battery charger.
-//
-// Design notes (datasheet references):
-// • I2C/SMBus, 400kHz, read/write word protocol; data-low then data-high.
-// • Default 7-bit address = 0b1101000.
-// • Integer-only telemetry scaling (VBAT, VIN, VSYS, IBAT, IIN, DIE_TEMP, NTC_RATIO, BSR).
-// • System status and alert registers with clear-on-write-0 behaviour.
-// • Limit alert enables / limits and Coulomb counter controls.
-
+// Package ltc4015 provides a TinyGo driver for the LTC4015 multi-chemistry
+// synchronous buck battery charger. The public API is integer-only. Methods
+// are not safe for concurrent use and should be serialised by the caller.
 package ltc4015
 
 import (
@@ -15,10 +8,6 @@ import (
 
 	"tinygo.org/x/drivers"
 )
-
-// ---------------- Top level vars ----------------
-
-var ErrNotApplicable = errors.New("not applicable for current chemistry")
 
 // ---------------- Types and configuration ----------------
 
@@ -30,13 +19,43 @@ const (
 	ChemLeadAcid           // VBAT LSB: 128.176 µV/cell
 )
 
+var (
+	ErrTargetsReadOnly  = errors.New("targets/timers are read-only in fixed-chem mode")
+	ErrChemistryUnknown = errors.New("unable to determine chemistry")
+)
+
 type Config struct {
-	Address        uint16
-	RSNSB_uOhm     uint32
-	RSNSI_uOhm     uint32
-	Cells          uint8
-	Chem           Chemistry
-	QCountPrescale uint16 // if 0, leave hardware default
+	Address         uint16
+	RSNSB_uOhm      uint32
+	RSNSI_uOhm      uint32
+	Cells           uint8
+	Chem            Chemistry
+	QCountPrescale  uint16 // if 0, leave hardware default
+	TargetsWritable bool   // set false if using a fixed-chem variant (guards 0x1A–0x2D)
+}
+
+// DefaultConfig returns a minimal configuration. Sense resistors must be set by
+// the caller to use current-related APIs.
+func DefaultConfig() Config {
+	return Config{
+		Address:         AddressDefault,
+		Chem:            ChemLithium, // default unless overridden/detected
+		TargetsWritable: true,
+	}
+}
+
+// Validate performs basic checks on values that are required by many APIs.
+func (c Config) Validate() error {
+	if c.Address == 0 {
+		return errors.New("Address must be non-zero (use AddressDefault)")
+	}
+	if c.RSNSB_uOhm == 0 {
+		return errors.New("RSNSB_uOhm must be set (battery path sense)")
+	}
+	if c.RSNSI_uOhm == 0 {
+		return errors.New("RSNSI_uOhm must be set (input path sense)")
+	}
+	return nil
 }
 
 type Device struct {
@@ -45,8 +64,9 @@ type Device struct {
 	cells uint8
 	chem  Chemistry
 
-	rsnsB_uOhm uint32
-	rsnsI_uOhm uint32
+	rsnsB_uOhm      uint32
+	rsnsI_uOhm      uint32
+	targetsWritable bool
 
 	// Fixed buffers to avoid per-call heap allocations.
 	w [3]byte
@@ -63,25 +83,24 @@ func New(i2c drivers.I2C, cfg Config) *Device {
 		chem = ChemLithium
 	}
 	return &Device{
-		i2c:        i2c,
-		addr:       addr,
-		cells:      cfg.Cells,
-		chem:       chem,
-		rsnsB_uOhm: cfg.RSNSB_uOhm,
-		rsnsI_uOhm: cfg.RSNSI_uOhm,
+		i2c:             i2c,
+		addr:            addr,
+		cells:           cfg.Cells,
+		chem:            chem,
+		rsnsB_uOhm:      cfg.RSNSB_uOhm,
+		rsnsI_uOhm:      cfg.RSNSI_uOhm,
+		targetsWritable: cfg.TargetsWritable,
 	}
 }
 
 func (d *Device) Configure(cfg Config) error {
+	// Chemistry is treated as fixed after construction; do not change here.
 	if cfg.Cells != 0 {
 		d.cells = cfg.Cells
 	} else {
 		if v, err := d.readWord(regChemCells); err == nil {
 			d.cells = uint8(v & 0x000F) // pins-based cell count (bits 3:0)
 		}
-	}
-	if cfg.Chem != ChemUnknown {
-		d.chem = cfg.Chem
 	}
 	if cfg.RSNSB_uOhm != 0 {
 		d.rsnsB_uOhm = cfg.RSNSB_uOhm
@@ -94,12 +113,28 @@ func (d *Device) Configure(cfg Config) error {
 			return err
 		}
 	}
+	// TargetsWritable may be updated if the caller knows the variant.
+	if !cfg.TargetsWritable {
+		d.targetsWritable = false
+	}
+	return nil
+}
+
+// Introspection.
+func (d *Device) Chem() Chemistry { return d.chem }
+func (d *Device) Cells() uint8    { return d.cells }
+
+// ---------------- Helpers ----------------
+
+func (d *Device) ensureTargetsWritable() error {
+	if !d.targetsWritable {
+		return ErrTargetsReadOnly
+	}
 	return nil
 }
 
 // ---------------- Generic bitmask register control ----------------
 
-// modifyBitmaskRegister is a private helper for the read-modify-write pattern
 func (d *Device) modifyBitmaskRegister(regAddr byte, set, clear uint16) error {
 	current, err := d.readWord(regAddr)
 	if err != nil {
@@ -134,7 +169,7 @@ func (d *Device) UpdateConfig(set, clear ConfigBits) error {
 	return d.modifyBitmaskRegister(regConfigBits, uint16(set), uint16(clear))
 }
 
-// ---------------- CHARGER_CONFIG_BITS control (typed, minimal API) ----------------
+// ---------------- CHARGER_CONFIG_BITS control ----------------
 
 func (b ChargerCfgBits) Has(flag ChargerCfgBits) bool { return b&flag != 0 }
 
@@ -168,7 +203,6 @@ func (b SystemStatus) Has(flag SystemStatus) bool         { return b&flag != 0 }
 
 // ---------------- Chemistry/Cell detection ----------------
 
-// DetectCells returns the pin-defined cell count.
 func (d *Device) DetectCells() (uint8, error) {
 	v, err := d.readWord(regChemCells)
 	if err != nil {
@@ -177,7 +211,6 @@ func (d *Device) DetectCells() (uint8, error) {
 	return uint8(v & 0x000F), nil
 }
 
-// DetectChemistry returns the device-reported chemistry.
 func (d *Device) DetectChemistry() (Chemistry, error) {
 	v, err := d.readWord(regChemCells)
 	if err != nil {
@@ -294,7 +327,41 @@ func (d *Device) MeasSystemValid() (bool, error) {
 	return (v & 0x0001) != 0, nil
 }
 
-// Typed status readers.
+// ---------------- Effective DAC read-backs ----------------
+
+// Raw codes
+func (d *Device) IChargeDACCode() (uint16, error)  { return d.readWord(regIChargeDAC) }
+func (d *Device) VChargeDACCode() (uint16, error)  { return d.readWord(regVChargeDAC) }
+func (d *Device) IinLimitDACCode() (uint16, error) { return d.readWord(regIinLimitDAC) }
+
+// Convenience in physical units (requires RSNS values).
+func (d *Device) IChargeDAC_mA() (int32, error) {
+	if d.rsnsB_uOhm == 0 {
+		return 0, errors.New("RSNSB_uOhm not set")
+	}
+	code, err := d.IChargeDACCode()
+	if err != nil {
+		return 0, err
+	}
+	// I = ((code+1)*1 mV)/RSNSB
+	mA := (int64(code) + 1) * 1_000_000 / int64(d.rsnsB_uOhm)
+	return int32(mA), nil
+}
+
+func (d *Device) IinLimitDAC_mA() (int32, error) {
+	if d.rsnsI_uOhm == 0 {
+		return 0, errors.New("RSNSI_uOhm not set")
+	}
+	code, err := d.IinLimitDACCode()
+	if err != nil {
+		return 0, err
+	}
+	// I = ((code+1)*0.5 mV)/RSNSI
+	mA := (int64(code) + 1) * 500_000 / int64(d.rsnsI_uOhm)
+	return int32(mA), nil
+}
+
+// ---------------- Typed status readers ----------------
 
 func (d *Device) SystemStatus() (SystemStatus, error) {
 	v, err := d.readWord(regSystemStatus)
@@ -312,8 +379,6 @@ func (d *Device) ChargeStatus() (ChargeStatus, error) {
 }
 
 // ---------------- Limits, enables, alerts ----------------
-
-// Threshold setters.
 
 func (d *Device) SetVBATWindow_mVPerCell(lo_mV, hi_mV int32) error {
 	if err := d.writeWord(regVBATLoAlertLimit, d.toVBATCode(lo_mV)); err != nil {
@@ -374,8 +439,6 @@ func (d *Device) SetNTCRatioWindowRaw(hi, lo uint16) error {
 	return d.writeWord(regNTCRatioLoAlertLimit, lo)
 }
 
-// Enable masks (absolute write; compact API).
-
 func (d *Device) EnableLimitAlertsMask(mask LimitEnable) error {
 	return d.writeWord(regEnLimitAlerts, uint16(mask))
 }
@@ -387,8 +450,6 @@ func (d *Device) EnableChargerStateAlertsMask(mask ChargerStateEnable) error {
 func (d *Device) EnableChargeStatusAlertsMask(mask ChargeStatusEnable) error {
 	return d.writeWord(regEnChargeStAlerts, uint16(mask))
 }
-
-// Alert reads/clears.
 
 func (d *Device) ReadLimitAlerts() (LimitAlerts, error) {
 	v, err := d.readWord(regLimitAlerts)
@@ -428,17 +489,15 @@ func (d *Device) SetIinLimit_mA(mA int32) error {
 	if d.rsnsI_uOhm == 0 {
 		return errors.New("RSNSI_uOhm not set")
 	}
-	// µV across RSNSI = (mA * µΩ)/1000
-	v_uV := (int64(mA) * int64(d.rsnsI_uOhm)) / 1000
+	v_uV := (int64(mA) * int64(d.rsnsI_uOhm)) / 1000 // µV across RSNSI
 	code := qLinear(v_uV, 500 /*µV*/, 0, true, 0, 63)
 	return d.writeWord(regIinLimitSetting, code)
 }
 
-// VIN_UVCL: (code+1)*4.6875 mV, 0..255.
-// Use nanovolts to avoid fractional LSB.
+// VIN_UVCL: (code+1)*4.6875 mV, 0..255 (nanovolts avoid fractional LSB).
 func (d *Device) SetVinUvcl_mV(mV int32) error {
-	v_nV := int64(mV) * 1_000_000 // mV → nV
-	step_nV := int64(4_687_500)   // 4.6875 mV in nV
+	v_nV := int64(mV) * 1_000_000
+	step_nV := int64(4_687_500)
 	code := qLinear(v_nV, step_nV, 0, true, 0, 255)
 	return d.writeWord(regVinUvclSetting, code)
 }
@@ -447,6 +506,9 @@ func (d *Device) SetVinUvcl_mV(mV int32) error {
 
 // ICHARGE_TARGET: (code+1)*1 mV across RSNSB, 0..31.
 func (d *Device) SetIChargeTarget_mA(mA int32) error {
+	if err := d.ensureTargetsWritable(); err != nil {
+		return err
+	}
 	if d.rsnsB_uOhm == 0 {
 		return errors.New("RSNSB_uOhm not set")
 	}
@@ -455,69 +517,8 @@ func (d *Device) SetIChargeTarget_mA(mA int32) error {
 	return d.writeWord(regIChargeTarget, code)
 }
 
-// Lead-acid only: VCHARGE_SETTING per-cell.
-// code ≈ round(105*(mV - 2000)/1000); clamp 0..63; optional cap 35 with tempComp.
-func (d *Device) SetVChargeSetting_mVPerCell(mV int32, tempComp bool) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	code := laCountsFrommV(mV, 2000)
-	if tempComp && code > 35 {
-		code = 35
-	}
-	code = clampRange(code, 0, 63)
-	return d.writeWord(regVChargeSetting, uint16(code))
-}
+// ---------------- Low-level SMBus (READ/WRITE WORD & ARA) ----------------
 
-// Lead-acid only: absorb delta per-cell, same scaling (offset 0).
-func (d *Device) SetVAbsorbDelta_mVPerCell(delta int32) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	code := clampRange(laCountsFrommV(delta, 0), 0, 63)
-	return d.writeWord(regVAbsorbDelta, uint16(code))
-}
-
-// Lead-acid only: equalise delta per-cell, same scaling (offset 0).
-func (d *Device) SetVEqualizeDelta_mVPerCell(delta int32) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	code := clampRange(laCountsFrommV(delta, 0), 0, 63)
-	return d.writeWord(regVEqualizeDelta, uint16(code))
-}
-
-// Lead-acid only: writes MAX_CV_TIME (s).
-func (d *Device) SetMaxAbsorbTime_s(sec uint16) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	return d.writeWord(regMaxAbsorbTime, sec)
-}
-
-// Lead-acid only: writes EQUALIZE_TIME (s).
-func (d *Device) SetEqualizeTime_s(sec uint16) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	return d.writeWord(regEqualizeTime, sec)
-}
-
-// Lead-acid only: toggles the LA temp compensation bit in CHARGER_CONFIG_BITS.
-func (d *Device) EnableLeadAcidTempComp(on bool) error {
-	if d.chem != ChemLeadAcid {
-		return ErrNotApplicable
-	}
-	if on {
-		return d.SetChargerConfigBits(CfgEnLeadAcidTempComp)
-	}
-	return d.ClearChargerConfigBits(CfgEnLeadAcidTempComp)
-}
-
-// ---------------- Low-level SMBus (READ/WRITE WORD) ----------------
-
-// AcknowledgeAlert reads the SMBus Alert Response Address (0x19).
-// Returns true if the LTC4015 (0xD1) identified itself and released SMBALERT.
 func (d *Device) AcknowledgeAlert() (bool, error) {
 	var r [1]byte
 	if err := d.i2c.Tx(ARAAddress, nil, r[:]); err != nil {
@@ -526,13 +527,12 @@ func (d *Device) AcknowledgeAlert() (bool, error) {
 	return r[0] == 0xD1, nil
 }
 
-// Optional functional pin interface (if a platform wants to poll the alert line).
 type PinInput func() bool // returns logical level
 
 // SMBALERT is active-low; this helper keeps the driver portable.
 func (d *Device) AlertActive(get PinInput) bool { return !get() }
 
-// ---------------- Low-level SMBus (READ/WRITE WORD) ----------------
+// --- bus word primitives
 
 func (d *Device) readWord(reg byte) (uint16, error) {
 	d.w[0] = reg
@@ -557,7 +557,6 @@ func (d *Device) writeWord(reg byte, val uint16) error {
 
 // ---------------- Integer scaling helpers ----------------
 
-// clampRange limits v to [lo, hi].
 func clampRange(v, lo, hi int64) int64 {
 	if v < lo {
 		return lo
@@ -572,17 +571,16 @@ func clamp16(v int64) uint16 {
 	return uint16(int16(clampRange(v, -32768, 32767)))
 }
 
-// qLinear quantises a physical value onto a linear code:
+// qLinear maps a physical value onto a linear code:
 //
 //	code_physical = (code + addOne?1:0)*step + offset
 //
-// so the inverse is:
+// inverse:
 //
 //	code = round((value - offset)/step) - (addOne?1:0)
 //
 // All parameters are integers in consistent units (e.g. nV or µV).
 func qLinear(value, step, offset int64, addOne bool, lo, hi int64) uint16 {
-	// round-to-nearest; inputs assumed non-negative in this driver’s use
 	num := value - offset
 	if num < 0 {
 		num = 0
