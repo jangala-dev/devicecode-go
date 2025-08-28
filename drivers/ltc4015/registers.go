@@ -54,6 +54,23 @@ const (
 	regVinUvclSetting  = 0x16 // R/W
 )
 
+// --- SMBus ARA
+const ARAAddress = 0x19 // Alert Response Address (read-only)
+
+// --- Charger targets/timers and config
+const (
+	regIChargeTarget   = 0x1A // ICHARGE_TARGET (R/W)      [5-bit field]
+	regVChargeSetting  = 0x1B // VCHARGE_SETTING (R/W)     [6-bit field, LA use]
+	regCOverXThreshold = 0x1C // C/X_THRESHOLD (R/W)
+	regMaxCVTime       = 0x1D // MAX_CV_TIME (R/W)         [s]
+	regMaxChargeTime   = 0x1E // MAX_CHARGE_TIME (R/W)     [s]
+	regChargerCfgBits  = 0x29 // CHARGER_CONFIG_BITS (R/W)
+	regVAbsorbDelta    = 0x2A // VABSORB_DELTA (R/W)       [LA, per-cell]
+	regMaxAbsorbTime   = 0x2B
+	regVEqualizeDelta  = 0x2C // VEQUALIZE_DELTA (R/W)     [LA, per-cell]
+	regEqualizeTime    = 0x2D // EQUALIZE_TIME (R/W)       [s]
+)
+
 // Readouts / status registers.
 const (
 	regChargerState      = 0x34 // R
@@ -87,6 +104,15 @@ const (
 	CfgForceMeasSysOn ConfigBits = 1 << 4
 	CfgMPPTEnableI2C  ConfigBits = 1 << 3
 	CfgEnableQCount   ConfigBits = 1 << 2
+)
+
+// CONFIG_BITS (0x14)
+type ChargerCfgBits uint16
+
+const (
+	CfgEnCOverXTerm       ChargerCfgBits = 1 << 2
+	CfgEnLeadAcidTempComp ChargerCfgBits = 1 << 1
+	CfgEnJEITA            ChargerCfgBits = 1 << 0
 )
 
 // CHARGER_STATE (0x34, mutually exclusive where applicable)
