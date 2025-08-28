@@ -508,17 +508,10 @@ func (d *Device) EnableLeadAcidTempComp(on bool) error {
 	if d.chem != ChemLeadAcid {
 		return ErrNotApplicable
 	}
-
-	v, err := d.readWord(regChargerCfgBits)
-	if err != nil {
-		return err
-	}
 	if on {
-		v |= 1 << 1
-	} else {
-		v &^= 1 << 1
+		return d.SetChargerConfigBits(CfgEnLeadAcidTempComp)
 	}
-	return d.writeWord(regChargerCfgBits, v)
+	return d.ClearChargerConfigBits(CfgEnLeadAcidTempComp)
 }
 
 // ---------------- Low-level SMBus (READ/WRITE WORD) ----------------
