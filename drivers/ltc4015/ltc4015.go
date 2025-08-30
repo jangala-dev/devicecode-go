@@ -524,7 +524,8 @@ func (d *Device) AcknowledgeAlert() (bool, error) {
 	if err := d.i2c.Tx(ARAAddress, nil, r[:]); err != nil {
 		return false, err
 	}
-	return r[0] == 0xD1, nil
+	expected := byte((d.addr << 1) | 1)
+	return r[0] == expected, nil
 }
 
 type PinInput func() bool // returns logical level
