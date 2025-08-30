@@ -55,7 +55,9 @@ const (
 )
 
 // --- SMBus ARA
-const ARAAddress = 0x19 // Alert Response Address (read-only)
+// SMBus Alert Response Address: datasheet quotes 0x19 (8-bit incl. R/W).
+// TinyGo I2C expects a 7-bit address, which is 0x0C.
+const ARAAddress = 0x0C
 
 // --- Charger targets/timers and config (note: some parts are read-only in fixed-chem modes)
 const (
