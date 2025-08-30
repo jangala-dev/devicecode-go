@@ -2,234 +2,200 @@ package main
 
 import (
 	"machine"
+	"sync/atomic"
 	"time"
 
 	"devicecode-go/drivers/ltc4015"
 )
 
-// bit describes a single bit in a status/alert register.
-type bit struct {
-	pos   uint8
-	label string
-}
+const smbPin = machine.GP15
 
-// ----- Bit maps (from datasheet) -----
-
-// SYSTEM_STATUS (0x39) bits we care about (others are reserved/unused).
-var systemStatusBits = []bit{
-	{13, "charger_enabled"}, // actively charging
-	{11, "mppt_en_pin"},     // MPPT pin high
-	{10, "equalize_req"},    // equalize queued/running (lead-acid)
-	{9, "drvcc_good"},
-	{8, "cell_count_error"},
-	{6, "ok_to_charge"},
-	{5, "no_rt"},
-	{4, "thermal_shutdown"},
-	{3, "vin_ovlo"},
-	{2, "vin_gt_vbat"},
-	{1, "intvcc_gt_4p3v"},
-	{0, "intvcc_gt_2p8v"},
-}
-
-// LIMIT_ALERTS (0x36)
-var limitAlertBits = []bit{
-	{15, "meas_sys_valid"},
-	// 14 reserved
-	{13, "qcount_lo"},
-	{12, "qcount_hi"},
-	{11, "vbat_lo"},
-	{10, "vbat_hi"},
-	{9, "vin_lo"},
-	{8, "vin_hi"},
-	{7, "vsys_lo"},
-	{6, "vsys_hi"},
-	{5, "iin_hi"},
-	{4, "ibat_lo"},
-	{3, "die_temp_hi"},
-	{2, "bsr_hi"},
-	{1, "ntc_ratio_hi(cold)"},
-	{0, "ntc_ratio_lo(hot)"},
-}
-
-// CHARGER_STATE_ALERTS (0x37)
-var chargerStateAlertBits = []bit{
-	{10, "equalize_charge"},
-	{9, "absorb_charge"},
-	{8, "charger_suspended"},
-	{7, "precharge"},
-	{6, "cc_cv_charge"},
-	{5, "ntc_pause"},
-	{4, "timer_term"},
-	{3, "c_over_x_term"},
-	{2, "max_charge_time_fault"},
-	{1, "bat_missing_fault"},
-	{0, "bat_short_fault"},
-}
-
-// CHARGE_STATUS_ALERTS (0x38)
-var chargeStatusAlertBits = []bit{
-	{3, "vin_uvcl_active"},
-	{2, "iin_limit_active"},
-	{1, "constant_current"},
-	{0, "constant_voltage"},
-}
-
-// printFlags prints a comma-separated list of set flags in v according to map bits.
-// Uses print/println to avoid fmt overhead. Also includes any unknown set bits.
-func printFlags(title string, v uint16, bits []bit) {
-	print(title, " (", v, "): ")
-	count := 0
-	for _, b := range bits {
-		if (v>>b.pos)&1 == 1 {
-			if count > 0 {
-				print(", ")
-			}
-			print(b.label)
-			count++
-		}
-	}
-	// report unexpected/reserved bits if they are set
-	var knownMask uint16
-	for _, b := range bits {
-		knownMask |= 1 << b.pos
-	}
-	extra := v &^ knownMask
-	if extra != 0 {
-		if count > 0 {
-			print(", ")
-		}
-		print("unknown_bits:")
-		first := true
-		for i := uint8(0); i < 16; i++ {
-			if (extra>>i)&1 == 1 {
-				if !first {
-					print("|")
-				}
-				print("b", int(i))
-				first = false
-			}
-		}
-		count++
-	}
-	if count == 0 {
-		print("none")
-	}
-	println()
-}
+// Buffered channel for ISR -> main signalling (ISR must not block).
+var alertCh = make(chan struct{}, 4)
+var dropped uint32 // count ISR sends that could not enqueue
 
 func main() {
+	// Allow USB CDC to enumerate before we print.
 	time.Sleep(2 * time.Second)
-	machine.Serial.Configure(machine.UARTConfig{})
+	println("boot")
 
-	println("LTC4015 Pico test starting...")
-
-	// Configure I2C0 (Pico default).
+	// I2C0 @ 400 kHz on Pico defaults.
 	machine.I2C0.Configure(machine.I2CConfig{
 		Frequency: 400 * machine.KHz,
 		SDA:       machine.I2C0_SDA_PIN,
 		SCL:       machine.I2C0_SCL_PIN,
 	})
 
-	cfg := ltc4015.Config{
-		RSNSB_uOhm: 3330, // 0.00333Ω
-		RSNSI_uOhm: 1670, // 0.00167Ω
+	// SMBALERT# pin (open-drain, active-low) with pull-up.
+	// If the board already has a pull-up, PinInput is sufficient.
+	smbPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+	if err := smbPin.SetInterrupt(machine.PinFalling, func(machine.Pin) {
+		select {
+		case alertCh <- struct{}{}:
+		default:
+			atomic.AddUint32(&dropped, 1)
+		}
+	}); err != nil {
+		println("SetInterrupt:", err.Error())
+	}
+
+	// LTC4015 device with configuration.
+	// Known chemistry → use New (not NewAuto).
+	dev := ltc4015.New(machine.I2C0, ltc4015.Config{
+		RSNSB_uOhm: 3330, // 0.00333 Ω
+		RSNSI_uOhm: 1670, // 0.00167 Ω
 		Cells:      6,
 		Chem:       ltc4015.ChemLeadAcid,
-	}
+	})
 
-	dev := ltc4015.New(machine.I2C0, cfg)
-	if err := dev.Configure(cfg); err != nil {
-		println("configure error")
-		for {
-			time.Sleep(time.Hour)
+	// Keep telemetry running and enable.
+	_ = dev.SetConfigBits(ltc4015.CfgForceMeasSysOn | ltc4015.CfgEnableQCount)
+
+	// 1) Disable non-charger groups explicitly and clear any latches.
+	_ = dev.EnableLimitAlertsMask(0)
+	_ = dev.EnableChargerStateAlertsMask(0)
+	_ = dev.ClearLimitAlerts()
+	_ = dev.ClearChargerStateAlerts()
+
+	// 2) Charger-status only; enable edge-triggered behaviour.
+	// Enable only bits that are not currently active, then clear latches.
+	enabled := baseMask()
+	if cur, err := dev.ChargeStatus(); err == nil {
+		enabled &^= cur
+	}
+	_ = dev.EnableChargeStatusAlertsMask(enabled)
+	_ = dev.ClearChargeStatusAlerts()
+
+	// If ALERT# is already low at boot, service once (use driver polarity helper).
+	if dev.AlertActive(func() bool { return smbPin.Get() }) {
+		select {
+		case alertCh <- struct{}{}:
+		default:
 		}
 	}
 
-	println("LTC4015 Lead-Acid 6-cell test starting")
+	// Periodic stats.
+	tick := time.NewTicker(1 * time.Second)
+	defer tick.Stop()
 
-	// Enable Coulomb counter and keep measurement system on (typed config bits).
-	_ = dev.SetConfigBits(ltc4015.CfgEnableQCount | ltc4015.CfgForceMeasSysOn)
-	// Example: trigger a BSR run (self-clearing bit in hardware).
-	// _ = dev.SetConfigBits(ltc4015.CfgRunBSR)
-
-	// Enable all documented LIMIT alerts (excludes reserved bit 14)
-	_ = dev.EnableLimitAlertsMask(
-		ltc4015.LaMeasSysValid |
-			ltc4015.LaQCountLo | ltc4015.LaQCountHi |
-			ltc4015.LaVBATLo | ltc4015.LaVBATHi |
-			ltc4015.LaVINLo | ltc4015.LaVINHi |
-			ltc4015.LaVSYSLo | ltc4015.LaVSYSHi |
-			ltc4015.LaIINHi | ltc4015.LaIBATLo |
-			ltc4015.LaDieTempHi | ltc4015.LaBSRHi |
-			ltc4015.LaNTCRatioHi | ltc4015.LaNTCRatioLo,
-	)
-
-	// Enable all documented CHARGER_STATE alerts
-	_ = dev.EnableChargerStateAlertsMask(
-		ltc4015.CsEqualizeCharge | ltc4015.CsAbsorbCharge |
-			ltc4015.CsChargerSuspended | ltc4015.CsPrecharge |
-			ltc4015.CsCCCVCharge | ltc4015.CsNTCPause |
-			ltc4015.CsTimerTerm | ltc4015.CsCOverXTerm |
-			ltc4015.CsMaxChargeTimeFault | ltc4015.CsBatMissingFault |
-			ltc4015.CsBatShortFault,
-	)
-
-	// Enable all documented CHARGE_STATUS alerts
-	_ = dev.EnableChargeStatusAlertsMask(
-		ltc4015.CsVinUvclActive | ltc4015.CsIinLimitActive |
-			ltc4015.CsConstCurrent | ltc4015.CsConstVoltage,
-	)
+	println("SMBALERT# armed on GP15; edge-triggered charger-status alerts")
 
 	for {
-		valid, err := dev.MeasSystemValid()
-		if err != nil {
-			println("MEAS_SYS_VALID error")
-			time.Sleep(time.Second)
-			continue
+		select {
+		case <-alertCh:
+			serviceChgStatus(dev, &enabled, smbPin)
+
+		case <-tick.C:
+			if ok, err := dev.MeasSystemValid(); err == nil && ok {
+				printStats(dev)
+			}
 		}
-		if !valid {
-			println("Measurement system not valid yet")
-			time.Sleep(time.Second)
-			continue
-		}
-
-		vcell, _ := dev.BatteryMilliVPerCell()
-		vpack, _ := dev.BatteryMilliVPack()
-		vin, _ := dev.VinMilliV()
-		vsys, _ := dev.VsysMilliV()
-		ibat, _ := dev.IbatMilliA()
-		iin, _ := dev.IinMilliA()
-		temp, _ := dev.DieMilliC()
-		bsr, _ := dev.BSRMicroOhmPerCell()
-		qc, _ := dev.QCount()
-
-		sys, _ := dev.SystemStatus()
-		limAlerts, _ := dev.ReadLimitAlerts()
-		chrStAlerts, _ := dev.ReadChargerStateAlerts()
-		chrgAlerts, _ := dev.ReadChargeStatusAlerts()
-
-		println("------------------------------------------")
-		println("VBAT per cell (mV):", vcell)
-		println("VBAT pack (mV):", vpack)
-		println("VIN (mV):", vin)
-		println("VSYS (mV):", vsys)
-		println("IBAT (mA):", ibat)
-		println("IIN (mA):", iin)
-		println("Die Temp (mC):", temp)
-		println("BSR/cell (µΩ):", bsr)
-		println("QCOUNT:", qc)
-
-		// Decoded registers (cast typed masks to uint16 for printFlags)
-		printFlags("SystemStatus", uint16(sys), systemStatusBits)
-		printFlags("Limit Alerts", uint16(limAlerts), limitAlertBits)
-		printFlags("Charger State Alerts", uint16(chrStAlerts), chargerStateAlertBits)
-		printFlags("Charge Status Alerts", uint16(chrgAlerts), chargeStatusAlertBits)
-
-		// Clear alert latches after reporting
-		_ = dev.ClearLimitAlerts()
-		_ = dev.ClearChargerStateAlerts()
-		_ = dev.ClearChargeStatusAlerts()
-
-		time.Sleep(2 * time.Second)
 	}
+}
+
+func serviceChgStatus(dev *ltc4015.Device, enabled *ltc4015.ChargeStatusEnable, pin machine.Pin) {
+	// Drain until ALERT# deasserts, with a generous safety cap.
+	const maxIters = 64
+	for iters := 0; !pin.Get() && iters < maxIters; iters++ {
+		// ARA + drain alerts (driver also clears latches).
+		ev, ok, err := dev.ServiceSMBAlert()
+		if err != nil {
+			// If the line rose while we were starting ARA, treat as drained.
+			if pin.Get() {
+				return
+			}
+			println("ServiceSMBAlert:", err.Error())
+			return
+		}
+		if !ok {
+			// Another device responded; brief settle then re-check the line.
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+
+		// Report newly-active CHARGE_STATUS bits we were watching.
+		newActive := ev.ChgStatus & *enabled
+		reportChgStatus(newActive)
+
+		// Recompute enable mask so we only trigger on future transitions.
+		if s, err := dev.ChargeStatus(); err == nil {
+			newEn := baseMask() &^ s
+			if newEn != *enabled {
+				*enabled = newEn
+				_ = dev.EnableChargeStatusAlertsMask(*enabled) // write only on change
+			}
+		}
+
+		// Small settle to allow any subsequent alert to assert.
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Still asserted after our safety cap? Re-queue a follow-up attempt to avoid starvation
+	if !pin.Get() {
+		time.Sleep(2 * time.Millisecond)
+		select {
+		case alertCh <- struct{}{}:
+		default:
+			atomic.AddUint32(&dropped, 1)
+		}
+	}
+}
+
+func baseMask() ltc4015.ChargeStatusEnable {
+	return ltc4015.CsVinUvclActive |
+		ltc4015.CsIinLimitActive |
+		ltc4015.CsConstCurrent |
+		ltc4015.CsConstVoltage
+}
+
+func reportChgStatus(s ltc4015.ChargeStatusAlerts) {
+	if s == 0 {
+		return
+	}
+	if s.Has(ltc4015.CsVinUvclActive) {
+		println("STATUS: VIN UVCL active")
+	}
+	if s.Has(ltc4015.CsIinLimitActive) {
+		println("STATUS: input current limited")
+	}
+	if s.Has(ltc4015.CsConstCurrent) {
+		println("STATUS: CC phase")
+	}
+	if s.Has(ltc4015.CsConstVoltage) {
+		println("STATUS: CV phase")
+	}
+}
+
+func printStats(dev *ltc4015.Device) {
+	if mv, err := dev.VinMilliV(); err == nil {
+		print("VIN: ", mv, " | ")
+	}
+	if mv, err := dev.VsysMilliV(); err == nil {
+		print("VSYS: ", mv, " | ")
+	}
+	if mv, err := dev.BatteryMilliVPack(); err == nil {
+		print("VBAT: ", mv, " | ")
+	}
+	if ma, err := dev.IinMilliA(); err == nil {
+		print("IIN: ", ma, " | ")
+	}
+	if ma, err := dev.IbatMilliA(); err == nil {
+		print("IBAT: ", ma, " | ")
+	}
+	if mC, err := dev.DieMilliC(); err == nil {
+		print("DIE mC: ", mC, " | ")
+	}
+
+	// Optional context: effective limits.
+	// if ma, err := dev.IinLimitDAC_mA(); err == nil {
+	// 	print("IIN_LIMIT_DAC: ", ma, " | ")
+	// }
+	// if ma, err := dev.IChargeDAC_mA(); err == nil {
+	// 	print("ICHARGE_DAC: ", ma, " | ")
+	// }
+
+	// ISR drop count.
+	print("ISR drops: ", atomic.LoadUint32(&dropped))
+
+	print("\n")
 }
