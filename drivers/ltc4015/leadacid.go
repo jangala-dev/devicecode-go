@@ -52,9 +52,9 @@ func (la LeadAcid) SetEqualizeTime_s(sec uint16) error {
 // Toggle lead-acid temperature compensation bit in CHARGER_CONFIG_BITS.
 func (la LeadAcid) EnableLeadAcidTempComp(on bool) error {
 	if on {
-		return la.d.SetChargerConfigBits(CfgEnLeadAcidTempComp)
+		return la.d.SetChargerConfigBits(EnLeadAcidTempComp)
 	}
-	return la.d.ClearChargerConfigBits(CfgEnLeadAcidTempComp)
+	return la.d.ClearChargerConfigBits(EnLeadAcidTempComp)
 }
 
 // Convenience: read back applied VCHARGE per-cell from VCHARGE_DAC (LA mapping).

@@ -6,7 +6,7 @@ package ltc4015
 // Note: with JEITA enabled, effective targets derive from the JEITA tables.
 func (li Lithium) EnableJEITA(on bool) error {
 	if on {
-		return li.d.SetChargerConfigBits(CfgEnJEITA)
+		return li.d.SetChargerConfigBits(EnJEITA)
 	}
-	return li.d.ClearChargerConfigBits(CfgEnJEITA)
+	return li.d.ClearChargerConfigBits(EnJEITA)
 }

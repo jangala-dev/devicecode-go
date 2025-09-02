@@ -97,6 +97,7 @@ const (
 	regNTCRatio          = 0x40 // R
 	regBSR               = 0x41 // R
 	regChemCells         = 0x43 // R
+	regIChargeBSR        = 0x48 // ICHARGE_BSR (R), IBAT used for BSR calc
 	regMeasSysValid      = 0x4A // R (bit0 indicates valid)
 )
 
@@ -108,55 +109,38 @@ const (
 type ConfigBits uint16
 
 const (
-	CfgSuspendCharger ConfigBits = 1 << 8
-	CfgRunBSR         ConfigBits = 1 << 5
-	CfgForceMeasSysOn ConfigBits = 1 << 4
-	CfgMPPTEnableI2C  ConfigBits = 1 << 3
-	CfgEnableQCount   ConfigBits = 1 << 2
+	SuspendCharger ConfigBits = 1 << 8
+	RunBSR         ConfigBits = 1 << 5
+	ForceMeasSysOn ConfigBits = 1 << 4
+	MPPTEnableI2C  ConfigBits = 1 << 3
+	EnableQCount   ConfigBits = 1 << 2
 )
 
 // CHARGER_CONFIG_BITS (0x29)
 type ChargerCfgBits uint16
 
 const (
-	CfgEnCOverXTerm       ChargerCfgBits = 1 << 2
-	CfgEnLeadAcidTempComp ChargerCfgBits = 1 << 1
-	CfgEnJEITA            ChargerCfgBits = 1 << 0
-)
-
-// CHARGER_STATE (0x34)
-type ChargerState uint16
-
-const (
-	StEqualizeCharge     ChargerState = 1 << 10
-	StAbsorbCharge       ChargerState = 1 << 9
-	StChargerSuspended   ChargerState = 1 << 8
-	StPrecharge          ChargerState = 1 << 7
-	StCcCvCharge         ChargerState = 1 << 6
-	StNTCPause           ChargerState = 1 << 5
-	StTimerTerm          ChargerState = 1 << 4
-	StCOverXTerm         ChargerState = 1 << 3
-	StMaxChargeTimeFault ChargerState = 1 << 2
-	StBatMissingFault    ChargerState = 1 << 1
-	StBatShortFault      ChargerState = 1 << 0
+	EnCOverXTerm       ChargerCfgBits = 1 << 2
+	EnLeadAcidTempComp ChargerCfgBits = 1 << 1
+	EnJEITA            ChargerCfgBits = 1 << 0
 )
 
 // SYSTEM_STATUS (0x39)
 type SystemStatus uint16
 
 const (
-	SysChargerEnabled  SystemStatus = 1 << 13
-	SysMpptEnPin       SystemStatus = 1 << 11
-	SysEqualizeReq     SystemStatus = 1 << 10
-	SysDrvccGood       SystemStatus = 1 << 9
-	SysCellCountError  SystemStatus = 1 << 8
-	SysOkToCharge      SystemStatus = 1 << 6
-	SysNoRt            SystemStatus = 1 << 5
-	SysThermalShutdown SystemStatus = 1 << 4
-	SysVinOvlo         SystemStatus = 1 << 3
-	SysVinGtVbat       SystemStatus = 1 << 2
-	SysIntvccGt4p3V    SystemStatus = 1 << 1
-	SysIntvccGt2p8V    SystemStatus = 1 << 0
+	ChargerEnabled  SystemStatus = 1 << 13
+	MpptEnPin       SystemStatus = 1 << 11
+	EqualizeReq     SystemStatus = 1 << 10
+	DrvccGood       SystemStatus = 1 << 9
+	CellCountError  SystemStatus = 1 << 8
+	OkToCharge      SystemStatus = 1 << 6
+	NoRt            SystemStatus = 1 << 5
+	ThermalShutdown SystemStatus = 1 << 4
+	VinOvlo         SystemStatus = 1 << 3
+	VinGtVbat       SystemStatus = 1 << 2
+	IntvccGt4p3V    SystemStatus = 1 << 1
+	IntvccGt2p8V    SystemStatus = 1 << 0
 )
 
 // -----------------------------------------------------------------------------
@@ -169,41 +153,42 @@ type LimitEnable = LimitBits
 type LimitAlerts = LimitBits
 
 const (
-	LaMeasSysValid LimitBits = 1 << 15
+	MeasSysValid LimitBits = 1 << 15
 	// bit14 reserved
-	LaQCountLo   LimitBits = 1 << 13
-	LaQCountHi   LimitBits = 1 << 12
-	LaVBATLo     LimitBits = 1 << 11
-	LaVBATHi     LimitBits = 1 << 10
-	LaVINLo      LimitBits = 1 << 9
-	LaVINHi      LimitBits = 1 << 8
-	LaVSYSLo     LimitBits = 1 << 7
-	LaVSYSHi     LimitBits = 1 << 6
-	LaIINHi      LimitBits = 1 << 5
-	LaIBATLo     LimitBits = 1 << 4
-	LaDieTempHi  LimitBits = 1 << 3
-	LaBSRHi      LimitBits = 1 << 2
-	LaNTCRatioHi LimitBits = 1 << 1 // cold
-	LaNTCRatioLo LimitBits = 1 << 0 // hot
+	QCountLo   LimitBits = 1 << 13
+	QCountHi   LimitBits = 1 << 12
+	VBATLo     LimitBits = 1 << 11
+	VBATHi     LimitBits = 1 << 10
+	VINLo      LimitBits = 1 << 9
+	VINHi      LimitBits = 1 << 8
+	VSYSLo     LimitBits = 1 << 7
+	VSYSHi     LimitBits = 1 << 6
+	IINHi      LimitBits = 1 << 5
+	IBATLo     LimitBits = 1 << 4
+	DieTempHi  LimitBits = 1 << 3
+	BSRHi      LimitBits = 1 << 2
+	NTCRatioHi LimitBits = 1 << 1 // cold
+	NTCRatioLo LimitBits = 1 << 0 // hot
 )
 
 // CHARGER_STATE_ALERTS / EN_CHARGER_STATE_ALERTS (0x37 / 0x0E)
 type ChargerStateBits uint16
+type ChargerState = ChargerStateBits
 type ChargerStateEnable = ChargerStateBits
 type ChargerStateAlerts = ChargerStateBits
 
 const (
-	CsEqualizeCharge     ChargerStateBits = 1 << 10
-	CsAbsorbCharge       ChargerStateBits = 1 << 9
-	CsChargerSuspended   ChargerStateBits = 1 << 8
-	CsPrecharge          ChargerStateBits = 1 << 7
-	CsCCCVCharge         ChargerStateBits = 1 << 6
-	CsNTCPause           ChargerStateBits = 1 << 5
-	CsTimerTerm          ChargerStateBits = 1 << 4
-	CsCOverXTerm         ChargerStateBits = 1 << 3
-	CsMaxChargeTimeFault ChargerStateBits = 1 << 2
-	CsBatMissingFault    ChargerStateBits = 1 << 1
-	CsBatShortFault      ChargerStateBits = 1 << 0
+	EqualizeCharge     ChargerStateBits = 1 << 10
+	AbsorbCharge       ChargerStateBits = 1 << 9
+	ChargerSuspended   ChargerStateBits = 1 << 8
+	Precharge          ChargerStateBits = 1 << 7
+	CCCVCharge         ChargerStateBits = 1 << 6
+	NTCPause           ChargerStateBits = 1 << 5
+	TimerTerm          ChargerStateBits = 1 << 4
+	COverXTerm         ChargerStateBits = 1 << 3
+	MaxChargeTimeFault ChargerStateBits = 1 << 2
+	BatMissingFault    ChargerStateBits = 1 << 1
+	BatShortFault      ChargerStateBits = 1 << 0
 )
 
 // CHARGE_STATUS bits reused across status (0x35), enables (0x0F), and alerts (0x38).
@@ -216,8 +201,8 @@ type ChargeStatusAlerts = ChargeStatusBits // 0x38 (R/Clear)
 
 // Bit definitions (one set only)
 const (
-	CsVinUvclActive  ChargeStatusBits = 1 << 3
-	CsIinLimitActive ChargeStatusBits = 1 << 2
-	CsConstCurrent   ChargeStatusBits = 1 << 1
-	CsConstVoltage   ChargeStatusBits = 1 << 0
+	VinUvclActive  ChargeStatusBits = 1 << 3
+	IinLimitActive ChargeStatusBits = 1 << 2
+	ConstCurrent   ChargeStatusBits = 1 << 1
+	ConstVoltage   ChargeStatusBits = 1 << 0
 )

@@ -327,6 +327,19 @@ func (d *Device) MeasSystemValid() (bool, error) {
 	return (v & 0x0001) != 0, nil
 }
 
+// ltc4015.go
+func (d *Device) IChargeBSR_mA() (int32, error) {
+	if d.rsnsB_uOhm == 0 {
+		return 0, errors.New("RSNSB_uOhm not set")
+	}
+	raw, err := d.readS16(regIChargeBSR)
+	if err != nil {
+		return 0, err
+	}
+	uA := (int64(raw) * 1464870) / int64(d.rsnsB_uOhm)
+	return int32(uA / 1000), nil
+}
+
 // ---------------- Effective DAC read-backs ----------------
 
 // Raw codes
