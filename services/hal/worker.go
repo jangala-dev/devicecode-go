@@ -69,26 +69,14 @@ func (w *measureWorker) Submit(req MeasureReq) bool {
 }
 
 func (w *measureWorker) Start(ctx context.Context) {
-	if !w.timer.Stop() {
-		drainTimer(w.timer)
-	}
+	resetTimer(w.timer, time.Hour)
 	go func() {
 		for {
 			next := w.minDue()
 			if next.IsZero() {
-				if !w.timer.Stop() {
-					drainTimer(w.timer)
-				}
-				w.timer.Reset(time.Hour)
+				resetTimer(w.timer, time.Hour)
 			} else {
-				d := time.Until(next)
-				if d < 0 {
-					d = 0
-				}
-				if !w.timer.Stop() {
-					drainTimer(w.timer)
-				}
-				w.timer.Reset(d)
+				resetTimer(w.timer, time.Until(next))
 			}
 			select {
 			case <-ctx.Done():
@@ -169,11 +157,4 @@ func (w *measureWorker) minDue() time.Time {
 		}
 	}
 	return min
-}
-
-func drainTimer(t *time.Timer) {
-	select {
-	case <-t.C:
-	default:
-	}
 }

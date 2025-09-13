@@ -87,28 +87,16 @@ func (s *service) loop(ctx context.Context) {
 	s.publishState("idle", "awaiting_config", nil)
 
 	s.timer = time.NewTimer(time.Hour)
-	if !s.timer.Stop() {
-		drainTimer(s.timer)
-	}
+	resetTimer(s.timer, time.Hour)
 
 	var gpioEv <-chan GPIOEvent = s.gpioW.Events()
 
 	for {
 		// (re)arm timer
 		if next := s.earliestDevDue(); next.IsZero() {
-			if !s.timer.Stop() {
-				drainTimer(s.timer)
-			}
-			s.timer.Reset(time.Hour)
+			resetTimer(s.timer, time.Hour)
 		} else {
-			d := time.Until(next)
-			if d < 0 {
-				d = 0
-			}
-			if !s.timer.Stop() {
-				drainTimer(s.timer)
-			}
-			s.timer.Reset(d)
+			resetTimer(s.timer, time.Until(next))
 		}
 
 		select {
