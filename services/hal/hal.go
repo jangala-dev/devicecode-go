@@ -106,7 +106,7 @@ func (s *service) loop(ctx context.Context) {
 
 		case msg := <-cfgSub.Channel():
 			var cfg HALConfig
-			if err := decodeJSON(msg.Payload, &cfg); err != nil {
+			if err := DecodeJSON(msg.Payload, &cfg); err != nil {
 				s.publishState("error", "config_decode_failed", err)
 				continue
 			}
@@ -222,7 +222,7 @@ func (s *service) applyConfig(ctx context.Context, cfg HALConfig) error {
 			var p struct {
 				Addr int `json:"addr"`
 			}
-			_ = decodeJSON(d.Params, &p)
+			_ = DecodeJSON(d.Params, &p)
 			if p.Addr == 0 {
 				p.Addr = 0x38
 			}
@@ -231,7 +231,7 @@ func (s *service) applyConfig(ctx context.Context, cfg HALConfig) error {
 
 		case "gpio":
 			var p GPIOParams
-			if err := decodeJSON(d.Params, &p); err != nil {
+			if err := DecodeJSON(d.Params, &p); err != nil {
 				continue
 			}
 
@@ -474,7 +474,7 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
-func decodeJSON[T any](src any, dst *T) error {
+func DecodeJSON[T any](src any, dst *T) error {
 	switch v := src.(type) {
 	case []byte:
 		return json.Unmarshal(v, dst)
