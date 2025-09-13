@@ -19,7 +19,7 @@ func Run(ctx context.Context, conn *bus.Connection, i2cFactory I2CBusFactory, pi
 		conn:        conn,
 		i2cFactory:  i2cFactory,
 		pinFactory:  pinFactory,
-		workers:     map[string]*measureWorker{},
+		workers:     map[string]MeasurementWorker{},
 		adaptors:    map[string]Adaptor{},
 		devices:     map[string]devEntry{},
 		capToDev:    map[capKey]string{},
@@ -27,7 +27,7 @@ func Run(ctx context.Context, conn *bus.Connection, i2cFactory I2CBusFactory, pi
 		devPeriodMS: map[string]int{},
 		devNextDue:  map[string]time.Time{},
 		results:     make(chan Result, 32),
-		gpioW:       newGPIOIRQWorker(32, 32),
+		gpioW:       newGPIOIRQWorker(64, 64),
 		gpioCancel:  map[string]func(){},
 	}
 	h.gpioW.Start(ctx)
@@ -54,7 +54,7 @@ type service struct {
 	i2cFactory I2CBusFactory
 	pinFactory PinFactory
 
-	workers  map[string]*measureWorker
+	workers  map[string]MeasurementWorker
 	adaptors map[string]Adaptor
 	devices  map[string]devEntry
 
@@ -70,7 +70,7 @@ type service struct {
 	results chan Result
 
 	// GPIO IRQ support
-	gpioW      *gpioIRQWorker
+	gpioW      GPIOIRQer
 	gpioCancel map[string]func() // devID -> cancel function
 }
 
@@ -215,7 +215,7 @@ func (s *service) applyConfig(ctx context.Context, cfg HALConfig) error {
 			}
 			// Ensure a worker for this bus
 			if _, ok := s.workers[d.BusRef.ID]; !ok {
-				w := NewWorker(WorkerConfig{}, s.results)
+				w := NewMeasurementWorker(WorkerConfig{}, s.results)
 				w.Start(ctx)
 				s.workers[d.BusRef.ID] = w
 			}

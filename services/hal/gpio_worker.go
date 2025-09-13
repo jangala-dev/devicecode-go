@@ -47,6 +47,9 @@ type watch struct {
 	cancelIRQ func()
 }
 
+// Ensure interface conformance at compile time.
+var _ GPIOIRQer = (*gpioIRQWorker)(nil)
+
 func newGPIOIRQWorker(isrBuf, outBuf int) *gpioIRQWorker {
 	if isrBuf <= 0 {
 		isrBuf = 64
