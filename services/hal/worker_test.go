@@ -44,7 +44,10 @@ func TestWorker_SuccessWithRetries(t *testing.T) {
 		RetryBackoff:   2 * time.Millisecond,
 		MaxRetries:     5,
 	}
-	w := NewWorker(cfg)
+
+	results := make(chan Result, 4)
+	w := NewWorker(cfg, results)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.Start(ctx)
@@ -55,7 +58,7 @@ func TestWorker_SuccessWithRetries(t *testing.T) {
 	}
 
 	select {
-	case r := <-w.Results():
+	case r := <-results:
 		if r.Err != nil {
 			t.Fatalf("unexpected error: %v", r.Err)
 		}
@@ -70,8 +73,15 @@ func TestWorker_SuccessWithRetries(t *testing.T) {
 }
 
 func TestWorker_RetryLimitFailure(t *testing.T) {
-	cfg := WorkerConfig{RetryBackoff: 1 * time.Millisecond, MaxRetries: 2}
-	w := NewWorker(cfg)
+	cfg := WorkerConfig{
+		RetryBackoff: 1 * time.Millisecond,
+		MaxRetries:   2,
+		// Trigger/Collect timeouts will be defaulted by NewWorker if zero.
+	}
+
+	results := make(chan Result, 4)
+	w := NewWorker(cfg, results)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.Start(ctx)
@@ -82,7 +92,7 @@ func TestWorker_RetryLimitFailure(t *testing.T) {
 	}
 
 	select {
-	case r := <-w.Results():
+	case r := <-results:
 		if r.Err == nil {
 			t.Fatal("expected error after exhausting retries, got nil")
 		}
@@ -96,7 +106,10 @@ func TestWorker_CoalescingAndReadNowDesire(t *testing.T) {
 		RetryBackoff: 1 * time.Millisecond,
 		MaxRetries:   1, // force a quick collect failure
 	}
-	w := NewWorker(cfg)
+
+	results := make(chan Result, 8)
+	w := NewWorker(cfg, results)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.Start(ctx)
@@ -112,7 +125,7 @@ func TestWorker_CoalescingAndReadNowDesire(t *testing.T) {
 
 	// First result should be an error (due to retries exhausted).
 	select {
-	case r := <-w.Results():
+	case r := <-results:
 		if r.Err == nil {
 			t.Fatal("expected error on first cycle")
 		}
@@ -125,7 +138,7 @@ func TestWorker_CoalescingAndReadNowDesire(t *testing.T) {
 
 	// Expect success from the immediate re-trigger driven by desire.
 	select {
-	case r := <-w.Results():
+	case r := <-results:
 		if r.Err != nil {
 			t.Fatalf("unexpected second error: %v", r.Err)
 		}

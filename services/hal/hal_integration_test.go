@@ -70,12 +70,13 @@ func TestHAL_EndToEnd_AHT20(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	go Run(ctx, halConn, factory, factory) // I2C + Pins
 
 	// 1) Wait for HAL 'awaiting_config'
 	stateSub := halConn.Subscribe(bus.Topic{"hal", "state"})
 	defer halConn.Unsubscribe(stateSub)
+	// Cancel *after* all Unsubscribe defers are registered so it runs first at teardown.
+	defer cancel()
 
 	waitReady := time.Now().Add(1 * time.Second)
 	ready := false
@@ -187,7 +188,6 @@ func TestHAL_EndToEnd_GPIO(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	go Run(ctx, halConn, factory, factory)
 
 	// Subscriptions used across the test
@@ -197,6 +197,8 @@ func TestHAL_EndToEnd_GPIO(t *testing.T) {
 	defer halConn.Unsubscribe(stateSub)
 	defer halConn.Unsubscribe(dbgSub)
 	defer halConn.Unsubscribe(capSub)
+	// Cancel first during teardown, then unsubscribe (LIFO), to avoid publishing into closed chans.
+	defer cancel()
 
 	// Await initial idle/awaiting_config
 	deadline := time.Now().Add(1 * time.Second)

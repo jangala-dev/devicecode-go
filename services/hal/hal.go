@@ -26,7 +26,8 @@ func Run(ctx context.Context, conn *bus.Connection, i2cFactory I2CBusFactory, pi
 		nextCapID:   map[string]int{},
 		devPeriodMS: map[string]int{},
 		devNextDue:  map[string]time.Time{},
-		gpioW:       newGPIOIRQWorker(64, 64),
+		results:     make(chan Result, 32),
+		gpioW:       newGPIOIRQWorker(32, 32),
 		gpioCancel:  map[string]func(){},
 	}
 	h.gpioW.Start(ctx)
@@ -65,6 +66,9 @@ type service struct {
 
 	timer *time.Timer
 
+	// Results fan-in
+	results chan Result
+
 	// GPIO IRQ support
 	gpioW      *gpioIRQWorker
 	gpioCancel map[string]func() // devID -> cancel function
@@ -87,7 +91,6 @@ func (s *service) loop(ctx context.Context) {
 		drainTimer(s.timer)
 	}
 
-	var results <-chan Result
 	var gpioEv <-chan GPIOEvent = s.gpioW.Events()
 
 	for {
@@ -124,12 +127,6 @@ func (s *service) loop(ctx context.Context) {
 				continue
 			}
 			s.publishState("ready", "configured", nil)
-			// Hook up worker results if present
-			for id, w := range s.workers {
-				if id == "i2c0" { // old bad behaviour
-					results = w.Results()
-				}
-			}
 
 		case msg := <-ctrlSub.Channel():
 			// hal/capability/<kind>/<id:int>/control/<method>
@@ -189,7 +186,7 @@ func (s *service) loop(ctx context.Context) {
 				}
 			}
 
-		case r := <-results:
+		case r := <-s.results:
 			s.handleResult(r)
 
 		case ev := <-gpioEv:
@@ -230,7 +227,7 @@ func (s *service) applyConfig(ctx context.Context, cfg HALConfig) error {
 			}
 			// Ensure a worker for this bus
 			if _, ok := s.workers[d.BusRef.ID]; !ok {
-				w := NewWorker(WorkerConfig{})
+				w := NewWorker(WorkerConfig{}, s.results)
 				w.Start(ctx)
 				s.workers[d.BusRef.ID] = w
 			}

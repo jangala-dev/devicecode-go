@@ -7,9 +7,9 @@ import (
 )
 
 type measureWorker struct {
-	cfg      WorkerConfig
-	reqQ     chan MeasureReq
-	resultsQ chan Result
+	cfg  WorkerConfig
+	reqQ chan MeasureReq
+	sink chan<- Result
 
 	pending  map[string]*collectItem
 	want     map[string]bool
@@ -24,7 +24,7 @@ type collectItem struct {
 	retries int
 }
 
-func NewWorker(cfg WorkerConfig) *measureWorker {
+func NewWorker(cfg WorkerConfig, sink chan<- Result) *measureWorker {
 	if cfg.TriggerTimeout <= 0 {
 		cfg.TriggerTimeout = 100 * time.Millisecond
 	}
@@ -45,10 +45,10 @@ func NewWorker(cfg WorkerConfig) *measureWorker {
 	}
 	return &measureWorker{
 		cfg: cfg, reqQ: make(chan MeasureReq, cfg.InputQueueSize),
-		resultsQ: make(chan Result, cfg.ResultsQueueSz),
-		pending:  map[string]*collectItem{},
-		want:     map[string]bool{},
-		timer:    time.NewTimer(time.Hour),
+		sink:    sink,
+		pending: map[string]*collectItem{},
+		want:    map[string]bool{},
+		timer:   time.NewTimer(time.Hour),
 	}
 }
 
@@ -67,8 +67,6 @@ func (w *measureWorker) Submit(req MeasureReq) bool {
 		return false
 	}
 }
-
-func (w *measureWorker) Results() <-chan Result { return w.resultsQ }
 
 func (w *measureWorker) Start(ctx context.Context) {
 	if !w.timer.Stop() {
@@ -157,9 +155,9 @@ func (w *measureWorker) Start(ctx context.Context) {
 
 func (w *measureWorker) emit(r Result) {
 	select {
-	case w.resultsQ <- r:
+	case w.sink <- r:
 	default:
-		w.resultsQ <- r
+		w.sink <- r
 	}
 }
 
