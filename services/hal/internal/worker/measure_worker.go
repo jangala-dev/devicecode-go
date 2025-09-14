@@ -1,15 +1,18 @@
-// services/hal/worker.go
-package hal
+// services/hal/internal/worker/measure_worker.go
+package worker
 
 import (
 	"context"
 	"time"
+
+	"devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/util"
 )
 
-type measureWorker struct {
-	cfg  WorkerConfig
-	reqQ chan MeasureReq
-	sink chan<- Result
+type MeasureWorker struct {
+	cfg  halcore.WorkerConfig
+	reqQ chan halcore.MeasureReq
+	sink chan<- halcore.Result // fan-in sink owned by service
 
 	pending  map[string]*collectItem
 	want     map[string]bool
@@ -19,12 +22,12 @@ type measureWorker struct {
 
 type collectItem struct {
 	id      string
-	adaptor Adaptor
+	adaptor halcore.Adaptor
 	due     time.Time
 	retries int
 }
 
-func NewWorker(cfg WorkerConfig, sink chan<- Result) *measureWorker {
+func New(cfg halcore.WorkerConfig, sink chan<- halcore.Result) *MeasureWorker {
 	if cfg.TriggerTimeout <= 0 {
 		cfg.TriggerTimeout = 100 * time.Millisecond
 	}
@@ -40,11 +43,9 @@ func NewWorker(cfg WorkerConfig, sink chan<- Result) *measureWorker {
 	if cfg.InputQueueSize <= 0 {
 		cfg.InputQueueSize = 16
 	}
-	if cfg.ResultsQueueSz <= 0 {
-		cfg.ResultsQueueSz = 16
-	}
-	return &measureWorker{
-		cfg: cfg, reqQ: make(chan MeasureReq, cfg.InputQueueSize),
+	return &MeasureWorker{
+		cfg:     cfg,
+		reqQ:    make(chan halcore.MeasureReq, cfg.InputQueueSize),
 		sink:    sink,
 		pending: map[string]*collectItem{},
 		want:    map[string]bool{},
@@ -52,7 +53,7 @@ func NewWorker(cfg WorkerConfig, sink chan<- Result) *measureWorker {
 	}
 }
 
-func (w *measureWorker) Submit(req MeasureReq) bool {
+func (w *MeasureWorker) Submit(req halcore.MeasureReq) bool {
 	select {
 	case w.reqQ <- req:
 		return true
@@ -68,15 +69,17 @@ func (w *measureWorker) Submit(req MeasureReq) bool {
 	}
 }
 
-func (w *measureWorker) Start(ctx context.Context) {
-	resetTimer(w.timer, time.Hour)
+func (w *MeasureWorker) Start(ctx context.Context) {
+	if !w.timer.Stop() {
+		util.DrainTimer(w.timer)
+	}
 	go func() {
 		for {
 			next := w.minDue()
 			if next.IsZero() {
-				resetTimer(w.timer, time.Hour)
+				util.ResetTimer(w.timer, time.Hour)
 			} else {
-				resetTimer(w.timer, time.Until(next))
+				util.ResetTimer(w.timer, time.Until(next))
 			}
 			select {
 			case <-ctx.Done():
@@ -92,7 +95,7 @@ func (w *measureWorker) Start(ctx context.Context) {
 				after, err := req.Adaptor.Trigger(tctx)
 				cancel()
 				if err != nil {
-					w.emit(Result{ID: req.ID, Err: err})
+					w.emit(halcore.Result{ID: req.ID, Err: err})
 					continue
 				}
 				it := &collectItem{id: req.ID, adaptor: req.Adaptor, due: time.Now().Add(after)}
@@ -113,14 +116,14 @@ func (w *measureWorker) Start(ctx context.Context) {
 					case err == nil:
 						delete(w.pending, it.id)
 						delete(w.want, it.id)
-						w.emit(Result{ID: it.id, Sample: s})
-					case err == ErrNotReady && it.retries < w.cfg.MaxRetries:
+						w.emit(halcore.Result{ID: it.id, Sample: s})
+					case err == halcore.ErrNotReady && it.retries < w.cfg.MaxRetries:
 						it.retries++
 						it.due = now.Add(w.cfg.RetryBackoff)
 						keep = append(keep, it)
 					default:
 						delete(w.pending, it.id)
-						w.emit(Result{ID: it.id, Err: err})
+						w.emit(halcore.Result{ID: it.id, Err: err})
 						if w.want[it.id] {
 							tctx, cancel := context.WithTimeout(ctx, w.cfg.TriggerTimeout)
 							after, terr := it.adaptor.Trigger(tctx)
@@ -141,7 +144,7 @@ func (w *measureWorker) Start(ctx context.Context) {
 	}()
 }
 
-func (w *measureWorker) emit(r Result) {
+func (w *MeasureWorker) emit(r halcore.Result) {
 	select {
 	case w.sink <- r:
 	default:
@@ -149,7 +152,7 @@ func (w *measureWorker) emit(r Result) {
 	}
 }
 
-func (w *measureWorker) minDue() time.Time {
+func (w *MeasureWorker) minDue() time.Time {
 	var min time.Time
 	for _, it := range w.collects {
 		if min.IsZero() || it.due.Before(min) {

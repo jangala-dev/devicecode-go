@@ -1,28 +1,29 @@
-// services/hal/gpio_worker.go
-package hal
+// services/hal/internal/gpioirq/irq_worker.go
+package gpioirq
 
 import (
 	"context"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/util"
 )
 
 // GPIOEvent is delivered from the worker to the HAL service.
 type GPIOEvent struct {
 	DevID string
 	Level int // 0/1 after inversion applied
-	Edge  Edge
+	Edge  halcore.Edge
 	TS    time.Time
 }
 
-type gpioIRQWorker struct {
+type Worker struct {
 	// Written by ISR; MUST NOT block the ISR:
 	isrQ chan isrEvent
-
 	// Consumed by the HAL service:
-	outQ chan GPIOEvent
-
+	outQ    chan GPIOEvent
 	stopped chan struct{}
 
 	mu     sync.RWMutex
@@ -38,8 +39,8 @@ type isrEvent struct {
 
 type watch struct {
 	devID     string
-	pin       IRQPin
-	edge      Edge
+	pin       halcore.IRQPin
+	edge      halcore.Edge
 	debounce  time.Duration
 	invert    bool
 	lastLevel bool
@@ -47,17 +48,14 @@ type watch struct {
 	cancelIRQ func()
 }
 
-// Ensure interface conformance at compile time.
-var _ GPIOIRQer = (*gpioIRQWorker)(nil)
-
-func newGPIOIRQWorker(isrBuf, outBuf int) *gpioIRQWorker {
+func New(isrBuf, outBuf int) *Worker {
 	if isrBuf <= 0 {
 		isrBuf = 64
 	}
 	if outBuf <= 0 {
 		outBuf = 64
 	}
-	return &gpioIRQWorker{
+	return &Worker{
 		isrQ:    make(chan isrEvent, isrBuf),
 		outQ:    make(chan GPIOEvent, outBuf),
 		stopped: make(chan struct{}),
@@ -65,7 +63,7 @@ func newGPIOIRQWorker(isrBuf, outBuf int) *gpioIRQWorker {
 	}
 }
 
-func (w *gpioIRQWorker) Start(ctx context.Context) {
+func (w *Worker) Start(ctx context.Context) {
 	go func() {
 		defer close(w.stopped)
 		for {
@@ -79,10 +77,10 @@ func (w *gpioIRQWorker) Start(ctx context.Context) {
 	}()
 }
 
-func (w *gpioIRQWorker) Events() <-chan GPIOEvent { return w.outQ }
+func (w *Worker) Events() <-chan GPIOEvent { return w.outQ }
 
-func (w *gpioIRQWorker) RegisterInput(devID string, pin IRQPin, edge Edge, debounceMS int, invert bool) (func(), error) {
-	if edge == EdgeNone {
+func (w *Worker) RegisterInput(devID string, pin halcore.IRQPin, edge halcore.Edge, debounceMS int, invert bool) (func(), error) {
+	if edge == halcore.EdgeNone {
 		return func() {}, nil
 	}
 	deb := time.Duration(debounceMS) * time.Millisecond
@@ -126,7 +124,7 @@ func (w *gpioIRQWorker) RegisterInput(devID string, pin IRQPin, edge Edge, debou
 	}, nil
 }
 
-func (w *gpioIRQWorker) handleISR(ev isrEvent) {
+func (w *Worker) handleISR(ev isrEvent) {
 	w.mu.RLock()
 	wh := w.inputs[ev.devID]
 	w.mu.RUnlock()
@@ -145,19 +143,19 @@ func (w *gpioIRQWorker) handleISR(ev isrEvent) {
 	}
 
 	// Edge detection
-	var e Edge
+	var e halcore.Edge
 	switch {
 	case !wh.lastLevel && raw:
-		e = EdgeRising
+		e = halcore.EdgeRising
 	case wh.lastLevel && !raw:
-		e = EdgeFalling
+		e = halcore.EdgeFalling
 	default:
 		return
 	}
 
-	if wh.edge == EdgeBoth || wh.edge == e {
+	if wh.edge == halcore.EdgeBoth || wh.edge == e {
 		select {
-		case w.outQ <- GPIOEvent{DevID: ev.devID, Level: boolToInt(raw), Edge: e, TS: now}:
+		case w.outQ <- GPIOEvent{DevID: ev.devID, Level: util.BoolToInt(raw), Edge: e, TS: now}:
 		default:
 			// drop to protect system if consumer is slow
 		}
@@ -167,4 +165,4 @@ func (w *gpioIRQWorker) handleISR(ev isrEvent) {
 	wh.lastEvent = now
 }
 
-func (w *gpioIRQWorker) ISRDrops() uint32 { return atomic.LoadUint32(&w.drops) }
+func (w *Worker) ISRDrops() uint32 { return atomic.LoadUint32(&w.drops) }
