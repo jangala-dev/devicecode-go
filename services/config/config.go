@@ -16,7 +16,7 @@ import (
 const (
 	serviceName  = "config"
 	configPrefix = "config"
-	ctxDeviceKey = "device" // context key used for device ID
+	CtxDeviceKey = "device" // context key used for device ID
 )
 
 // EmbeddedConfigLookup allows overriding how configs are resolved.
@@ -39,7 +39,7 @@ func NewConfigService() *ConfigService {
 
 // publishConfig reads the device config from embedded data and publishes it as retained messages.
 func (s *ConfigService) publishConfig(ctx context.Context, conn *bus.Connection) error {
-	device, _ := ctx.Value(ctxDeviceKey).(string)
+	device, _ := ctx.Value(CtxDeviceKey).(string)
 	if device == "" {
 		return errors.New("missing device ID in context")
 	}

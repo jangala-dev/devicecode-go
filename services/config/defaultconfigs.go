@@ -15,7 +15,10 @@ const cfgPico = `{
   "bridge": [
   ],
   "hal": [
-  ]
+  ],
+  "heartbeat": {
+      "interval": 2
+  }
 }`
 
 var embeddedConfigs = map[string][]byte{
