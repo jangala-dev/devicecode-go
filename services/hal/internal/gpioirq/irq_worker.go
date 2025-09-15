@@ -85,13 +85,19 @@ func (w *Worker) RegisterInput(devID string, pin halcore.IRQPin, edge halcore.Ed
 	}
 	deb := time.Duration(debounceMS) * time.Millisecond
 
+	// Take the initial *logical* level snapshot (after inversion),
+	// so that subsequent edge detection compares like-for-like.
+	init := pin.Get()
+	if invert {
+		init = !init
+	}
 	wh := &watch{
 		devID:     devID,
 		pin:       pin,
 		edge:      edge,
 		debounce:  deb,
 		invert:    invert,
-		lastLevel: pin.Get(), // initial snapshot
+		lastLevel: init, // initial logical snapshot
 	}
 
 	// ISR handler: fast register read + non-blocking channel send.

@@ -7,8 +7,11 @@ import (
 
 	"devicecode-go/bus"
 	"devicecode-go/services/hal/config"
+	"devicecode-go/services/hal/internal/consts"
 	"devicecode-go/services/hal/internal/gpioirq"
 	"devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/halerr"
+
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
 	"devicecode-go/services/hal/internal/worker"
@@ -49,6 +52,11 @@ type Service struct {
 	gpioCancel map[string]func() // devID -> cancel function
 }
 
+var (
+	topicConfigHAL = bus.Topic{consts.TokConfig, consts.TokHAL}
+	topicCtrl      = bus.Topic{consts.TokHAL, consts.TokCapability, "+", "+", consts.TokControl, "+"}
+)
+
 func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFactory) *Service {
 	return &Service{
 		conn:        conn,
@@ -70,8 +78,8 @@ func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFact
 func (s *Service) Run(ctx context.Context) {
 	s.gpioW.Start(ctx)
 
-	cfgSub := s.conn.Subscribe(bus.Topic{"config", "hal"})
-	ctrlSub := s.conn.Subscribe(bus.Topic{"hal", "capability", "+", "+", "control", "+"})
+	cfgSub := s.conn.Subscribe(topicConfigHAL)
+	ctrlSub := s.conn.Subscribe(topicCtrl)
 	defer s.conn.Unsubscribe(cfgSub)
 	defer s.conn.Unsubscribe(ctrlSub)
 
@@ -121,44 +129,48 @@ func (s *Service) Run(ctx context.Context) {
 			kind, _ := msg.Topic[2].(string)
 			idNum, ok := asInt(msg.Topic[3])
 			if !ok || kind == "" {
-				s.replyErr(msg, "invalid capability address")
+				s.replyErr(msg, halerr.ErrInvalidCapAddr)
 				continue
 			}
 			key := capKey{kind: kind, id: idNum}
 			devID, ok := s.capToDev[key]
 			if !ok {
-				s.replyErr(msg, "unknown capability")
+				s.replyErr(msg, halerr.ErrUnknownCap)
 				continue
 			}
 			method, _ := msg.Topic[5].(string)
 
 			switch method {
-			case "read_now":
+			case consts.CtrlReadNow:
 				if s.submitMeasure(devID, true) {
 					s.bumpDevNext(devID, time.Now())
 					s.replyOK(msg, nil)
 				} else {
-					s.replyErr(msg, "busy")
+					s.replyErr(msg, halerr.ErrBusy)
 				}
-			case "set_rate":
+			case consts.CtrlSetRate:
 				ms, ok := parsePeriodMS(msg.Payload)
 				if ok && ms > 0 {
 					s.devPeriodMS[devID] = util.ClampInt(ms, 200, 3_600_000)
 					s.bumpDevNext(devID, time.Now())
 					s.replyOK(msg, map[string]any{"period_ms": s.devPeriodMS[devID]})
 				} else {
-					s.replyErr(msg, "invalid period")
+					s.replyErr(msg, halerr.ErrInvalidPeriod)
 				}
 			default:
 				ent := s.devices[devID]
 				if ent.adaptor == nil {
-					s.replyErr(msg, "no adaptor")
+					s.replyErr(msg, halerr.ErrNoAdaptor)
 					continue
 				}
 				if res, err := ent.adaptor.Control(kind, method, msg.Payload); err == nil {
 					s.replyOK(msg, map[string]any{"result": res})
 				} else {
-					s.replyErr(msg, err.Error())
+					if err == halcore.ErrUnsupported {
+						s.replyErr(msg, halerr.ErrUnsupported)
+					} else {
+						s.replyErr(msg, err)
+					}
 				}
 			}
 
@@ -233,9 +245,9 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 			entry.caps[ci.Kind] = id
 			s.capToDev[capKey{kind: ci.Kind, id: id}] = d.ID
 
-			s.pubRet(capTopicInt(ci.Kind, id, "info"), ci.Info)
-			s.pubRet(capTopicInt(ci.Kind, id, "state"),
-				map[string]any{"link": "up", "ts_ms": time.Now().UnixMilli()})
+			s.pubRet(ci.Kind, id, consts.TokInfo, ci.Info)
+			s.pubRet(ci.Kind, id, consts.TokState,
+				map[string]any{"link": consts.LinkUp, "ts_ms": time.Now().UnixMilli()})
 		}
 		s.devices[d.ID] = entry
 
@@ -261,9 +273,9 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 			continue
 		}
 		for kind, id := range ent.caps {
-			s.pubRet(capTopicInt(kind, id, "info"), nil)
-			s.pubRet(capTopicInt(kind, id, "state"),
-				map[string]any{"link": "down", "ts_ms": time.Now().UnixMilli()})
+			s.pubRet(kind, id, consts.TokInfo, nil)
+			s.pubRet(kind, id, consts.TokState,
+				map[string]any{"link": consts.LinkDown, "ts_ms": time.Now().UnixMilli()})
 			delete(s.capToDev, capKey{kind: kind, id: id})
 		}
 		if c, ok := s.gpioCancel[devID]; ok {
@@ -318,8 +330,8 @@ func (s *Service) handleResult(r halcore.Result) {
 
 	if r.Err != nil {
 		for kind, id := range ent.caps {
-			s.pubRet(capTopicInt(kind, id, "state"),
-				map[string]any{"link": "degraded", "error": r.Err.Error(), "ts_ms": now})
+			s.pubRet(kind, id, consts.TokState,
+				map[string]any{"link": consts.LinkDegraded, "error": r.Err.Error(), "ts_ms": now})
 		}
 		return
 	}
@@ -329,11 +341,11 @@ func (s *Service) handleResult(r halcore.Result) {
 			continue
 		}
 		s.conn.Publish(s.conn.NewMessage(
-			capTopicInt(rd.Kind, id, "value"),
+			capTopicInt(rd.Kind, id, consts.TokValue),
 			rd.Payload,
 			false,
 		))
-		s.pubRet(capTopicInt(rd.Kind, id, "state"), map[string]any{"link": "up", "ts_ms": now})
+		s.pubRet(rd.Kind, id, "state", map[string]any{"link": "up", "ts_ms": now})
 	}
 }
 
@@ -342,7 +354,7 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 	if !ok {
 		return
 	}
-	id, ok := ent.caps["gpio"]
+	id, ok := ent.caps[consts.KindGPIO]
 	if !ok {
 		return
 	}
@@ -350,7 +362,7 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 
 	// Event (non-retained)
 	s.conn.Publish(s.conn.NewMessage(
-		capTopicInt("gpio", id, "event"),
+		capTopicInt(consts.KindGPIO, id, consts.TokEvent),
 		map[string]any{
 			"edge":  halcore.EdgeToString(ev.Edge),
 			"level": ev.Level,
@@ -359,8 +371,8 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 		false,
 	))
 	// State (retained)
-	s.pubRet(capTopicInt("gpio", id, "state"),
-		map[string]any{"link": "up", "level": ev.Level, "ts_ms": ts})
+	s.pubRet(consts.KindGPIO, id, consts.TokState,
+		map[string]any{"link": consts.LinkUp, "level": ev.Level, "ts_ms": ts})
 }
 
 // ---- bus helpers & utils ----
@@ -370,7 +382,7 @@ func (s *Service) publishState(level, status string, err error) {
 	if err != nil {
 		payload["error"] = err.Error()
 	}
-	s.conn.Publish(s.conn.NewMessage(bus.Topic{"hal", "state"}, payload, true))
+	s.conn.Publish(s.conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokState}, payload, true))
 }
 
 func (s *Service) replyOK(req *bus.Message, extra map[string]any) {
@@ -384,20 +396,23 @@ func (s *Service) replyOK(req *bus.Message, extra map[string]any) {
 	s.conn.Reply(req, m, false)
 }
 
-func (s *Service) replyErr(req *bus.Message, e string) {
+func (s *Service) replyErr(req *bus.Message, e error) {
 	if len(req.ReplyTo) == 0 {
 		return
 	}
-	s.conn.Reply(req, map[string]any{"ok": false, "error": e}, false)
+	code := "error"
+	if e != nil {
+		code = e.Error()
+	}
+	s.conn.Reply(req, map[string]any{"ok": false, "error": code}, false)
 }
 
-func capTopicInt(kind string, id int, rest ...bus.Token) bus.Topic {
-	base := bus.Topic{"hal", "capability", kind, id}
-	return append(base, rest...)
+func capTopicInt(kind string, id int, suffix string) bus.Topic {
+	return bus.Topic{consts.TokHAL, consts.TokCapability, kind, id, suffix}
 }
 
-func (s *Service) pubRet(t bus.Topic, p any) {
-	s.conn.Publish(s.conn.NewMessage(t, p, true))
+func (s *Service) pubRet(kind string, id int, suffix string, p any) {
+	s.conn.Publish(s.conn.NewMessage(capTopicInt(kind, id, suffix), p, true))
 }
 
 func parsePeriodMS(p any) (int, bool) {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
 )
@@ -19,11 +20,11 @@ type aht20Builder struct{}
 
 func (aht20Builder) Build(in registry.BuildInput) (registry.BuildOutput, error) {
 	if in.BusRefType != "i2c" || in.BusRefID == "" {
-		return registry.BuildOutput{}, util.Errf("missing i2c bus")
+		return registry.BuildOutput{}, halerr.ErrMissingBusRef
 	}
 	i2c, ok := in.Buses.ByID(in.BusRefID)
 	if !ok {
-		return registry.BuildOutput{}, util.Errf("unknown bus %q", in.BusRefID)
+		return registry.BuildOutput{}, halerr.ErrUnknownBus
 	}
 	// Params: { "addr": 0x38 }
 	var p struct {

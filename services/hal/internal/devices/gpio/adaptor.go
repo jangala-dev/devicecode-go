@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
 )
@@ -38,7 +39,7 @@ func (gpioBuilder) Build(in registry.BuildInput) (registry.BuildOutput, error) {
 	}
 	pin, ok := in.Pins.ByNumber(p.Pin)
 	if !ok {
-		return registry.BuildOutput{}, util.Errf("unknown pin %d", p.Pin)
+		return registry.BuildOutput{}, halerr.ErrUnknownPin
 	}
 
 	// Configure initial mode.
@@ -59,7 +60,7 @@ func (gpioBuilder) Build(in registry.BuildInput) (registry.BuildOutput, error) {
 			return registry.BuildOutput{}, err
 		}
 	default:
-		return registry.BuildOutput{}, util.Errf("invalid mode %q", p.Mode)
+		return registry.BuildOutput{}, halerr.ErrInvalidMode
 	}
 
 	ad := &adaptor{id: in.DeviceID, pin: pin, params: p}
@@ -123,7 +124,7 @@ func (a *adaptor) Control(kind, method string, payload interface{}) (interface{}
 			if a.params.Invert {
 				l = !l
 			}
-			return map[string]interface{}{"level": boolToInt(l)}, nil
+			return map[string]interface{}{"level": util.BoolToInt(l)}, nil
 		default:
 			return nil, halcore.ErrUnsupported
 		}
@@ -181,11 +182,4 @@ func ParseEdge(s string) halcore.Edge {
 	default:
 		return halcore.EdgeNone
 	}
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

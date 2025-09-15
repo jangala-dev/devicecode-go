@@ -3,7 +3,6 @@ package util
 
 import (
 	"encoding/json"
-	"fmt"
 	"time"
 )
 
@@ -37,10 +36,6 @@ func DecodeJSON[T any](src any, dst *T) error {
 		}
 		return json.Unmarshal(b, dst)
 	}
-}
-
-func Errf(format string, args ...any) error {
-	return fmt.Errorf(format, args...)
 }
 
 func BoolToInt(b bool) int {

@@ -3,7 +3,6 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -53,7 +52,7 @@ func RegisterBuilder(deviceType string, b Builder) {
 	mu.Lock()
 	defer mu.Unlock()
 	if _, exists := builders[deviceType]; exists {
-		panic(fmt.Sprintf("device builder already registered for type %q", deviceType))
+		panic("device builder already registered for type " + deviceType)
 	}
 	builders[deviceType] = b
 }
