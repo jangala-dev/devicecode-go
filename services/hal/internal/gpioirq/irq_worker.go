@@ -150,16 +150,26 @@ func (w *Worker) handleISR(ev isrEvent) {
 
 	// Edge detection
 	var e halcore.Edge
-	switch {
-	case !wh.lastLevel && raw:
-		e = halcore.EdgeRising
-	case wh.lastLevel && !raw:
-		e = halcore.EdgeFalling
-	default:
-		return
+	if wh.edge == halcore.EdgeBoth {
+		switch {
+		case !wh.lastLevel && raw:
+			e = halcore.EdgeRising
+		case wh.lastLevel && !raw:
+			e = halcore.EdgeFalling
+		}
+	} else {
+		// We only get called when the configured edge fired;
+		// trust the configuration for direction on first observation.
+		switch wh.edge {
+		case halcore.EdgeRising:
+			e = halcore.EdgeRising
+		case halcore.EdgeFalling:
+			e = halcore.EdgeFalling
+		}
 	}
 
-	if wh.edge == halcore.EdgeBoth || wh.edge == e {
+	// Emit if requested edge; drop if none (e == EdgeNone)
+	if e != halcore.EdgeNone {
 		select {
 		case w.outQ <- GPIOEvent{DevID: ev.devID, Level: util.BoolToInt(raw), Edge: e, TS: now}:
 		default:
@@ -167,6 +177,7 @@ func (w *Worker) handleISR(ev isrEvent) {
 		}
 	}
 
+	// Always update snapshots
 	wh.lastLevel = raw
 	wh.lastEvent = now
 }

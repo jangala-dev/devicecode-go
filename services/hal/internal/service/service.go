@@ -354,25 +354,36 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 	if !ok {
 		return
 	}
-	id, ok := ent.caps[consts.KindGPIO]
-	if !ok {
-		return
-	}
 	ts := ev.TS.UnixMilli()
 
-	// Event (non-retained)
-	s.conn.Publish(s.conn.NewMessage(
-		capTopicInt(consts.KindGPIO, id, consts.TokEvent),
-		map[string]any{
-			"edge":  halcore.EdgeToString(ev.Edge),
-			"level": ev.Level,
-			"ts_ms": ts,
-		},
-		false,
-	))
-	// State (retained)
-	s.pubRet(consts.KindGPIO, id, consts.TokState,
-		map[string]any{"link": consts.LinkUp, "level": ev.Level, "ts_ms": ts})
+	// Path 1: devices that expose a GPIO capability -> publish event + retained state
+	if id, ok := ent.caps[consts.KindGPIO]; ok {
+		// Event (non-retained)
+		s.conn.Publish(s.conn.NewMessage(
+			capTopicInt(consts.KindGPIO, id, consts.TokEvent),
+			map[string]any{
+				"edge":  halcore.EdgeToString(ev.Edge),
+				"level": ev.Level,
+				"ts_ms": ts,
+			},
+			false,
+		))
+		// State (retained)
+		s.pubRet(consts.KindGPIO, id, consts.TokState,
+			map[string]any{"link": consts.LinkUp, "level": ev.Level, "ts_ms": ts})
+		return
+	}
+
+	// Path 2: non-GPIO devices that registered an IRQ (e.g. LTC4015 SMBALERT)
+	if _, hasIRQ := s.gpioCancel[ev.DevID]; hasIRQ {
+		if ev.Edge != halcore.EdgeFalling {
+			return
+		}
+
+		// Best-effort immediate read; worker handles back-pressure/priorities.
+		_ = s.submitMeasure(ev.DevID, true)
+		s.bumpDevNext(ev.DevID, ev.TS)
+	}
 }
 
 // ---- bus helpers & utils ----
