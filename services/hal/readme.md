@@ -1,144 +1,148 @@
 # Overview
 
-`hal` is a **self-contained, message-driven HAL service** that:
+`hal` in Go is the **port of the DC-Lua HAL service** used on Linux-class devices, adapted for TinyGo (RP2040/Pico) and Go (Linux/arm64 - in the future). It retains the **message-driven, capability-based model** from the Lua version, but introduces changes to suit constrained MCU targets, stronger typing, and Go’s concurrency model.
 
-* Starts with `hal.Run(ctx, conn)` and constructs a `Service` with **injected platform factories** for I2C and GPIO.
-* Is **configured entirely via the in-process bus** (topic `config/hal`), and exposes **capability endpoints** under `hal/capability/<kind>/<id>/…`.
-* Uses a **registry of device builders** (blank-import registrations) to construct device-specific **adaptors** that implement a small HAL interface (`Trigger`, `Collect`, `Control`).
-* Manages **periodic sampling** and **priority on-demand reads** through per-bus **measurement workers** that implement a split-phase Trigger/Collect cycle with backoff and retries.
-* Publishes **retained capability metadata and state**, **event/value messages**, and supports **request–reply controls**.
+Key properties:
 
-# Configuration and topics
+* Runs with `hal.Run(ctx, conn)` and constructs a `Service` with **compile-time injected platform factories** (I²C, GPIO).
+* Fully **configured over the in-process pub/sub bus** (`config/hal`).
+* Exposes **capabilities** under `hal/capability/<kind>/<id>/…`, indexed per runtime.
+* Uses a **registry of device builders** (via blank imports) to create adaptors that implement a minimal interface (`Trigger`, `Collect`, `Control`).
+* Provides **periodic sampling**, **priority reads**, and **IRQ-driven events**, serialised per shared bus.
+* Publishes retained **capability metadata** and **state**, and supports **request–reply control**.
 
-* The service subscribes to:
 
-  * `config/hal` — JSON config (`HALConfig`) declaring devices.
-  * `hal/capability/+/+/control/+` — control RPCs to specific capability instances.
+# Differences from the Lua HAL
 
-* A `HALConfig` contains `Devices[]`, each with:
+This service follows the same architectural goals as Lua HAL (device discovery, configuration via the bus, capability addressing), but some key changes have been made:
 
-  * `id`, `type`, optional `params`, and an optional shared-bus reference (`bus_ref {type,id}`, e.g. I2C).
+* **Typed interfaces:** Where Lua relied on dynamic tables and conventions, Go defines explicit interfaces (`Adaptor`, `CapInfo`, etc.), improving compile-time checking.
+* **Goroutines, not fibers:** On MCUs the Lua “fibers” library is replaced by Go’s goroutines and channels. This keeps concurrency lightweight while simplifying integration with TinyGo.
+* **Trigger/Collect model:** Retained from Lua, but codified as a `MeasureWorker` per bus to guarantee serialised access and prevent I²C contention.
+* **Configuration model:** JSON config (`HALConfig`) is deserialised into typed structures; repeated application is idempotent.
+* **Capability addressing:** Still `hal/capability/<kind>/<id>`, but IDs are assigned per service runtime (monotonic counter).
+* **Platform abstraction:**
 
-* On configuration:
+  * **RP2 builds:** use TinyGo drivers for I²C and GPIO, with IRQ support.
+  * **Linux/arm64 builds:** provide stub factories (to allow testing and parity with existing Lua HAL, where drivers remain Lua-based).
+* **Error handling:** Go version errs on safety—failed device builds or unsupported drivers do not panic; state is published as `"error"`.
+* **Testability:** Factories and adaptor interfaces enable fake injection; more suitable for unit tests than Lua’s global state.
 
-  * For each device not yet present, the service looks up a **Builder** by `type` in the **registry**, calls `Build` with factories and JSON params, and receives a `BuildOutput`:
 
-    * `Adaptor` (implements `halcore.Adaptor`),
-    * optional `BusID` (groups devices sharing the same physical bus),
-    * optional `SampleEvery` (declares this device as a periodic producer),
-    * optional `IRQ` request (GPIO edge events).
-  * If a `BusID` is provided, a **per-bus `MeasureWorker`** is created (once) and started to serialise access on that bus.
-  * The adaptor’s **capabilities** are discovered (`Capabilities() []CapInfo`). For each capability `kind`, the service assigns a **monotonic integer ID** (per `kind`) and publishes:
+# Configuration and Topics
 
-    * `hal/capability/<kind>/<id>/info` (retained) — the `CapInfo.Info` map.
-    * `hal/capability/<kind>/<id>/state` (retained) — `{"link":"up","ts_ms":…}` upon configuration.
-  * If `SampleEvery>0`, the device is scheduled for periodic sampling; period is **clamped to \[200 ms, 1 h]**.
-  * If `IRQ` is requested and the pin supports interrupts, the **GPIO IRQ worker** registers an ISR and will emit debounced, edge-filtered events.
+The service subscribes to:
 
-* Devices absent from the latest config are **removed idempotently**:
+* `config/hal` — JSON config (`HALConfig`) declaring devices.
+* `hal/capability/+/+/control/+` — control RPCs.
 
-  * Their `info` is cleared (retained `nil`), `state` set to `"down"`, IRQs cancelled, and internal maps tidied.
+A `HALConfig` defines `Devices[]` with:
 
-# Capability addressing and control
+* `id`, `type`, optional `params`,
+* optional `bus_ref {type,id}` (for shared I²C buses).
 
-* Capability address = `(kind, id)` where `id` is the service-assigned integer. The mapping `(kind,id) -> deviceID` is stored internally.
-* Control requests are received on:
+On config application:
 
-  * `hal/capability/<kind>/<id>/control/<method>` with optional payload and an optional reply-to.
-* Built-in methods handled by the service:
+* New devices are built using a registered `Builder`.
+* Output includes:
 
-  * `read_now` — attempts a **priority measurement** for the owning device (queues with `Prio=true`).
-  * `set_rate` — updates the device’s periodic sampling period (`{"period_ms":N}`), clamped.
-* Other methods are **forwarded to the adaptor’s `Control`** and the result/error is returned.
-* Replies use the bus request–reply helper (`ReplyTo` topic), returning `{"ok":true,…}` or `{"ok":false,"error":…}`.
+  * an `Adaptor`,
+  * optional `BusID` (for serialised workers),
+  * optional `SampleEvery` (periodic producer),
+  * optional `IRQ` (for GPIO).
+* Capabilities are discovered and published:
 
-# Measurement model (Trigger/Collect)
+  * `…/info` (retained metadata),
+  * `…/state` (retained, `"up"`/`"down"`).
+* Devices absent from the latest config are removed gracefully, clearing retained docs and cancelling workers.
 
-* Each device that samples data is serviced by a **`MeasureWorker` tied to its BusID**:
 
-  * **`Submit(MeasureReq{ID, Adaptor, Prio})`** enqueues a trigger request (bounded channel; priority path retries briefly).
-  * Worker loop:
+# Measurement Model
 
-    * On request: **`Trigger(ctx)`** with timeout (default 100 ms) returns a **delay hint** `after` until data is ready. The worker records a `collectItem{due = now+after}`.
-    * On timer: when `due` arrives, **`Collect(ctx)`** with timeout (default 250 ms):
+Each device that produces samples is managed by a per-bus `MeasureWorker`:
 
-      * On success: emits `Result{ID, Sample}`.
-      * On `ErrNotReady`: retries up to `MaxRetries` (default 6) with **short backoff** (default 15 ms).
-      * On other error: emits a failure. If a **priority re-read was requested while pending**, the worker **re-triggers immediately** once to service the priority request.
-* The service consumes results:
+* Requests (`MeasureReq`) are queued; priority requests are retried promptly.
+* `Trigger(ctx)` returns a delay until ready.
+* `Collect(ctx)` retrieves data.
+* On success, results are published to `…/value`.
+* On error, device state is degraded (`…/state = "error"`).
 
-  * On error: publishes degraded `state` for each capability of that device.
-  * On success: for each `Reading{Kind, Payload, TsMs}` in the `Sample`, publishes:
+Backoff, retries, and bounded queues ensure stability on constrained hardware.
 
-    * `hal/capability/<kind>/<id>/value` (non-retained) with the reading payload,
-    * updates retained `state` to `"up"` with timestamp.
 
-# GPIO IRQ events
+# GPIO IRQ Events
 
-* A separate **`gpioirq.Worker`** manages ISR-safe edge capture:
+A dedicated IRQ worker manages GPIO events:
 
-  * ISR handler reads the pin level and **non-blocking** sends to a bounded `isrQ`; drops are counted atomically (`ISRDrops()`).
-  * A single goroutine drains `isrQ`, applies **optional inversion**, **software debounce** (per-device `debounce_ms`), and **edge selection** (rising/falling/both).
-  * Qualifying events are forwarded on `outQ` as `{DevID, Level (0/1), Edge, TS}`.
-* The service, on each event for a device with `"gpio"` capability:
+* ISR handler enqueues edges into a bounded queue.
+* A draining goroutine applies inversion, debounce, and edge filtering.
+* Events are published on `hal/capability/gpio/<id>/event`.
+* Retained state (`…/state`) also reflects current level.
 
-  * Publishes `hal/capability/gpio/<id>/event` (non-retained) including `edge`, `level`, `ts_ms`.
-  * Updates retained `state` with current level.
 
-# Bus interactions and retained documents
+# Service Lifecycle and Bus Interaction
 
-* Service lifecycle state is published retained at `hal/state` with `{"level":…,"status":…,"ts_ms":…}`:
+* Service publishes lifecycle state retained at `hal/state` (`"idle"`, `"ready"`, `"stopped"`).
+* Capabilities publish:
 
-  * Starts `"idle"/"awaiting_config"`, transitions to `"ready"/"configured"`, and `"stopped"/"context_cancelled"` on exit.
-* Capability documents:
+  * `…/info` (retained static metadata),
+  * `…/state` (retained status),
+  * `…/value` (non-retained streaming measurements),
+  * `…/event` (non-retained GPIO events).
+* Control requests at `…/control/<method>`:
 
-  * `…/info` (retained): static metadata from the adaptor (`unit`, `precision`, `schema_version`, `driver`, etc.).
-  * `…/state` (retained): link/status, and for GPIO also last `level`.
-  * `…/value` (non-retained): streaming measurements.
-  * `…/event` (non-retained): edge events for GPIO.
+  * Built-ins: `read_now`, `set_rate`.
+  * Others: forwarded to the device adaptor.
 
-# Platform abstraction and build targets
+Here’s a section you can drop into the README. It explains concurrency in the Go/TinyGo HAL and contrasts it with the Lua version.
 
-* **Build tags** split platform code:
+# Concurrency Model
 
-  * **RP2 (TinyGo on RP2040(Pico)/RP2350(Pico 2)):** `factories_rp2.go` supplies:
+The Go/TinyGo HAL retains the cooperative, message-driven style of the Lua version but deliberately **minimises the number of active goroutines**.
 
-    * Two pre-configured I2C buses (`i2c0`, `i2c1`) at 400 kHz on board-default pins.
-    * A GPIO factory mapping logical numbers to `machine.Pin(n)` with input/output and IRQ support (rising/falling/both).
-  * **Linux/arm64 (Pi 5)**: `factories_linux.go` supplies **no-op factories** (tests must inject fakes; service won’t “discover” real pins/buses by default).
-* Device drivers follow the same pattern:
+In the Lua HAL, every service and driver typically spawned its own fiber, and many background loops ran concurrently. This was straightforward to express but could lead to dozens of active fibers even when most devices were idle. On MCU targets this is unsustainable.
 
-  * **AHT20**:
+In the Go/TinyGo design:
 
-    * RP2 build wraps a TinyGo driver, exposes a small internal `aht20Device` interface; adaptor configures timings (poll interval, collect timeout, trigger hint).
-    * Linux/arm64 build provides a **stub** that returns “not supported” (intended for future `devicecode-go` on current Lua targets).
-  * **GPIO**:
+* **Per-bus workers** — Sampling devices share a single `MeasureWorker` goroutine per bus. This serialises I²C access and avoids allocating one goroutine per device.
+* **Shared service timers** — A single scheduling loop manages periodic sampling across all devices. It re-arms itself to the earliest due event rather than keeping separate timers per device.
+* **IRQ worker** — One bounded queue and drain goroutine handle all GPIO interrupts. Individual devices do not spawn their own listeners.
+* **Bounded queues, short-lived goroutines** — Where possible, operations are performed inline in the worker loop. Short helper goroutines (eg. to satisfy a request–reply) are spawned but exit immediately after use.
 
-    * Builder configures pin mode, pull, inversion, optional IRQ.
-    * Adaptor implements `Control`:
+As a result, the number of long-lived goroutines is bounded and small, regardless of device count. The model favours a few central workers that multiplex many devices, rather than many concurrent routines. This keeps memory footprint and scheduling overhead predictable, which is critical on TinyGo targets with limited RAM.
 
-      * **Inputs**: `get` → `{"level":0|1}` (observes inversion).
-      * **Outputs**: `set {"level":bool}` (observes inversion), or `toggle`.
-    * Not a periodic producer (no Trigger/Collect).
 
-# Scheduling, timing and limits
+# Platform Targets
 
-* Periodic sampling is driven by a single service timer:
+* **RP2 (TinyGo / Pico):**
 
-  * Next-due per device is tracked; the timer is re-armed to the **earliest due**; `util.ResetTimer` handles safe reset/drain.
-  * Periods are clamped (`200 ms` minimum, `1 h` maximum).
-* Utility helpers include JSON decoding from `any` (`DecodeJSON`), bounded integer clamp, and simple error formatting.
+  * Two default I²C buses (400 kHz),
+  * GPIO factory with pin mapping and IRQ support,
+  * Drivers implemented in TinyGo (eg. AHT20).
 
-# Error handling and idempotence
+* **Host:**
 
-* Unknown device types, failed builds, or missing buses/pins are **ignored** (no panic); the service reports `"error"` via `hal/state` when config decode/apply fails as a whole.
-* Applying the same config twice is **idempotent** (devices already present are skipped).
-* On shutdown, IRQ registrations are cancelled best-effort.
+  * Factories return stubs (no discovery),
+  * Enables testing.
 
-# Intended properties
 
-* **Capability indexing** per service runtime (IDs assigned in order of discovery per `kind`).
-* **Serialised access per shared bus** via the per-`BusID` worker to avoid I2C contention.
-* **Back-pressure aware** paths: bounded queues for ISR and worker inputs; non-blocking emits with safe drops where necessary.
-* **Testability**: small `halcore` interfaces, platform factories, and a registration mechanism enable fake injection on test builds (to be ported).
-* **Observability hooks**: retained `state` documents, explicit degraded states on errors, and ISR drop counters (exposed programmatically).
+# Intended Properties
+
+* Capability indexing consistent per runtime.
+* Serialised access to shared buses (I²C safe).
+* Bounded queues and safe drops for back-pressure control.
+* Retained documents for observability.
+* Idempotent configuration.
+* Testable via fake factories.
+
+
+# Summary
+
+The Go/TinyGo HAL is a **typed, concurrency-safe re-implementation of the Lua HAL**, preserving the same bus-driven architecture but adapted to:
+
+* run on constrained MCUs (Pico),
+* provide stronger compile-time safety,
+* integrate cleanly with Go’s goroutines and channels,
+* and remain interoperable with the Lua services still running on Linux-class targets.
+
+This ensures feature parity with the Lua implementation while preparing for a gradual migration of device drivers into Go, and supporting innovation on both MCU and Linux platforms.
