@@ -18,31 +18,6 @@ import (
 	_ "devicecode-go/services/hal/internal/devices/gpio"
 )
 
-func recvOrTimeout(ch <-chan *bus.Message, d time.Duration) (*bus.Message, error) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case m := <-ch:
-		return m, nil
-	case <-timer.C:
-		return nil, context.DeadlineExceeded
-	}
-}
-
-func asInt(t any) (int, bool) {
-	switch v := t.(type) {
-	case int:
-		return v, true
-	case int32:
-		return int(v), true
-	case int64:
-		return int(v), true
-	case float64:
-		return int(v), true
-	}
-	return 0, false
-}
-
 func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
