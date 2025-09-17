@@ -1,3 +1,5 @@
+// services/hal/internal/devices/gpio/adaptor_test.go
+
 package gpio
 
 import (

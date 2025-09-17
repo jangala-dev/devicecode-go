@@ -1,3 +1,5 @@
+// services/hal/config/config_test.go
+
 package config
 
 import (

@@ -1,3 +1,5 @@
+// services/hal/internal/halerr/errors_test.go
+
 package halerr
 
 import "testing"

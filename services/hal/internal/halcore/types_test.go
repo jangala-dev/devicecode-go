@@ -1,3 +1,5 @@
+// services/hal/internal/halcore/types_test.go
+
 package halcore
 
 import "testing"

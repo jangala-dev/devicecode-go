@@ -1,3 +1,5 @@
+// services/hal/internal/consts/consts_test.go
+
 package consts
 
 import "testing"
