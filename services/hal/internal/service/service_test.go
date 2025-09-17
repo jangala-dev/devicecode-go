@@ -24,6 +24,13 @@ type nopPinFactory struct{}
 
 func (nopPinFactory) ByNumber(int) (halcore.GPIOPin, bool) { return nil, false }
 
+// NEW: no-op UART factory to satisfy Service.New
+type nopUARTFactory struct{}
+
+func (nopUARTFactory) ByID(id string) (halcore.UARTPort, bool) { return nil, false }
+
+// ---- Test device/adaptor & builder ----
+
 type svcTestAdaptor struct {
 	id string
 }
@@ -84,7 +91,8 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	b := bus.NewBus(8)
 	conn := b.NewConnection("test")
 
-	s := New(conn, nopBusFactory{}, nopPinFactory{})
+	// UPDATED: include nopUARTFactory in constructor
+	s := New(conn, nopBusFactory{}, nopPinFactory{}, nopUARTFactory{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -146,8 +154,10 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	}
 
 	// Exercise control plane: read_now and set_rate.
-	// Request–reply on hal/capability/temp/0/control/read_now
-	req := conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlReadNow}, nil, false)
+	req := conn.NewMessage(
+		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlReadNow},
+		nil, false,
+	)
 	ctxReq, cancelReq := context.WithTimeout(context.Background(), time.Second)
 	defer cancelReq()
 	reply, err := conn.RequestWait(ctxReq, req)
@@ -159,7 +169,10 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	}
 
 	// Change rate.
-	req2 := conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate}, map[string]any{"period_ms": 200}, false)
+	req2 := conn.NewMessage(
+		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate},
+		map[string]any{"period_ms": 200}, false,
+	)
 	ctxReq2, cancelReq2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancelReq2()
 	reply2, err := conn.RequestWait(ctxReq2, req2)
@@ -176,7 +189,9 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 
 	b := bus.NewBus(8)
 	conn := b.NewConnection("test2")
-	s := New(conn, nopBusFactory{}, nopPinFactory{})
+
+	// UPDATED: include nopUARTFactory in constructor
+	s := New(conn, nopBusFactory{}, nopPinFactory{}, nopUARTFactory{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

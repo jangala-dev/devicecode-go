@@ -31,30 +31,6 @@ func asInt(t any) (int, bool) {
 	return 0, false
 }
 
-func topicStr(t bus.Topic) string {
-	s := ""
-	for i, tok := range t {
-		if i > 0 {
-			s += "/"
-		}
-		switch v := tok.(type) {
-		case string:
-			s += v
-		case int:
-			s += itoa(v)
-		case int32:
-			s += itoa(int(v))
-		case int64:
-			s += itoa(int(v))
-		case float64:
-			s += itoa(int(v))
-		default:
-			s += "<unk>"
-		}
-	}
-	return s
-}
-
 // tiny itoa to avoid fmt in this test target
 func itoa(i int) string {
 	if i == 0 {

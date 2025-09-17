@@ -4,6 +4,7 @@
 package platform
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -181,4 +182,63 @@ func (f *HostPinFactory) Get(n int) (*FakePin, bool) {
 // DefaultPinFactory provides a host GPIO factory.
 func DefaultPinFactory() halcore.PinFactory {
 	return &HostPinFactory{pins: make(map[int]*FakePin)}
+}
+
+// ---- UART
+
+type simUART struct {
+	mu sync.Mutex
+	rx []byte
+	rd chan struct{}
+}
+
+func newSimUART() *simUART { return &simUART{rd: make(chan struct{}, 1)} }
+
+func (s *simUART) WriteByte(b byte) error      { return nil }
+func (s *simUART) Write(p []byte) (int, error) { return len(p), nil }
+func (s *simUART) Buffered() int               { s.mu.Lock(); n := len(s.rx); s.mu.Unlock(); return n }
+func (s *simUART) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	n := copy(p, s.rx)
+	s.rx = s.rx[n:]
+	s.mu.Unlock()
+	return n, nil
+}
+func (s *simUART) Readable() <-chan struct{} { return s.rd }
+func (s *simUART) RecvSomeContext(ctx context.Context, p []byte) (int, error) {
+	if n := s.Buffered(); n > 0 {
+		return s.Read(p)
+	}
+	select {
+	case <-s.rd:
+		return s.Read(p)
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// test helper (optional)
+/*
+func (s *simUART) inject(b []byte) {
+	s.mu.Lock()
+	s.rx = append(s.rx, b...)
+	if len(s.rd) == 0 {
+		s.rd <- struct{}{}
+	}
+	s.mu.Unlock()
+}
+*/
+
+type hostUARTFactory struct{ m map[string]*simUART }
+
+func (f *hostUARTFactory) ByID(id string) (halcore.UARTPort, bool) {
+	u, ok := f.m[id]
+	return u, ok
+}
+
+func DefaultUARTFactory() halcore.UARTFactory {
+	return &hostUARTFactory{m: map[string]*simUART{
+		"uart0": newSimUART(),
+		"uart1": newSimUART(),
+	}}
 }

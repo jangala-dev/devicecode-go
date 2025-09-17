@@ -35,6 +35,7 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 	// Host factories (build-tagged shims on non-RP2 platforms).
 	i2c := platform.DefaultI2CFactory()
 	pins := platform.DefaultPinFactory()
+	uart := platform.DefaultUARTFactory()
 
 	// Keep a handle to the concrete host pin factory to simulate IRQ edges later.
 	hostPins, ok := pins.(*platform.HostPinFactory)
@@ -44,7 +45,7 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 	}
 
 	// Start the service directly with our factories.
-	svc := service.New(conn, i2c, pins)
+	svc := service.New(conn, i2c, pins, uart)
 	go svc.Run(ctx)
 
 	// Expect the initial retained state.

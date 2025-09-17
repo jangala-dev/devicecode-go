@@ -18,5 +18,6 @@ var (
 	ErrUnknownPin    = errors.New("unknown_pin")
 
 	// Generic / pass-through
-	ErrUnsupported = errors.New("unsupported")
+	ErrUnsupported    = errors.New("unsupported")
+	ErrInvalidPayload = errors.New("invalid_payload")
 )

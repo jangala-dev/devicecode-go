@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"time"
 
 	"devicecode-go/bus"
@@ -13,6 +14,7 @@ import (
 	"devicecode-go/services/hal/internal/halerr"
 
 	"devicecode-go/services/hal/internal/registry"
+	"devicecode-go/services/hal/internal/uartio"
 	"devicecode-go/services/hal/internal/util"
 	"devicecode-go/services/hal/internal/worker"
 )
@@ -32,6 +34,7 @@ type Service struct {
 	conn  *bus.Connection
 	buses halcore.I2CBusFactory
 	pins  halcore.PinFactory
+	uarts halcore.UARTFactory
 
 	workers map[string]*worker.MeasureWorker // busID -> worker
 	results chan halcore.Result
@@ -50,6 +53,11 @@ type Service struct {
 	// GPIO IRQ support
 	gpioW      *gpioirq.Worker
 	gpioCancel map[string]func() // devID -> cancel function
+
+	// UART reader support
+	uartW      *uartio.Worker
+	uartCancel map[string]func()
+	uartEcho   map[string]bool
 }
 
 var (
@@ -57,11 +65,12 @@ var (
 	topicCtrl      = bus.Topic{consts.TokHAL, consts.TokCapability, "+", "+", consts.TokControl, "+"}
 )
 
-func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFactory) *Service {
+func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFactory, uarts halcore.UARTFactory) *Service {
 	return &Service{
 		conn:        conn,
 		buses:       buses,
 		pins:        pins,
+		uarts:       uarts,
 		workers:     map[string]*worker.MeasureWorker{},
 		results:     make(chan halcore.Result, 64),
 		adaptors:    map[string]halcore.Adaptor{},
@@ -72,6 +81,8 @@ func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFact
 		devNextDue:  map[string]time.Time{},
 		gpioW:       gpioirq.New(64, 64),
 		gpioCancel:  map[string]func(){},
+		uartW:       uartio.New(64),
+		uartCancel:  map[string]func(){},
 	}
 }
 
@@ -91,9 +102,10 @@ func (s *Service) Run(ctx context.Context) {
 	}
 
 	var gpioEv <-chan gpioirq.GPIOEvent = s.gpioW.Events()
+	var uartEv <-chan uartio.Event = s.uartW.Events() // NEW
 
 	for {
-		// (re)arm timer
+		// arm timer
 		if next := s.earliestDevDue(); next.IsZero() {
 			util.ResetTimer(s.timer, time.Hour)
 		} else {
@@ -103,8 +115,10 @@ func (s *Service) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			s.publishState("stopped", "context_cancelled", nil)
-			// best-effort: cancel any IRQ registrations
 			for _, c := range s.gpioCancel {
+				c()
+			}
+			for _, c := range s.uartCancel {
 				c()
 			}
 			return
@@ -122,7 +136,7 @@ func (s *Service) Run(ctx context.Context) {
 			s.publishState("ready", "configured", nil)
 
 		case msg := <-ctrlSub.Channel():
-			// hal/capability/<kind>/<id:int>/control/<method>
+			// unchanged except for new capability kind handled by adaptors
 			if len(msg.Topic) < 6 {
 				continue
 			}
@@ -165,6 +179,18 @@ func (s *Service) Run(ctx context.Context) {
 				}
 				if res, err := ent.adaptor.Control(kind, method, msg.Payload); err == nil {
 					s.replyOK(msg, map[string]any{"result": res})
+					// Optional TX echo on successful UART writes (if enabled via UARTRequest.PublishTXEcho).
+					if kind == consts.KindUART && method == "write" && s.uartEcho[devID] {
+						if m, ok := msg.Payload.(map[string]any); ok {
+							if t, ok := m["text"].(string); ok {
+								s.uartW.EmitTX(devID, []byte(t))
+							} else if b64, ok := m["data_b64"].(string); ok {
+								if b, err := base64.StdEncoding.DecodeString(b64); err == nil {
+									s.uartW.EmitTX(devID, b)
+								}
+							}
+						}
+					}
 				} else {
 					if err == halcore.ErrUnsupported {
 						s.replyErr(msg, halerr.ErrUnsupported)
@@ -188,6 +214,9 @@ func (s *Service) Run(ctx context.Context) {
 
 		case ev := <-gpioEv:
 			s.handleGPIOEvent(ev)
+
+		case ev := <-uartEv: // NEW
+			s.handleUARTEvent(ev)
 		}
 	}
 }
@@ -199,21 +228,20 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 		d := &cfg.Devices[i]
 		seen[d.ID] = struct{}{}
 
-		// Skip if already present (simple idempotence)
 		if _, exists := s.devices[d.ID]; exists {
 			continue
 		}
 
-		// Find a builder
 		b, ok := registry.Lookup(d.Type)
 		if !ok {
-			continue // unknown type; ignore
+			continue
 		}
 
 		out, err := b.Build(registry.BuildInput{
 			Ctx:        ctx,
 			Buses:      s.buses,
 			Pins:       s.pins,
+			UARTs:      s.uarts, // NEW
 			DeviceID:   d.ID,
 			Type:       d.Type,
 			ParamsJSON: d.Params,
@@ -224,7 +252,6 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 			continue
 		}
 
-		// Ensure a worker for the referenced bus, if any.
 		if out.BusID != "" {
 			if _, ok := s.workers[out.BusID]; !ok {
 				w := worker.New(halcore.WorkerConfig{}, s.results)
@@ -233,7 +260,6 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 			}
 		}
 
-		// Record adaptor and publish retained capability info/state.
 		ad := out.Adaptor
 		s.adaptors[d.ID] = ad
 		entry := devEntry{adaptor: ad, busID: out.BusID, caps: map[string]int{}}
@@ -251,23 +277,38 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 		}
 		s.devices[d.ID] = entry
 
-		// Schedule periodic sampling for producers only (as declared by builder)
 		if out.SampleEvery > 0 {
 			ms := int(out.SampleEvery / time.Millisecond)
 			s.devPeriodMS[d.ID] = util.ClampInt(ms, 200, 3_600_000)
 			s.devNextDue[d.ID] = time.Now().Add(200 * time.Millisecond)
 		}
 
-		// Register GPIO IRQs if requested and supported
+		// GPIO IRQ registration
 		if out.IRQ != nil && out.IRQ.Pin != nil {
 			cancel, err := s.gpioW.RegisterInput(out.IRQ.DevID, out.IRQ.Pin, out.IRQ.Edge, out.IRQ.DebounceMS, out.IRQ.Invert)
 			if err == nil {
 				s.gpioCancel[d.ID] = cancel
 			}
 		}
+
+		// UART reader registration
+		if out.UART != nil && out.UART.Port != nil {
+			cancel, err := s.uartW.Register(ctx, uartio.ReaderCfg{
+				DevID:         out.UART.DevID,
+				Port:          out.UART.Port,
+				Mode:          out.UART.Mode,
+				MaxFrame:      out.UART.MaxFrame,
+				IdleFlush:     time.Duration(out.UART.IdleFlushMS) * time.Millisecond,
+				PublishTXEcho: out.UART.PublishTXEcho,
+			})
+			if err == nil {
+				s.uartCancel[d.ID] = cancel
+				s.uartEcho[d.ID] = out.UART.PublishTXEcho
+			}
+		}
 	}
 
-	// Tidy-up: remove devices not in config
+	// Tidy-up devices not in config
 	for devID, ent := range s.devices {
 		if _, ok := seen[devID]; ok {
 			continue
@@ -281,6 +322,10 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 		if c, ok := s.gpioCancel[devID]; ok {
 			c()
 			delete(s.gpioCancel, devID)
+		}
+		if c, ok := s.uartCancel[devID]; ok {
+			c()
+			delete(s.uartCancel, devID)
 		}
 		delete(s.devices, devID)
 		delete(s.adaptors, devID)
@@ -320,6 +365,27 @@ func (s *Service) earliestDevDue() time.Time {
 }
 
 // ---- results & events ----
+
+func (s *Service) handleUARTEvent(ev uartio.Event) {
+	ent, ok := s.devices[ev.DevID]
+	if !ok {
+		return
+	}
+	if id, ok := ent.caps[consts.KindUART]; ok {
+		ts := ev.TS.UnixMilli()
+		s.conn.Publish(s.conn.NewMessage(
+			capTopicInt(consts.KindUART, id, consts.TokEvent),
+			map[string]any{
+				"dir":      ev.Dir,
+				"data_b64": uartio.EncodeB64(ev.Data),
+				"n":        len(ev.Data),
+				"ts_ms":    ts,
+			},
+			false,
+		))
+		s.pubRet(consts.KindUART, id, consts.TokState, map[string]any{"link": consts.LinkUp, "ts_ms": ts})
+	}
+}
 
 func (s *Service) handleResult(r halcore.Result) {
 	ent, ok := s.devices[r.ID]

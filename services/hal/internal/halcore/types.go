@@ -134,3 +134,27 @@ func EdgeToString(e Edge) string {
 		return "none"
 	}
 }
+
+// ---------------- UART abstractions ----------------
+
+type UARTPort interface {
+	// TX
+	WriteByte(b byte) error
+	Write(p []byte) (int, error)
+
+	// RX
+	Buffered() int
+	Read(p []byte) (int, error)
+	Readable() <-chan struct{}
+	RecvSomeContext(ctx context.Context, p []byte) (int, error)
+}
+
+type UARTFactory interface {
+	ByID(id string) (UARTPort, bool)
+}
+
+// Optional: formatting where platform supports it (no-op on host).
+type UARTFormatter interface {
+	SetBaudRate(br uint32)
+	SetFormat(databits, stopbits uint8, parity uint8) error // parity: 0 none, 1 even, 2 odd
+}

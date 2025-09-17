@@ -22,6 +22,7 @@ const (
 // Capability kinds used in service wiring
 const (
 	KindGPIO = "gpio"
+	KindUART = "uart"
 )
 
 const (

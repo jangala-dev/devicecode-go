@@ -10,15 +10,17 @@ import (
 )
 
 // BuildInput is passed to a device builder.
+
 type BuildInput struct {
 	Ctx        context.Context
 	Buses      halcore.I2CBusFactory
 	Pins       halcore.PinFactory
+	UARTs      halcore.UARTFactory
 	DeviceID   string
 	Type       string
 	ParamsJSON interface{}
-	BusRefType string // e.g. "i2c"
-	BusRefID   string // e.g. "i2c0"
+	BusRefType string // e.g. "i2c", "spi", "uart"
+	BusRefID   string // e.g. "i2c0", "uart0"
 }
 
 // BuildOutput describes a constructed device.
@@ -27,6 +29,7 @@ type BuildOutput struct {
 	BusID       string        // "" if not on a shared bus
 	SampleEvery time.Duration // 0 if not a periodic producer
 	IRQ         *IRQRequest   // nil if none
+	UART        *UARTRequest  // nil if none
 }
 
 // IRQRequest asks the service to register a GPIO IRQ.
@@ -36,6 +39,16 @@ type IRQRequest struct {
 	Edge       halcore.Edge
 	DebounceMS int
 	Invert     bool
+}
+
+// UARTRequest asks the service to start a reader on a UART port.
+type UARTRequest struct {
+	DevID         string
+	Port          halcore.UARTPort
+	Mode          string // "bytes" | "lines"
+	MaxFrame      int
+	IdleFlushMS   int
+	PublishTXEcho bool
 }
 
 // Builder creates an adaptor from config and factories.

@@ -34,6 +34,8 @@ func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
 
 	i2c := platform.DefaultI2CFactory()
 	pins := platform.DefaultPinFactory()
+	uart := platform.DefaultUARTFactory()
+
 	hostPins, ok := pins.(*platform.HostPinFactory)
 	if !ok {
 		t.Errorf("[%s] expected HostPinFactory", ts())
@@ -52,7 +54,7 @@ func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
 	}
 	pin22.Set(true)
 
-	svc := service.New(conn, i2c, pins)
+	svc := service.New(conn, i2c, pins, uart)
 	go svc.Run(ctx)
 
 	// Initial hal/state

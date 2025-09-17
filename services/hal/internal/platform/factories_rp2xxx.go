@@ -4,6 +4,7 @@
 package platform
 
 import (
+	"context"
 	"machine"
 
 	"tinygo.org/x/drivers"
@@ -128,4 +129,50 @@ func toPinChange(e halcore.Edge) machine.PinChange {
 		var zero machine.PinChange
 		return zero
 	}
+}
+
+// ---- UART implementation ------
+
+type rp2UART struct{ u *uartx.UART }
+
+func (r *rp2UART) WriteByte(b byte) error      { return r.u.WriteByte(b) }
+func (r *rp2UART) Write(p []byte) (int, error) { return r.u.Write(p) }
+func (r *rp2UART) Buffered() int               { return r.u.Buffered() }
+func (r *rp2UART) Read(p []byte) (int, error)  { return r.u.Read(p) }
+func (r *rp2UART) Readable() <-chan struct{}   { return r.u.Readable() }
+func (r *rp2UART) RecvSomeContext(ctx context.Context, p []byte) (int, error) {
+	return r.u.RecvSomeContext(ctx, p)
+}
+
+// Optional formatter/configurer interfaces.
+func (r *rp2UART) SetBaudRate(br uint32) { r.u.SetBaudRate(br) }
+func (r *rp2UART) SetFormat(db, sb uint8, parity uint8) error {
+	var p uartx.UARTParity
+	switch parity {
+	case 1:
+		p = uartx.ParityEven
+	case 2:
+		p = uartx.ParityOdd
+	default:
+		p = uartx.ParityNone
+	}
+	return r.u.SetFormat(db, sb, p)
+}
+
+type rp2UARTFactory struct{ m map[string]*rp2UART }
+
+func (f *rp2UARTFactory) ByID(id string) (halcore.UARTPort, bool) {
+	u, ok := f.m[id]
+	return u, ok
+}
+
+// DefaultUARTFactory exposes UART0 and UART1.
+// Pins/baud are configured by device adaptors using SetBaud/SetFormat where supported.
+func DefaultUARTFactory() halcore.UARTFactory {
+	_ = uartx.UART0.Configure(uartx.UARTConfig{}) // enable RX IRQ + defaults
+	_ = uartx.UART1.Configure(uartx.UARTConfig{})
+	return &rp2UARTFactory{m: map[string]*rp2UART{
+		"uart0": {u: uartx.UART0},
+		"uart1": {u: uartx.UART1},
+	}}
 }
