@@ -1,5 +1,5 @@
 // services/hal/internal/devices/uart/adaptor.go
-package uart
+package uartadpt
 
 import (
 	"context"

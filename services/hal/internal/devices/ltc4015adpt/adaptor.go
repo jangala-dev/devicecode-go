@@ -1,5 +1,5 @@
 // services/hal/internal/devices/ltc4015/adaptor.go
-package ltc4015
+package ltc4015adpt
 
 import (
 	"context"

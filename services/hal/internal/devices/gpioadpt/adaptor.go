@@ -1,5 +1,5 @@
 // services/hal/internal/devices/gpio/adaptor.go
-package gpio
+package gpioadpt
 
 import (
 	"context"

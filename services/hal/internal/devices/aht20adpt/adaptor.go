@@ -1,5 +1,5 @@
 // services/hal/internal/devices/aht20/adaptor.go
-package aht20
+package aht20adpt
 
 import (
 	"context"

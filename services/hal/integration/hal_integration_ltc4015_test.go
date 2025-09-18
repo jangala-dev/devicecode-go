@@ -13,8 +13,8 @@ import (
 	"devicecode-go/services/hal/internal/platform"
 	"devicecode-go/services/hal/internal/service"
 
-	_ "devicecode-go/services/hal/internal/devices/gpio"
-	_ "devicecode-go/services/hal/internal/devices/ltc4015"
+	_ "devicecode-go/services/hal/internal/devices/gpioadpt"
+	_ "devicecode-go/services/hal/internal/devices/ltc4015adpt"
 
 	"devicecode-go/types"
 )

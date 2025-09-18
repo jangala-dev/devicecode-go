@@ -14,8 +14,8 @@ import (
 	"devicecode-go/services/hal/internal/service"
 
 	// Ensure device builders register with the registry.
-	_ "devicecode-go/services/hal/internal/devices/aht20"
-	_ "devicecode-go/services/hal/internal/devices/gpio"
+	_ "devicecode-go/services/hal/internal/devices/aht20adpt"
+	_ "devicecode-go/services/hal/internal/devices/gpioadpt"
 
 	"devicecode-go/types"
 )

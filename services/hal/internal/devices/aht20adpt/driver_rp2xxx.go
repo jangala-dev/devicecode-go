@@ -1,7 +1,7 @@
 // services/hal/internal/devices/aht20/driver_rp2xxx.go
 //go:build rp2040 || rp2350
 
-package aht20
+package aht20adpt
 
 import (
 	"errors"

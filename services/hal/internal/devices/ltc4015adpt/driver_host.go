@@ -1,7 +1,7 @@
 // services/hal/internal/devices/ltc4015/driver_host.go
 //go:build !rp2040 && !rp2350
 
-package ltc4015
+package ltc4015adpt
 
 import (
 	"sync/atomic"
