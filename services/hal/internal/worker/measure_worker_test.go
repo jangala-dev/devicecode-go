@@ -32,7 +32,7 @@ func (f *fakeAdaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 		f.collectErrs--
 		return nil, halcore.ErrNotReady
 	}
-	return halcore.Sample{{Kind: "temp", Payload: 123, TsMs: time.Now().UnixMilli()}}, nil
+	return halcore.Sample{{Kind: "temp", Payload: 123}}, nil
 }
 func (f *fakeAdaptor) Control(string, string, any) (any, error) { return nil, halcore.ErrUnsupported }
 

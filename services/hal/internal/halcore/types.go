@@ -13,7 +13,7 @@ import (
 type Reading struct {
 	Kind    string // e.g. "temperature", "humidity", "voltage", "gpio"
 	Payload any    // JSON-serialisable
-	TsMs    int64  // producer timestamp (ms)
+	// TsMs    int64  // producer timestamp (ms)
 }
 
 // Sample is a batch collected together.

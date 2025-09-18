@@ -45,7 +45,7 @@ func (a *svcTestAdaptor) Trigger(ctx context.Context) (time.Duration, error) {
 func (a *svcTestAdaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 	// Emit a trivially typed value; service republishes payload as-is.
 	return halcore.Sample{
-		{Kind: "temp", Payload: types.IntValue{Value: 42, TS: time.Now()}, TsMs: time.Now().UnixMilli()},
+		{Kind: "temp", Payload: types.IntValue{Value: 42, TS: time.Now()}},
 	}, nil
 }
 func (a *svcTestAdaptor) Control(kind, method string, payload any) (any, error) {
@@ -181,7 +181,7 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	// Change rate.
 	req2 := conn.NewMessage(
 		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate},
-		types.SetRate{PeriodMS: 200}, false,
+		types.SetRate{Period: 200 * time.Millisecond}, false,
 	)
 	ctxReq2, cancelReq2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancelReq2()

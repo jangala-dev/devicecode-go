@@ -152,10 +152,10 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 	}
 
 	// Reduce AHT20 rate to speed up the test (set on one kind; device-wide).
-	setRate := func(kind string, ms int) bool {
+	setRate := func(kind string, ms time.Duration) bool {
 		req := conn.NewMessage(
 			bus.T(consts.TokHAL, consts.TokCapability, kind, ids[kind], consts.TokControl, consts.CtrlSetRate),
-			types.SetRate{PeriodMS: ms},
+			types.SetRate{Period: ms},
 			false,
 		)
 		ctx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
@@ -171,7 +171,7 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 		}
 		return true
 	}
-	if !setRate("temperature", 200) {
+	if !setRate("temperature", 200*time.Millisecond) {
 		return
 	}
 	time.Sleep(50 * time.Millisecond)

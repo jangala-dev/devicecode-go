@@ -266,7 +266,6 @@ func (a *adaptor) Trigger(ctx context.Context) (time.Duration, error) { return 0
 
 func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 	nowt := time.Now()
-	now := nowt.UnixMilli()
 	var out halcore.Sample
 
 	// Drain SMBALERT# while asserted (bounded). Respect context cancellation.
@@ -286,7 +285,6 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 				out = append(out, halcore.Reading{
 					Kind:    "alerts",
 					Payload: types.AlertsEvent{Limit: ev.Limit, ChgState: ev.ChgState, ChgStatus: ev.ChgStatus, TS: nowt},
-					TsMs:    now,
 				})
 			}
 			time.Sleep(200 * time.Microsecond)
@@ -337,7 +335,7 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 	if v, err := a.dev.DieMilliC(); err == nil {
 		pv.Die_mC = &v
 	}
-	out = append(out, halcore.Reading{Kind: "power", Payload: pv, TsMs: now})
+	out = append(out, halcore.Reading{Kind: "power", Payload: pv})
 
 	// Charger summary + raw bitfields
 	sum, _ := a.dev.Summary()
@@ -350,7 +348,7 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 		Raw:          types.ChargerRaw{SystemStatus: ss, ChargerState: cs, ChargeStatus: st},
 		TS:           nowt,
 	}
-	out = append(out, halcore.Reading{Kind: "charger", Payload: cv, TsMs: now})
+	out = append(out, halcore.Reading{Kind: "charger", Payload: cv})
 
 	return out, nil
 }

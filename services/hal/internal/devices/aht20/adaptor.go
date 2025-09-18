@@ -81,8 +81,8 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 	}
 	now := time.Now()
 	return halcore.Sample{
-		{Kind: "temperature", Payload: types.TemperatureValue{DeciC: s.DeciCelsius(), TS: now}, TsMs: now.UnixMilli()},
-		{Kind: "humidity", Payload: types.HumidityValue{DeciPercent: s.DeciRelHumidity(), TS: now}, TsMs: now.UnixMilli()},
+		{Kind: "temperature", Payload: types.TemperatureValue{DeciC: s.DeciCelsius(), TS: now}},
+		{Kind: "humidity", Payload: types.HumidityValue{DeciPercent: s.DeciRelHumidity(), TS: now}},
 	}, nil
 }
 

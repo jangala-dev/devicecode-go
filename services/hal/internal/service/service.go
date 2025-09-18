@@ -44,8 +44,8 @@ type Service struct {
 	capToDev  map[capKey]string // (kind,id) -> devID
 	nextCapID map[string]int
 
-	devPeriodMS map[string]int
-	devNextDue  map[string]time.Time
+	devPeriod  map[string]time.Duration
+	devNextDue map[string]time.Time
 
 	timer *time.Timer
 
@@ -66,23 +66,23 @@ var (
 
 func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFactory, uarts halcore.UARTFactory) *Service {
 	return &Service{
-		conn:        conn,
-		buses:       buses,
-		pins:        pins,
-		uarts:       uarts,
-		workers:     map[string]*worker.MeasureWorker{},
-		results:     make(chan halcore.Result, 64),
-		adaptors:    map[string]halcore.Adaptor{},
-		devices:     map[string]devEntry{},
-		capToDev:    map[capKey]string{},
-		nextCapID:   map[string]int{},
-		devPeriodMS: map[string]int{},
-		devNextDue:  map[string]time.Time{},
-		gpioW:       gpioirq.New(64, 64),
-		gpioCancel:  map[string]func(){},
-		uartW:       uartio.New(64),
-		uartCancel:  map[string]func(){},
-		uartEcho:    map[string]bool{},
+		conn:       conn,
+		buses:      buses,
+		pins:       pins,
+		uarts:      uarts,
+		workers:    map[string]*worker.MeasureWorker{},
+		results:    make(chan halcore.Result, 64),
+		adaptors:   map[string]halcore.Adaptor{},
+		devices:    map[string]devEntry{},
+		capToDev:   map[capKey]string{},
+		nextCapID:  map[string]int{},
+		devPeriod:  map[string]time.Duration{},
+		devNextDue: map[string]time.Time{},
+		gpioW:      gpioirq.New(64, 64),
+		gpioCancel: map[string]func(){},
+		uartW:      uartio.New(64),
+		uartCancel: map[string]func(){},
+		uartEcho:   map[string]bool{},
 	}
 }
 
@@ -163,10 +163,11 @@ func (s *Service) Run(ctx context.Context) {
 					s.replyErr(msg, halerr.ErrBusy.Error())
 				}
 			case consts.CtrlSetRate:
-				if p, ok := msg.Payload.(types.SetRate); ok && p.PeriodMS > 0 {
-					s.devPeriodMS[devID] = util.ClampInt(p.PeriodMS, 200, 3_600_000)
+				if p, ok := msg.Payload.(types.SetRate); ok && p.Period > 0 {
+					// Clamp to 200 ms .. 1 h
+					s.devPeriod[devID] = util.ClampDuration(p.Period, 200*time.Millisecond, time.Hour)
 					s.bumpDevNext(devID, time.Now())
-					s.conn.Reply(msg, types.SetRateAck{OK: true, PeriodMS: s.devPeriodMS[devID]}, false)
+					s.conn.Reply(msg, types.SetRateAck{OK: true, Period: s.devPeriod[devID]}, false)
 				} else {
 					s.replyErr(msg, halerr.ErrInvalidPeriod.Error())
 				}
@@ -275,8 +276,10 @@ func (s *Service) applyConfig(ctx context.Context, cfg types.HALConfig) error {
 		s.devices[d.ID] = entry
 
 		if out.SampleEvery > 0 {
-			ms := int(out.SampleEvery / time.Millisecond)
-			s.devPeriodMS[d.ID] = util.ClampInt(ms, 200, 3_600_000)
+			// Clamp to 200 ms .. 1 h for safety.
+			p := util.ClampDuration(out.SampleEvery, 200*time.Millisecond, time.Hour)
+			s.devPeriod[d.ID] = p
+			// First reading shortly after configuration.
 			s.devNextDue[d.ID] = time.Now().Add(200 * time.Millisecond)
 		}
 
@@ -325,7 +328,7 @@ func (s *Service) applyConfig(ctx context.Context, cfg types.HALConfig) error {
 		}
 		delete(s.devices, devID)
 		delete(s.adaptors, devID)
-		delete(s.devPeriodMS, devID)
+		delete(s.devPeriod, devID)
 		delete(s.devNextDue, devID)
 	}
 	return nil
@@ -346,7 +349,12 @@ func (s *Service) submitMeasure(devID string, prio bool) bool {
 }
 
 func (s *Service) bumpDevNext(devID string, from time.Time) {
-	period := time.Duration(util.ClampInt(s.devPeriodMS[devID], 200, 3_600_000)) * time.Millisecond
+	period := s.devPeriod[devID]
+	if period <= 0 {
+		period = 200 * time.Millisecond
+	}
+	// Defensive clamp.
+	period = util.ClampDuration(period, 200*time.Millisecond, time.Hour)
 	s.devNextDue[devID] = from.Add(period)
 }
 

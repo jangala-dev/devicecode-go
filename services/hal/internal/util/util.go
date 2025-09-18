@@ -54,3 +54,13 @@ func ClampInt(v, lo, hi int) int {
 	}
 	return v
 }
+
+func ClampDuration(d, lo, hi time.Duration) time.Duration {
+	if d < lo {
+		return lo
+	}
+	if d > hi {
+		return hi
+	}
+	return d
+}

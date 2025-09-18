@@ -226,10 +226,10 @@ type AlertsEvent struct {
 type ReadNow struct{}
 type ReadNowAck struct{ OK bool }
 
-type SetRate struct{ PeriodMS int }
+type SetRate struct{ Period time.Duration }
 type SetRateAck struct {
-	OK       bool
-	PeriodMS int
+	OK     bool
+	Period time.Duration
 }
 
 type GPIOGet struct{}
