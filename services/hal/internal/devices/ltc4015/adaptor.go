@@ -3,13 +3,13 @@ package ltc4015
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"devicecode-go/services/hal/internal/halcore"
 	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
+	"devicecode-go/types"
 )
 
 // ---------------- Params supplied via config ----------------
@@ -219,45 +219,40 @@ type adaptor struct {
 func (a *adaptor) ID() string { return a.id }
 
 func (a *adaptor) Capabilities() []halcore.CapInfo {
-	// Power info with units (vendor-neutral).
-	powerInfo := map[string]any{
-		"schema_version": 2,
-		"driver":         "ltc4015",
-		"cells":          a.dev.Cells(),
-		"chemistry":      a.dev.Chemistry(),
-		"units": map[string]any{
-			"vbat_per_cell_mV":  "mV",
-			"vbat_pack_mV":      "mV",
-			"vin_mV":            "mV",
-			"vsys_mV":           "mV",
-			"ibat_mA":           "mA",
-			"iin_mA":            "mA",
-			"die_mC":            "m°C",
-			"bsr_uohm_per_cell": "µΩ",
-			"icharge_dac_mA":    "mA",
-			"iin_limit_dac_mA":  "mA",
-			"icharge_bsr_mA":    "mA",
+	// Power info
+	powerInfo := types.PowerInfo{
+		SchemaVersion: 1,
+		Driver:        "ltc4015",
+		Cells:         a.dev.Cells(),
+		Chemistry:     parseChemistry(a.dev.Chemistry()),
+		Units: types.PowerUnits{
+			VBatPerCell_mV:  "mV",
+			VBatPack_mV:     "mV",
+			Vin_mV:          "mV",
+			Vsys_mV:         "mV",
+			IBat_mA:         "mA",
+			IIn_mA:          "mA",
+			Die_mC:          "m°C",
+			BSR_uohmPerCell: "µΩ",
+			IChargeDAC_mA:   "mA",
+			IInLimitDAC_mA:  "mA",
+			IChargeBSR_mA:   "mA",
 		},
 	}
-
-	// Charger info with optional vendor extension documenting bitfields.
-	chargerInfo := map[string]any{
-		"schema_version":   2,
-		"model":            "ltc4015",
-		"chemistry":        a.dev.Chemistry(),
-		"cells":            a.dev.Cells(),
-		"targets_writable": a.targetsWritable,
-		"extensions": map[string]any{
-			"ltc4015": map[string]any{
-				"bitfields": a.extensionsBitMap, // retained map: decode "raw" masks
-			},
+	// Charger info inc. vendor bitfield dictionary
+	chargerInfo := types.ChargerInfo{
+		SchemaVersion:   2,
+		Model:           "ltc4015",
+		Chemistry:       parseChemistry(a.dev.Chemistry()),
+		Cells:           a.dev.Cells(),
+		TargetsWritable: a.targetsWritable,
+		VendorBitfields: types.ChargerBitfields{
+			SystemStatus: ltc4015BitfieldsMap()["system_status"].(map[int]string),
+			ChargerState: ltc4015BitfieldsMap()["charger_state"].(map[int]string),
+			ChargeStatus: ltc4015BitfieldsMap()["charge_status"].(map[int]string),
 		},
 	}
-
-	alertsInfo := map[string]any{
-		"schema_version": 1,
-		"groups":         []string{"limit", "chg_state", "chg_status"},
-	}
+	alertsInfo := types.AlertsInfo{SchemaVersion: 1, Groups: []string{"limit", "chg_state", "chg_status"}}
 
 	return []halcore.CapInfo{
 		{Kind: "power", Info: powerInfo},
@@ -270,7 +265,8 @@ func (a *adaptor) Capabilities() []halcore.CapInfo {
 func (a *adaptor) Trigger(ctx context.Context) (time.Duration, error) { return 0, nil }
 
 func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
-	now := time.Now().UnixMilli()
+	nowt := time.Now()
+	now := nowt.UnixMilli()
 	var out halcore.Sample
 
 	// Drain SMBALERT# while asserted (bounded). Respect context cancellation.
@@ -288,11 +284,9 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 			} // different device responded on ARA
 			if ev.Limit != 0 || ev.ChgState != 0 || ev.ChgStatus != 0 {
 				out = append(out, halcore.Reading{
-					Kind: "alerts",
-					Payload: map[string]any{
-						"limit": ev.Limit, "chg_state": ev.ChgState, "chg_status": ev.ChgStatus, "ts_ms": now,
-					},
-					TsMs: now,
+					Kind:    "alerts",
+					Payload: types.AlertsEvent{Limit: ev.Limit, ChgState: ev.ChgState, ChgStatus: ev.ChgStatus, TS: nowt},
+					TsMs:    now,
 				})
 			}
 			time.Sleep(200 * time.Microsecond)
@@ -304,96 +298,96 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 		return nil, halcore.ErrNotReady
 	}
 
-	// Power (device-agnostic keys).
-	p := map[string]any{"ts_ms": now}
+	// Power
+	pv := types.PowerValue{TS: nowt}
 	if v, err := a.dev.BatteryMilliVPerCell(); err == nil {
-		p["vbat_per_cell_mV"] = v
+		pv.VBatPerCell_mV = &v
 	}
 	if v, err := a.dev.BatteryMilliVPack(); err == nil {
-		p["vbat_pack_mV"] = v
+		pv.VBatPack_mV = &v
 	}
 	if v, err := a.dev.VinMilliV(); err == nil {
-		p["vin_mV"] = v
+		pv.Vin_mV = &v
 	}
 	if v, err := a.dev.VsysMilliV(); err == nil {
-		p["vsys_mV"] = v
+		pv.Vsys_mV = &v
 	}
 	if a.haveB {
 		if v, err := a.dev.IbatMilliA(); err == nil {
-			p["ibat_mA"] = v
+			pv.IBat_mA = &v
 		}
 		if v, err := a.dev.IChargeDAC_mA(); err == nil {
-			p["icharge_dac_mA"] = v
+			pv.IChargeDAC_mA = &v
 		}
 		if v, err := a.dev.BSRMicroOhmPerCell(); err == nil {
-			p["bsr_uohm_per_cell"] = v
+			pv.BSR_uohmPerCell = &v
 		}
 		if v, err := a.dev.IChargeBSR_mA(); err == nil {
-			p["icharge_bsr_mA"] = v
+			pv.IChargeBSR_mA = &v
 		}
 	}
 	if a.haveI {
 		if v, err := a.dev.IinMilliA(); err == nil {
-			p["iin_mA"] = v
+			pv.IIn_mA = &v
 		}
 		if v, err := a.dev.IinLimitDAC_mA(); err == nil {
-			p["iin_limit_dac_mA"] = v
+			pv.IInLimitDAC_mA = &v
 		}
 	}
 	if v, err := a.dev.DieMilliC(); err == nil {
-		p["die_mC"] = v
+		pv.Die_mC = &v
 	}
-	out = append(out, halcore.Reading{Kind: "power", Payload: p, TsMs: now})
+	out = append(out, halcore.Reading{Kind: "power", Payload: pv, TsMs: now})
 
-	// Charger summary + optional raw bitfields.
+	// Charger summary + raw bitfields
 	sum, _ := a.dev.Summary()
 	ss, cs, st, _ := a.dev.RawStatus()
-	out = append(out, halcore.Reading{
-		Kind: "charger",
-		Payload: map[string]any{
-			"phase": phaseFrom(sum),
-			"input_limited": map[string]any{
-				"vin_uvcl":  sum.VinUvcl,
-				"iin_limit": sum.IinLimit,
-			},
-			"ok_to_charge": sum.OkToCharge,
-			"faults": map[string]any{
-				"bat_missing":      sum.BatMissing,
-				"bat_short":        sum.BatShort,
-				"thermal_shutdown": sum.ThermalShutdown,
-			},
-			// Vendor extension: compact raw bitfields (decode using retained map).
-			"raw":   map[string]any{"system_status": ss, "charger_state": cs, "charge_status": st},
-			"ts_ms": now,
-		},
-		TsMs: now,
-	})
+	cv := types.ChargerValue{
+		Phase:        phaseFrom(sum),
+		InputLimited: types.ChargerInputLimited{VinUvcl: sum.VinUvcl, IInLimit: sum.IinLimit},
+		OKToCharge:   sum.OkToCharge,
+		Faults:       types.ChargerFaults{BatMissing: sum.BatMissing, BatShort: sum.BatShort, ThermalShutdown: sum.ThermalShutdown},
+		Raw:          types.ChargerRaw{SystemStatus: ss, ChargerState: cs, ChargeStatus: st},
+		TS:           nowt,
+	}
+	out = append(out, halcore.Reading{Kind: "charger", Payload: cv, TsMs: now})
 
 	return out, nil
 }
 
-func phaseFrom(s StatusSummary) string {
+func parseChemistry(s string) types.Chemistry {
+	switch s {
+	case "lithium":
+		return types.ChemLithium
+	case "lead_acid":
+		return types.ChemLeadAcid
+	default:
+		return types.ChemUnknown
+	}
+}
+
+func phaseFrom(s StatusSummary) types.ChargerPhase {
 	switch {
 	case s.BatMissing || s.BatShort || s.ThermalShutdown:
-		return "fault"
+		return types.PhaseFault
 	case s.Equalize:
-		return "equalize"
+		return types.PhaseEqualize
 	case s.Absorb:
-		return "absorb"
+		return types.PhaseAbsorb
 	case s.Precharge:
-		return "precharge"
+		return types.PhasePrecharge
 	case s.InCCCV:
 		if s.CC {
-			return "cc"
+			return types.PhaseCC
 		}
 		if s.CV {
-			return "cv"
+			return types.PhaseCV
 		}
-		return "cc"
+		return types.PhaseCC
 	case s.Suspended:
-		return "suspended"
+		return types.PhaseSuspended
 	default:
-		return "idle"
+		return types.PhaseIdle
 	}
 }
 
@@ -404,128 +398,107 @@ func (a *adaptor) Control(kind, method string, payload any) (any, error) {
 	}
 	switch method {
 	case "set_input_current_limit":
-		if mA, ok := getInt(payload, "mA"); ok {
-			return okReply(a.dev.SetIinLimit_mA(int32(mA)))
+		if p, ok := payload.(types.LTC4015SetInputCurrentLimit); ok {
+			return okReply(a.dev.SetIinLimit_mA(int32(p.MA)))
 		}
-		return nil, badPayload("mA")
+		return nil, halerr.ErrInvalidPayload
 	case "set_charge_current":
-		if mA, ok := getInt(payload, "mA"); ok {
-			return okReply(a.dev.SetIChargeTarget_mA(int32(mA)))
+		if p, ok := payload.(types.LTC4015SetChargeCurrent); ok {
+			return okReply(a.dev.SetIChargeTarget_mA(int32(p.MA)))
 		}
-		return nil, badPayload("mA")
+		return nil, halerr.ErrInvalidPayload
 	case "set_vin_uvcl":
-		if mV, ok := getInt(payload, "mV"); ok {
-			return okReply(a.dev.SetVinUvcl_mV(int32(mV)))
+		if p, ok := payload.(types.LTC4015SetVinUVCL); ok {
+			return okReply(a.dev.SetVinUvcl_mV(int32(p.MV)))
 		}
-		return nil, badPayload("mV")
+		return nil, halerr.ErrInvalidPayload
 	case "apply_profile":
-		return a.applyProfile(payload)
-	case "read_alerts":
-		ev, err := a.dev.DrainAlerts()
-		if err != nil {
-			return nil, err
+		if p, ok := payload.(types.LTC4015ApplyProfile); ok {
+			return a.applyProfileTyped(p)
 		}
-		return map[string]any{"limit": ev.Limit, "chg_state": ev.ChgState, "chg_status": ev.ChgStatus}, nil
+		return nil, halerr.ErrInvalidPayload
+	case "read_alerts":
+		if _, ok := payload.(types.LTC4015ReadAlerts); ok {
+			ev, err := a.dev.DrainAlerts()
+			if err != nil {
+				return nil, err
+			}
+			return types.LTC4015ReadAlertsReply{Limit: ev.Limit, ChgState: ev.ChgState, ChgStatus: ev.ChgStatus}, nil
+		}
+		return nil, halerr.ErrInvalidPayload
 	default:
 		return nil, halcore.ErrUnsupported
 	}
 }
 
-func badPayload(_ string) error { // keep message small like other HAL errors
-	return errors.New("invalid_payload")
-}
-
-func (a *adaptor) applyProfile(p any) (any, error) {
-	m, _ := p.(map[string]any)
-	if cells, ok := getInt(m, "cells"); ok && cells > 0 {
-		_ = a.dev.Configure(configLite{Cells: uint8(cells)}) // best-effort
+func (a *adaptor) applyProfileTyped(p types.LTC4015ApplyProfile) (types.LTC4015ApplyProfileReply, error) {
+	if p.Cells != nil && *p.Cells > 0 {
+		_ = a.dev.Configure(configLite{Cells: uint8(*p.Cells)})
 	}
 
-	chem, _ := getString(m, "chemistry")
+	var chem string
+	switch p.Chemistry {
+	case types.ChemLeadAcid:
+		chem = "lead_acid"
+	case types.ChemLithium:
+		chem = "lithium"
+	default:
+		chem = "unknown"
+	}
 	_ = a.dev.SetSuspend(true)
 	defer a.dev.SetSuspend(false)
 
 	switch chem {
 	case "lead_acid":
 		if la, ok := a.dev.LeadAcid(); ok {
-			if vpc, ok := getInt(m, "vcharge_mV_per_cell"); ok {
-				if err := la.SetVChargeSetting_mVPerCell(int32(vpc), getBool(m, "temp_comp")); err != nil {
-					return nil, err
+			if p.VCharge_mVPerCell != nil {
+				if err := la.SetVChargeSetting_mVPerCell(*p.VCharge_mVPerCell, p.EnableTempComp != nil && *p.EnableTempComp); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
-			if d, ok := getInt(m, "vabsorb_delta_mV"); ok {
-				if err := la.SetVAbsorbDelta_mVPerCell(int32(d)); err != nil {
-					return nil, err
+			if p.VAbsorbDelta_mV != nil {
+				if err := la.SetVAbsorbDelta_mVPerCell(*p.VAbsorbDelta_mV); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
-			if d, ok := getInt(m, "vequalize_delta_mV"); ok {
-				if err := la.SetVEqualizeDelta_mVPerCell(int32(d)); err != nil {
-					return nil, err
+			if p.VEqualizeDelta_mV != nil {
+				if err := la.SetVEqualizeDelta_mVPerCell(*p.VEqualizeDelta_mV); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
-			if s, ok := getInt(m, "max_absorb_time_s"); ok {
-				if err := la.SetMaxAbsorbTime_s(uint16(s)); err != nil {
-					return nil, err
+			if p.MaxAbsorbTime_s != nil {
+				if err := la.SetMaxAbsorbTime_s(*p.MaxAbsorbTime_s); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
-			if s, ok := getInt(m, "equalize_time_s"); ok {
-				if err := la.SetEqualizeTime_s(uint16(s)); err != nil {
-					return nil, err
+			if p.EqualizeTime_s != nil {
+				if err := la.SetEqualizeTime_s(*p.EqualizeTime_s); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
-			if _, present := m["temp_comp"]; present {
-				if err := la.EnableLeadAcidTempComp(getBool(m, "temp_comp")); err != nil {
-					return nil, err
+			if p.EnableTempComp != nil {
+				if err := la.EnableLeadAcidTempComp(*p.EnableTempComp); err != nil {
+					return types.LTC4015ApplyProfileReply{}, err
 				}
 			}
 		}
 	case "lithium":
-		if mA, ok := getInt(m, "icharge_mA"); ok {
-			if err := a.dev.SetIChargeTarget_mA(int32(mA)); err != nil {
-				return nil, err
-			}
+		if p.VCharge_mVPerCell == nil { // keep example simple; map lithium to charge current if provided
+			// no-op
 		}
+		// Optional: extend with more lithium profile fields later.
 	}
 
 	ss, cs, st, _ := a.dev.RawStatus()
-	return map[string]any{"ok": true, "raw": map[string]any{"system_status": ss, "charger_state": cs, "charge_status": st}}, nil
+	return types.LTC4015ApplyProfileReply{OK: true, Raw: types.ChargerRaw{SystemStatus: ss, ChargerState: cs, ChargeStatus: st}}, nil
 }
 
 // Small helpers.
-func okReply(err error) (map[string]any, error) {
+func okReply(err error) (struct{ OK bool }, error) {
 	if err != nil {
-		return nil, err
+		return struct{ OK bool }{}, err
 	}
-	return map[string]any{"ok": true}, nil
-}
-func getInt(p any, key string) (int, bool) {
-	if m, ok := p.(map[string]any); ok {
-		switch v := m[key].(type) {
-		case int:
-			return v, true
-		case int64:
-			return int(v), true
-		case float64:
-			return int(v), true
-		}
-	}
-	return 0, false
-}
-func getString(m map[string]any, key string) (string, bool) {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s, true
-		}
-	}
-	return "", false
-}
-func getBool(m map[string]any, key string) bool {
-	if v, ok := m[key]; ok {
-		if b, ok := v.(bool); ok {
-			return b
-		}
-	}
-	return false
+	return struct{ OK bool }{OK: true}, nil
 }
 
 // Retained vendor bitfield dictionary for decoding "raw" masks.

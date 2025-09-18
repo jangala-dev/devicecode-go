@@ -21,8 +21,8 @@ type Sample []Reading
 
 // CapInfo describes one capability’s retained info document.
 type CapInfo struct {
-	Kind string         // capability kind
-	Info map[string]any // small JSONable map
+	Kind string // capability kind
+	Info any    // small JSONable struct (typed)
 }
 
 // Adaptor abstracts a concrete device/driver. Must not own goroutines or the bus.

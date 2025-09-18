@@ -3,7 +3,6 @@ package uart
 
 import (
 	"context"
-	"encoding/base64"
 	"time"
 
 	"devicecode-go/services/hal/internal/consts"
@@ -11,6 +10,7 @@ import (
 	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
+	"devicecode-go/types"
 )
 
 func init() { registry.RegisterBuilder("uart", builder{}) }
@@ -97,9 +97,9 @@ func (a *adaptor) Capabilities() []halcore.CapInfo {
 	return []halcore.CapInfo{
 		{
 			Kind: consts.KindUART,
-			Info: map[string]any{
-				"schema_version": 1,
-				"driver":         "uart",
+			Info: types.UARTInfo{
+				SchemaVersion: 1,
+				Driver:        "uart",
 			},
 		},
 	}
@@ -123,86 +123,43 @@ func (a *adaptor) Control(kind, method string, payload any) (any, error) {
 	}
 	switch method {
 	case "write":
-		data, ok := decodeWritePayload(payload)
+		p, ok := payload.(types.UARTWrite)
 		if !ok {
 			return nil, halerr.ErrInvalidPayload
 		}
-		n, err := a.port.Write(data)
-		return map[string]any{"ok": err == nil, "n": n}, err
+		n, err := a.port.Write(p.Data)
+		return types.UARTWriteReply{OK: err == nil, N: n}, err
 	case "set_baud":
 		if f, ok := a.port.(halcore.UARTFormatter); ok {
-			if m, ok := payload.(map[string]any); ok {
-				switch v := m["baud"].(type) {
-				case int:
-					f.SetBaudRate(uint32(v))
-					return map[string]any{"ok": true}, nil
-				case int64:
-					f.SetBaudRate(uint32(v))
-					return map[string]any{"ok": true}, nil
-				case float64:
-					f.SetBaudRate(uint32(v))
-					return map[string]any{"ok": true}, nil
-				}
+			p, ok := payload.(types.UARTSetBaud)
+			if !ok {
+				return nil, halerr.ErrInvalidPayload
 			}
-			return nil, halerr.ErrInvalidPayload
+			f.SetBaudRate(p.Baud)
+			return struct{ OK bool }{OK: true}, nil
 		}
 		return nil, halcore.ErrUnsupported
 	case "set_format":
 		if f, ok := a.port.(halcore.UARTFormatter); ok {
-			m, _ := payload.(map[string]any)
-			db := util.ClampInt(intFrom(m, "databits", 8), 5, 8)
-			sb := util.ClampInt(intFrom(m, "stopbits", 1), 1, 2)
+			p, ok := payload.(types.UARTSetFormat)
+			if !ok {
+				return nil, halerr.ErrInvalidPayload
+			}
+			db := util.ClampInt(int(p.DataBits), 5, 8)
+			sb := util.ClampInt(int(p.StopBits), 1, 2)
 			var par uint8
-			switch strFrom(m, "parity") {
-			case "even":
+			switch p.Parity {
+			case types.ParityEven:
 				par = 1
-			case "odd":
+			case types.ParityOdd:
 				par = 2
 			default:
 				par = 0
 			}
-			return map[string]any{"ok": true}, f.SetFormat(uint8(db), uint8(sb), par)
+			return struct{ OK bool }{OK: true}, f.SetFormat(uint8(db), uint8(sb), par)
 		}
 		return nil, halcore.ErrUnsupported
 	default:
 		return nil, halcore.ErrUnsupported
 	}
-}
-
-func decodeWritePayload(p any) ([]byte, bool) {
-	if m, ok := p.(map[string]any); ok {
-		if t, ok := m["text"].(string); ok {
-			return []byte(t), true
-		}
-		if s, ok := m["data_b64"].(string); ok {
-			if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-				return b, true
-			}
-		}
-	}
-	return nil, false
-}
-func intFrom(m map[string]any, k string, def int) int {
-	if m == nil {
-		return def
-	}
-	switch v := m[k].(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case float64:
-		return int(v)
-	default:
-		return def
-	}
-}
-func strFrom(m map[string]any, k string) string {
-	if m == nil {
-		return ""
-	}
-	if s, ok := m[k].(string); ok {
-		return s
-	}
-	return ""
 }

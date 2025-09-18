@@ -9,7 +9,9 @@ import (
 
 	"tinygo.org/x/drivers"
 
-	halcore "devicecode-go/services/hal/internal/halcore"
+	"devicecode-go/services/hal/internal/halcore"
+
+	"github.com/jangala-dev/tinygo-uartx/uartx"
 )
 
 // -----------------------------------------------------------------------------

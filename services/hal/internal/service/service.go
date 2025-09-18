@@ -3,20 +3,19 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/hal/config"
 	"devicecode-go/services/hal/internal/consts"
 	"devicecode-go/services/hal/internal/gpioirq"
 	"devicecode-go/services/hal/internal/halcore"
 	"devicecode-go/services/hal/internal/halerr"
-
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/uartio"
 	"devicecode-go/services/hal/internal/util"
 	"devicecode-go/services/hal/internal/worker"
+
+	"devicecode-go/types"
 )
 
 type devEntry struct {
@@ -83,6 +82,7 @@ func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFact
 		gpioCancel:  map[string]func(){},
 		uartW:       uartio.New(64),
 		uartCancel:  map[string]func(){},
+		uartEcho:    map[string]bool{},
 	}
 }
 
@@ -124,9 +124,9 @@ func (s *Service) Run(ctx context.Context) {
 			return
 
 		case msg := <-cfgSub.Channel():
-			var cfg config.HALConfig
-			if err := util.DecodeJSON(msg.Payload, &cfg); err != nil {
-				s.publishState("error", "config_decode_failed", err)
+			cfg, ok := msg.Payload.(types.HALConfig)
+			if !ok {
+				s.publishState("error", "config_wrong_type", nil)
 				continue
 			}
 			if err := s.applyConfig(ctx, cfg); err != nil {
@@ -143,13 +143,13 @@ func (s *Service) Run(ctx context.Context) {
 			kind, _ := msg.Topic[2].(string)
 			idNum, ok := asInt(msg.Topic[3])
 			if !ok || kind == "" {
-				s.replyErr(msg, halerr.ErrInvalidCapAddr)
+				s.replyErr(msg, halerr.ErrInvalidCapAddr.Error())
 				continue
 			}
 			key := capKey{kind: kind, id: idNum}
 			devID, ok := s.capToDev[key]
 			if !ok {
-				s.replyErr(msg, halerr.ErrUnknownCap)
+				s.replyErr(msg, halerr.ErrUnknownCap.Error())
 				continue
 			}
 			method, _ := msg.Topic[5].(string)
@@ -158,44 +158,38 @@ func (s *Service) Run(ctx context.Context) {
 			case consts.CtrlReadNow:
 				if s.submitMeasure(devID, true) {
 					s.bumpDevNext(devID, time.Now())
-					s.replyOK(msg, nil)
+					s.conn.Reply(msg, types.ReadNowAck{OK: true}, false)
 				} else {
-					s.replyErr(msg, halerr.ErrBusy)
+					s.replyErr(msg, halerr.ErrBusy.Error())
 				}
 			case consts.CtrlSetRate:
-				ms, ok := parsePeriodMS(msg.Payload)
-				if ok && ms > 0 {
-					s.devPeriodMS[devID] = util.ClampInt(ms, 200, 3_600_000)
+				if p, ok := msg.Payload.(types.SetRate); ok && p.PeriodMS > 0 {
+					s.devPeriodMS[devID] = util.ClampInt(p.PeriodMS, 200, 3_600_000)
 					s.bumpDevNext(devID, time.Now())
-					s.replyOK(msg, map[string]any{"period_ms": s.devPeriodMS[devID]})
+					s.conn.Reply(msg, types.SetRateAck{OK: true, PeriodMS: s.devPeriodMS[devID]}, false)
 				} else {
-					s.replyErr(msg, halerr.ErrInvalidPeriod)
+					s.replyErr(msg, halerr.ErrInvalidPeriod.Error())
 				}
 			default:
 				ent := s.devices[devID]
 				if ent.adaptor == nil {
-					s.replyErr(msg, halerr.ErrNoAdaptor)
+					s.replyErr(msg, halerr.ErrNoAdaptor.Error())
 					continue
 				}
 				if res, err := ent.adaptor.Control(kind, method, msg.Payload); err == nil {
-					s.replyOK(msg, map[string]any{"result": res})
-					// Optional TX echo on successful UART writes (if enabled via UARTRequest.PublishTXEcho).
+					// Successful device-specific control: reply with the typed result directly.
+					s.conn.Reply(msg, res, false)
+					// Optional TX echo for UART writes with typed payload.
 					if kind == consts.KindUART && method == "write" && s.uartEcho[devID] {
-						if m, ok := msg.Payload.(map[string]any); ok {
-							if t, ok := m["text"].(string); ok {
-								s.uartW.EmitTX(devID, []byte(t))
-							} else if b64, ok := m["data_b64"].(string); ok {
-								if b, err := base64.StdEncoding.DecodeString(b64); err == nil {
-									s.uartW.EmitTX(devID, b)
-								}
-							}
+						if w, ok := msg.Payload.(types.UARTWrite); ok {
+							s.uartW.EmitTX(devID, w.Data)
 						}
 					}
 				} else {
 					if err == halcore.ErrUnsupported {
-						s.replyErr(msg, halerr.ErrUnsupported)
+						s.replyErr(msg, halerr.ErrUnsupported.Error())
 					} else {
-						s.replyErr(msg, err)
+						s.replyErr(msg, err.Error())
 					}
 				}
 			}
@@ -221,7 +215,7 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 
-func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
+func (s *Service) applyConfig(ctx context.Context, cfg types.HALConfig) error {
 	seen := map[string]struct{}{}
 
 	for i := range cfg.Devices {
@@ -273,7 +267,10 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 
 			s.pubRet(ci.Kind, id, consts.TokInfo, ci.Info)
 			s.pubRet(ci.Kind, id, consts.TokState,
-				map[string]any{"link": consts.LinkUp, "ts_ms": time.Now().UnixMilli()})
+				types.CapabilityState{
+					Link: types.LinkUp,
+					TS:   time.Now(),
+				})
 		}
 		s.devices[d.ID] = entry
 
@@ -315,8 +312,7 @@ func (s *Service) applyConfig(ctx context.Context, cfg config.HALConfig) error {
 		}
 		for kind, id := range ent.caps {
 			s.pubRet(kind, id, consts.TokInfo, nil)
-			s.pubRet(kind, id, consts.TokState,
-				map[string]any{"link": consts.LinkDown, "ts_ms": time.Now().UnixMilli()})
+			s.pubRet(kind, id, consts.TokState, types.CapabilityState{Link: types.LinkDown, TS: time.Now()})
 			delete(s.capToDev, capKey{kind: kind, id: id})
 		}
 		if c, ok := s.gpioCancel[devID]; ok {
@@ -372,18 +368,21 @@ func (s *Service) handleUARTEvent(ev uartio.Event) {
 		return
 	}
 	if id, ok := ent.caps[consts.KindUART]; ok {
-		ts := ev.TS.UnixMilli()
+		evt := types.UARTEvent{
+			Dir: func() types.UARTDir {
+				if ev.Dir == "tx" {
+					return types.UARTTx
+				}
+				return types.UARTRx
+			}(),
+			Data: append([]byte(nil), ev.Data...),
+			N:    len(ev.Data),
+			TS:   ev.TS,
+		}
 		s.conn.Publish(s.conn.NewMessage(
-			capTopicInt(consts.KindUART, id, consts.TokEvent),
-			map[string]any{
-				"dir":      ev.Dir,
-				"data_b64": uartio.EncodeB64(ev.Data),
-				"n":        len(ev.Data),
-				"ts_ms":    ts,
-			},
-			false,
-		))
-		s.pubRet(consts.KindUART, id, consts.TokState, map[string]any{"link": consts.LinkUp, "ts_ms": ts})
+			capTopicInt(consts.KindUART, id, consts.TokEvent), evt, false))
+		s.pubRet(consts.KindUART, id, consts.TokState,
+			types.CapabilityState{Link: types.LinkUp, TS: ev.TS})
 	}
 }
 
@@ -392,12 +391,15 @@ func (s *Service) handleResult(r halcore.Result) {
 	if !ok {
 		return
 	}
-	now := time.Now().UnixMilli()
+	now := time.Now()
 
 	if r.Err != nil {
 		for kind, id := range ent.caps {
-			s.pubRet(kind, id, consts.TokState,
-				map[string]any{"link": consts.LinkDegraded, "error": r.Err.Error(), "ts_ms": now})
+			s.pubRet(kind, id, consts.TokState, types.CapabilityState{
+				Link:  types.LinkDegraded,
+				TS:    now,
+				Error: r.Err.Error(),
+			})
 		}
 		return
 	}
@@ -411,7 +413,7 @@ func (s *Service) handleResult(r halcore.Result) {
 			rd.Payload,
 			false,
 		))
-		s.pubRet(rd.Kind, id, "state", map[string]any{"link": "up", "ts_ms": now})
+		s.pubRet(rd.Kind, id, consts.TokState, types.CapabilityState{Link: types.LinkUp, TS: now})
 	}
 }
 
@@ -420,23 +422,26 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 	if !ok {
 		return
 	}
-	ts := ev.TS.UnixMilli()
+	ts := ev.TS
 
 	// Path 1: devices that expose a GPIO capability -> publish event + retained state
 	if id, ok := ent.caps[consts.KindGPIO]; ok {
 		// Event (non-retained)
+		edge := map[halcore.Edge]types.Edge{
+			halcore.EdgeNone:    types.EdgeNone,
+			halcore.EdgeRising:  types.EdgeRising,
+			halcore.EdgeFalling: types.EdgeFalling,
+			halcore.EdgeBoth:    types.EdgeBoth,
+		}[ev.Edge]
+		// Event (non-retained)
 		s.conn.Publish(s.conn.NewMessage(
 			capTopicInt(consts.KindGPIO, id, consts.TokEvent),
-			map[string]any{
-				"edge":  halcore.EdgeToString(ev.Edge),
-				"level": ev.Level,
-				"ts_ms": ts,
-			},
+			types.GPIOEvent{Edge: edge, Level: uint8(ev.Level), TS: ts},
 			false,
 		))
 		// State (retained)
 		s.pubRet(consts.KindGPIO, id, consts.TokState,
-			map[string]any{"link": consts.LinkUp, "level": ev.Level, "ts_ms": ts})
+			types.GPIOState{Link: types.LinkUp, Level: uint8(ev.Level), TS: ts})
 		return
 	}
 
@@ -455,33 +460,21 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 // ---- bus helpers & utils ----
 
 func (s *Service) publishState(level, status string, err error) {
-	payload := map[string]any{"level": level, "status": status, "ts_ms": time.Now().UnixMilli()}
+	pl := types.HALState{Level: level, Status: status, TS: time.Now()}
 	if err != nil {
-		payload["error"] = err.Error()
+		pl.Error = err.Error()
 	}
-	s.conn.Publish(s.conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokState}, payload, true))
+	s.conn.Publish(s.conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokState}, pl, true))
 }
 
-func (s *Service) replyOK(req *bus.Message, extra map[string]any) {
+func (s *Service) replyErr(req *bus.Message, code string) {
 	if len(req.ReplyTo) == 0 {
 		return
 	}
-	m := map[string]any{"ok": true}
-	for k, v := range extra {
-		m[k] = v
+	if code == "" {
+		code = "error"
 	}
-	s.conn.Reply(req, m, false)
-}
-
-func (s *Service) replyErr(req *bus.Message, e error) {
-	if len(req.ReplyTo) == 0 {
-		return
-	}
-	code := "error"
-	if e != nil {
-		code = e.Error()
-	}
-	s.conn.Reply(req, map[string]any{"ok": false, "error": code}, false)
+	s.conn.Reply(req, types.ErrorReply{OK: false, Error: code}, false)
 }
 
 func capTopicInt(kind string, id int, suffix string) bus.Topic {
@@ -490,20 +483,6 @@ func capTopicInt(kind string, id int, suffix string) bus.Topic {
 
 func (s *Service) pubRet(kind string, id int, suffix string, p any) {
 	s.conn.Publish(s.conn.NewMessage(capTopicInt(kind, id, suffix), p, true))
-}
-
-func parsePeriodMS(p any) (int, bool) {
-	if m, ok := p.(map[string]any); ok {
-		switch v := m["period_ms"].(type) {
-		case int:
-			return v, true
-		case int64:
-			return int(v), true
-		case float64:
-			return int(v), true
-		}
-	}
-	return 0, false
 }
 
 func asInt(t any) (int, bool) {

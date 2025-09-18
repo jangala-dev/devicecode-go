@@ -3,7 +3,6 @@ package uartio
 
 import (
 	"context"
-	"encoding/base64"
 	"time"
 
 	"devicecode-go/services/hal/internal/halcore"
@@ -141,5 +140,3 @@ func (w *Worker) EmitTX(devID string, data []byte) {
 	default:
 	}
 }
-
-func EncodeB64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }

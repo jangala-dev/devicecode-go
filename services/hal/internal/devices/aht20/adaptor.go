@@ -9,6 +9,8 @@ import (
 	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
+
+	"devicecode-go/types"
 )
 
 // Register this device type with the registry.
@@ -53,8 +55,12 @@ func (a *adaptor) ID() string { return a.id }
 
 func (a *adaptor) Capabilities() []halcore.CapInfo {
 	return []halcore.CapInfo{
-		{Kind: "temperature", Info: map[string]any{"unit": "C", "precision": 0.1, "schema_version": 1, "driver": "aht20"}},
-		{Kind: "humidity", Info: map[string]any{"unit": "%RH", "precision": 0.1, "schema_version": 1, "driver": "aht20"}},
+		{Kind: "temperature", Info: types.TemperatureInfo{
+			SchemaVersion: 1, Driver: "aht20", Unit: "C", Precision: 0.1,
+		}},
+		{Kind: "humidity", Info: types.HumidityInfo{
+			SchemaVersion: 1, Driver: "aht20", Unit: "%RH", Precision: 0.1,
+		}},
 	}
 }
 
@@ -73,10 +79,10 @@ func (a *adaptor) Collect(ctx context.Context) (halcore.Sample, error) {
 		}
 		return nil, err
 	}
-	ts := time.Now().UnixMilli()
+	now := time.Now()
 	return halcore.Sample{
-		{Kind: "temperature", Payload: map[string]any{"deci_c": s.DeciCelsius(), "ts_ms": ts}, TsMs: ts},
-		{Kind: "humidity", Payload: map[string]any{"deci_percent": s.DeciRelHumidity(), "ts_ms": ts}, TsMs: ts},
+		{Kind: "temperature", Payload: types.TemperatureValue{DeciC: s.DeciCelsius(), TS: now}, TsMs: now.UnixMilli()},
+		{Kind: "humidity", Payload: types.HumidityValue{DeciPercent: s.DeciRelHumidity(), TS: now}, TsMs: now.UnixMilli()},
 	}, nil
 }
 

@@ -3,13 +3,13 @@ package gpio
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"devicecode-go/services/hal/internal/halcore"
 	"devicecode-go/services/hal/internal/halerr"
 	"devicecode-go/services/hal/internal/registry"
 	"devicecode-go/services/hal/internal/util"
+	"devicecode-go/types"
 )
 
 func init() {
@@ -88,15 +88,13 @@ type adaptor struct {
 func (a *adaptor) ID() string { return a.id }
 
 func (a *adaptor) Capabilities() []halcore.CapInfo {
-	info := map[string]interface{}{
-		"pin":            a.pin.Number(),
-		"mode":           a.params.Mode,
-		"invert":         a.params.Invert,
-		"schema_version": 1,
-		"driver":         "gpio",
-	}
-	if a.params.Mode == "input" {
-		info["pull"] = a.params.Pull
+	info := types.GPIOInfo{
+		SchemaVersion: 1,
+		Driver:        "gpio",
+		Pin:           a.pin.Number(),
+		Mode:          a.params.Mode,
+		Pull:          a.params.Pull,
+		Invert:        a.params.Invert,
 	}
 	return []halcore.CapInfo{{Kind: "gpio", Info: info}}
 }
@@ -124,40 +122,33 @@ func (a *adaptor) Control(kind, method string, payload interface{}) (interface{}
 			if a.params.Invert {
 				l = !l
 			}
-			return map[string]interface{}{"level": util.BoolToInt(l)}, nil
+			return types.GPIOGetReply{Level: uint8(util.BoolToInt(l))}, nil
 		default:
 			return nil, halcore.ErrUnsupported
 		}
 	case "output":
 		switch method {
 		case "set":
-			l, ok := parseLevel(payload)
+			p, ok := payload.(types.GPIOSet)
 			if !ok {
-				return nil, errors.New("invalid payload; want {\"level\":bool}")
+				return nil, halerr.ErrInvalidPayload
+
 			}
+			l := p.Level
 			if a.params.Invert {
 				l = !l
 			}
 			a.pin.Set(l)
-			return map[string]interface{}{"ok": true}, nil
+			return struct{ OK bool }{OK: true}, nil
 		case "toggle":
 			a.pin.Toggle()
-			return map[string]interface{}{"ok": true}, nil
+			return struct{ OK bool }{OK: true}, nil
 		default:
 			return nil, halcore.ErrUnsupported
 		}
 	default:
 		return nil, halcore.ErrUnsupported
 	}
-}
-
-func parseLevel(p interface{}) (bool, bool) {
-	if m, ok := p.(map[string]interface{}); ok {
-		if v, ok := m["level"].(bool); ok {
-			return v, true
-		}
-	}
-	return false, false
 }
 
 func parsePull(s string) halcore.Pull {

@@ -9,13 +9,14 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/hal/config"
 	"devicecode-go/services/hal/internal/consts"
 	"devicecode-go/services/hal/internal/platform"
 	"devicecode-go/services/hal/internal/service"
 
 	_ "devicecode-go/services/hal/internal/devices/gpio"
 	_ "devicecode-go/services/hal/internal/devices/ltc4015"
+
+	"devicecode-go/types"
 )
 
 func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
@@ -64,8 +65,8 @@ func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
 	}
 
 	// Configure one LTC4015
-	cfg := config.HALConfig{
-		Devices: []config.Device{{
+	cfg := types.HALConfig{
+		Devices: []types.Device{{
 			ID:   "chg0",
 			Type: "ltc4015",
 			Params: map[string]any{
@@ -79,7 +80,7 @@ func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
 				"irq_debounce_ms":   2,
 				"force_meas_sys_on": true,
 			},
-			BusRef: config.BusRef{Type: "i2c", ID: "i2c1"},
+			BusRef: types.BusRef{Type: "i2c", ID: "i2c1"},
 		}},
 	}
 	conn.Publish(conn.NewMessage(bus.T(consts.TokConfig, consts.TokHAL), cfg, false))
@@ -89,7 +90,7 @@ func TestHAL_LTC4015_Alerts_State_EdgeFilter(t *testing.T) {
 readyWait:
 	for time.Now().Before(readyBy) {
 		if m, _ := recvOrTimeout(stateSub.Channel(), 500*time.Millisecond); m != nil {
-			if p, ok := m.Payload.(map[string]any); ok && p["level"] == "ready" {
+			if st, ok := m.Payload.(types.HALState); ok && st.Level == "ready" {
 				break readyWait
 			}
 		}
@@ -146,14 +147,14 @@ value1Wait:
 	powerStateSub := conn.Subscribe(bus.T(consts.TokHAL, consts.TokCapability, "power", ids["power"], consts.TokState))
 	defer conn.Unsubscribe(powerStateSub)
 
-	var state1 map[string]any
+	var state1 types.CapabilityState
 	if m, err := recvOrTimeout(powerStateSub.Channel(), 2*time.Second); err != nil || m == nil {
 		t.Errorf("[%s] no power/state observed", ts())
 		return
-	} else if p, ok := m.Payload.(map[string]any); ok {
-		state1 = p
-		if p["link"] != consts.LinkUp {
-			t.Errorf("[%s] power/state link != up: %#v", ts(), p)
+	} else if st, ok := m.Payload.(types.CapabilityState); ok {
+		state1 = st
+		if st.Link != types.LinkUp {
+			t.Errorf("[%s] power/state link != up: %#v", ts(), st)
 			return
 		}
 	}
@@ -172,7 +173,7 @@ value1Wait:
 	cancelRN()
 
 	// Await state with ts_ms > previous (allowing for equal in same ms)
-	t1, _ := asInt(state1["ts_ms"])
+	t1 := state1.TS
 	newerBy := time.Now().Add(750 * time.Millisecond)
 	seenNewer := false
 	for time.Now().Before(newerBy) {
@@ -180,11 +181,9 @@ value1Wait:
 		if err != nil || m == nil {
 			continue
 		}
-		if p, ok := m.Payload.(map[string]any); ok {
-			if t2, ok := asInt(p["ts_ms"]); ok && t2 > t1 {
-				seenNewer = true
-				break
-			}
+		if st, ok := m.Payload.(types.CapabilityState); ok && st.TS.After(t1) {
+			seenNewer = true
+			break
 		}
 	}
 	if !seenNewer {
@@ -275,7 +274,7 @@ value1Wait:
 	stopBy := time.Now().Add(2 * time.Second)
 	for time.Now().Before(stopBy) {
 		if m, _ := recvOrTimeout(stateSub.Channel(), 100*time.Millisecond); m != nil {
-			if p, ok := m.Payload.(map[string]any); ok && p["level"] == "stopped" {
+			if st, ok := m.Payload.(types.HALState); ok && st.Level == "stopped" {
 				break
 			}
 		}

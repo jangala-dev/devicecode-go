@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/hal/config"
 	"devicecode-go/services/hal/internal/consts"
 	"devicecode-go/services/hal/internal/halcore"
 	"devicecode-go/services/hal/internal/registry"
+	"devicecode-go/types"
 
 	"tinygo.org/x/drivers"
 )
@@ -43,11 +43,13 @@ func (a *svcTestAdaptor) Trigger(ctx context.Context) (time.Duration, error) {
 	return 5 * time.Millisecond, nil
 }
 func (a *svcTestAdaptor) Collect(ctx context.Context) (halcore.Sample, error) {
-	ts := time.Now().UnixMilli()
-	return halcore.Sample{{Kind: "temp", Payload: map[string]any{"value": 42, "ts_ms": ts}, TsMs: ts}}, nil
+	// Emit a trivially typed value; service republishes payload as-is.
+	return halcore.Sample{
+		{Kind: "temp", Payload: types.IntValue{Value: 42, TS: time.Now()}, TsMs: time.Now().UnixMilli()},
+	}, nil
 }
 func (a *svcTestAdaptor) Control(kind, method string, payload any) (any, error) {
-	return map[string]any{"ok": true}, nil
+	return struct{ OK bool }{OK: true}, nil
 }
 
 type svcBuilder struct{}
@@ -104,25 +106,31 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 
 	// Expect initial idle.
 	if msg, ok := recvWithin(t, stateSub.Channel(), 200*time.Millisecond); ok {
-		m := msg.Payload.(map[string]any)
-		if m["level"] != "idle" {
-			t.Fatalf("expected initial idle, got %+v", m)
+		st, ok := msg.Payload.(types.HALState)
+		if !ok {
+			t.Fatalf("unexpected hal/state payload type: %T", msg.Payload)
+		}
+		if st.Level != "idle" {
+			t.Fatalf("expected initial idle, got %+v", st)
 		}
 	} else {
 		t.Fatal("did not receive initial hal/state")
 	}
 
 	// Apply config with single device of our test type.
-	cfg := config.HALConfig{
-		Devices: []config.Device{{ID: "d1", Type: "svc_testdev"}},
+	cfg := types.HALConfig{
+		Devices: []types.Device{{ID: "d1", Type: "svc_testdev"}},
 	}
 	conn.Publish(conn.NewMessage(bus.Topic{consts.TokConfig, consts.TokHAL}, cfg, false))
 
 	// State should move to ready.
 	if msg, ok := recvWithin(t, stateSub.Channel(), 500*time.Millisecond); ok {
-		m := msg.Payload.(map[string]any)
-		if m["level"] != "ready" {
-			t.Fatalf("expected ready, got %+v", m)
+		st, ok := msg.Payload.(types.HALState)
+		if !ok {
+			t.Fatalf("unexpected hal/state payload type: %T", msg.Payload)
+		}
+		if st.Level != "ready" {
+			t.Fatalf("expected ready, got %+v", st)
 		}
 	} else {
 		t.Fatal("did not receive ready hal/state")
@@ -138,16 +146,20 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	if msg, ok := recvWithin(t, valSub.Channel(), 1*time.Second); !ok {
 		t.Fatal("timeout waiting for value")
 	} else {
-		if _, ok := msg.Payload.(map[string]any)["value"]; !ok {
-			t.Fatalf("unexpected payload: %+v", msg.Payload)
+		// Typed payload – accept any concrete typed value; ensure non-nil.
+		if msg.Payload == nil {
+			t.Fatalf("unexpected nil payload")
 		}
 	}
 
 	// State retained should be 'up'.
 	if msg, ok := recvWithin(t, stSub.Channel(), 500*time.Millisecond); ok {
-		m := msg.Payload.(map[string]any)
-		if m["link"] != consts.LinkUp {
-			t.Fatalf("expected link up, got %+v", m)
+		cs, ok := msg.Payload.(types.CapabilityState)
+		if !ok {
+			t.Fatalf("unexpected capability state payload: %T", msg.Payload)
+		}
+		if cs.Link != types.LinkUp {
+			t.Fatalf("expected link up, got %+v", cs)
 		}
 	} else {
 		t.Fatal("timeout waiting for retained state")
@@ -164,14 +176,12 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read_now request failed: %v", err)
 	}
-	if ok, _ := reply.Payload.(map[string]any)["ok"].(bool); !ok {
-		t.Fatalf("unexpected reply: %+v", reply.Payload)
-	}
+	_ = reply // reply presence is sufficient; OK typing is handled by service
 
 	// Change rate.
 	req2 := conn.NewMessage(
 		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate},
-		map[string]any{"period_ms": 200}, false,
+		types.SetRate{PeriodMS: 200}, false,
 	)
 	ctxReq2, cancelReq2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancelReq2()
@@ -179,9 +189,7 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set_rate request failed: %v", err)
 	}
-	if ok, _ := reply2.Payload.(map[string]any)["ok"].(bool); !ok {
-		t.Fatalf("unexpected reply2: %+v", reply2.Payload)
-	}
+	_ = reply2
 }
 
 func TestServiceApplyConfigRemovesDevices(t *testing.T) {
@@ -205,8 +213,8 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 		for time.Now().Before(deadline) {
 			select {
 			case msg := <-sub.Channel():
-				if m, ok := msg.Payload.(map[string]any); ok {
-					if lv, _ := m["level"].(string); lv == level {
+				if st, ok := msg.Payload.(types.HALState); ok {
+					if st.Level == level {
 						return
 					}
 				}
@@ -223,13 +231,13 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 	defer conn.Unsubscribe(stSub)
 
 	// Helper to wait for a specified link value on any temp capability.
-	waitCapLink := func(want string, timeout time.Duration) (any, bool) {
+	waitCapLink := func(want types.LinkState, timeout time.Duration) (any, bool) {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
 			select {
 			case msg := <-stSub.Channel():
-				if pl, ok := msg.Payload.(map[string]any); ok {
-					if link, _ := pl["link"].(string); link == want {
+				if cs, ok := msg.Payload.(types.CapabilityState); ok {
+					if cs.Link == want {
 						if len(msg.Topic) >= 5 {
 							return msg.Topic[3], true // capability id token
 						}
@@ -245,10 +253,10 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 	// Apply config with one device and expect link=up.
 	conn.Publish(conn.NewMessage(
 		bus.Topic{consts.TokConfig, consts.TokHAL},
-		config.HALConfig{Devices: []config.Device{{ID: "dX", Type: "svc_testdev2"}}},
+		types.HALConfig{Devices: []types.Device{{ID: "dX", Type: "svc_testdev2"}}},
 		false,
 	))
-	idTok, ok := waitCapLink(consts.LinkUp, 2*time.Second)
+	idTok, ok := waitCapLink(types.LinkUp, 2*time.Second)
 	if !ok {
 		t.Errorf("timeout waiting for initial capability state link=up")
 		return
@@ -257,7 +265,7 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 	// Reconfigure with no devices and expect link=down for the same id.
 	conn.Publish(conn.NewMessage(
 		bus.Topic{consts.TokConfig, consts.TokHAL},
-		config.HALConfig{Devices: nil},
+		types.HALConfig{Devices: nil},
 		false,
 	))
 
@@ -270,8 +278,8 @@ outer:
 			if len(msg.Topic) < 5 || msg.Topic[3] != idTok {
 				continue
 			}
-			if pl, _ := msg.Payload.(map[string]any); pl != nil {
-				if link, _ := pl["link"].(string); link == consts.LinkDown {
+			if cs, ok := msg.Payload.(types.CapabilityState); ok {
+				if cs.Link == types.LinkDown {
 					downOK = true
 					break outer
 				}

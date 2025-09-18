@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/hal/config"
 	"devicecode-go/services/hal/internal/consts"
 	"devicecode-go/services/hal/internal/platform"
 	"devicecode-go/services/hal/internal/service"
@@ -17,6 +16,8 @@ import (
 	// Ensure device builders register with the registry.
 	_ "devicecode-go/services/hal/internal/devices/aht20"
 	_ "devicecode-go/services/hal/internal/devices/gpio"
+
+	"devicecode-go/types"
 )
 
 func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
@@ -54,17 +55,17 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 		t.Logf("did not observe initial hal/state within 3s: %v", err)
 		return
 	}
-	if p, ok := m.Payload.(map[string]any); ok {
-		t.Logf("initial state: level=%v status=%v", p["level"], p["status"])
+	if st, ok := m.Payload.(types.HALState); ok {
+		t.Logf("initial state: level=%s status=%s", st.Level, st.Status)
 	}
 
 	// Apply config: one AHT20 on i2c0 and one GPIO input with IRQ.
-	cfg := config.HALConfig{
-		Devices: []config.Device{
+	cfg := types.HALConfig{
+		Devices: []types.Device{
 			{
 				ID:   "th1",
 				Type: "aht20",
-				BusRef: config.BusRef{
+				BusRef: types.BusRef{
 					Type: "i2c",
 					ID:   "i2c0",
 				},
@@ -95,7 +96,7 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		if p, ok := m.Payload.(map[string]any); ok && p["level"] == "ready" {
+		if st, ok := m.Payload.(types.HALState); ok && st.Level == "ready" {
 			t.Log("state: ready")
 			seenReady = true
 			break
@@ -154,13 +155,18 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 	setRate := func(kind string, ms int) bool {
 		req := conn.NewMessage(
 			bus.T(consts.TokHAL, consts.TokCapability, kind, ids[kind], consts.TokControl, consts.CtrlSetRate),
-			map[string]any{"period_ms": ms},
+			types.SetRate{PeriodMS: ms},
 			false,
 		)
 		ctx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel2()
-		if _, err := conn.RequestWait(ctx2, req); err != nil {
+		rep, err := conn.RequestWait(ctx2, req)
+		if err != nil {
 			t.Logf("set_rate request failed for %s: %v", kind, err)
+			return false
+		}
+		if ack, ok := rep.Payload.(types.SetRateAck); !ok || !ack.OK {
+			t.Logf("set_rate not acknowledged for %s: %#v", kind, rep.Payload)
 			return false
 		}
 		return true
@@ -210,17 +216,17 @@ func TestHAL_EndToEnd_AHT20_And_GPIO(t *testing.T) {
 		t.Logf("timed out waiting for gpio event after simulated edge: %v", err)
 		return
 	}
-	payload, ok := ev.Payload.(map[string]any)
+	ge, ok := ev.Payload.(types.GPIOEvent)
 	if !ok {
-		t.Logf("gpio event payload not a map: %#v", ev.Payload)
+		t.Logf("gpio event payload not typed: %#v", ev.Payload)
 		return
 	}
-	if payload["edge"] != "rising" {
-		t.Logf("unexpected edge: %#v", payload["edge"])
+	if ge.Edge != types.EdgeRising {
+		t.Logf("unexpected edge: %#v", ge.Edge)
 		return
 	}
-	if lvl, ok := payload["level"].(int); !ok || lvl != 1 {
-		t.Logf("unexpected level: %#v", payload["level"])
+	if ge.Level != 1 {
+		t.Logf("unexpected level: %#v", ge.Level)
 		return
 	}
 	cancel() // already defined at top
