@@ -1,4 +1,6 @@
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
+github.com/jangala-dev/tinygo-uartx v0.0.0-20250917074613-343ee52ec116 h1:Z3t1FIu0/RREW2kvZ2i1fV8axyVsnT97p20J5YAahHI=
+github.com/jangala-dev/tinygo-uartx v0.0.0-20250917074613-343ee52ec116/go.mod h1:e3HxjGzBZBIsn/oYvWr707ug3IbkglEyivyYVxHRph4=
 tinygo.org/x/drivers v0.33.0 h1:5r8Ab0IxjWQi7LzYLNWpya6U4nedo9ZtxeMaAzrJTG8=
 tinygo.org/x/drivers v0.33.0/go.mod h1:ZdErNrApSABdVXjA1RejD67R8SNRI6RKVfYgQDZtKtk=
