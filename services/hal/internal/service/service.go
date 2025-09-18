@@ -102,7 +102,7 @@ func (s *Service) Run(ctx context.Context) {
 	}
 
 	var gpioEv <-chan gpioirq.GPIOEvent = s.gpioW.Events()
-	var uartEv <-chan uartio.Event = s.uartW.Events() // NEW
+	var uartEv <-chan *uartio.Event = s.uartW.Events()
 
 	for {
 		// arm timer
@@ -210,8 +210,9 @@ func (s *Service) Run(ctx context.Context) {
 		case ev := <-gpioEv:
 			s.handleGPIOEvent(ev)
 
-		case ev := <-uartEv: // NEW
-			s.handleUARTEvent(ev)
+		case ev := <-uartEv:
+			s.handleUARTEvent(*ev) // pass by value to existing handler
+			ev.Release()           // return pooled buffer
 		}
 	}
 }
@@ -236,7 +237,7 @@ func (s *Service) applyConfig(ctx context.Context, cfg types.HALConfig) error {
 			Ctx:        ctx,
 			Buses:      s.buses,
 			Pins:       s.pins,
-			UARTs:      s.uarts, // NEW
+			UARTs:      s.uarts,
 			DeviceID:   d.ID,
 			Type:       d.Type,
 			ParamsJSON: d.Params,
