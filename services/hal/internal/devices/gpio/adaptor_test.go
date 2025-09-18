@@ -8,6 +8,7 @@ import (
 
 	"devicecode-go/services/hal/internal/halcore"
 	"devicecode-go/services/hal/internal/registry"
+	"devicecode-go/types"
 )
 
 // ---- Test doubles ----
@@ -70,8 +71,8 @@ func TestGPIOBuilderAndControl_Input(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	if _, ok := res.(map[string]any)["level"]; !ok {
-		t.Fatalf("missing level in response: %+v", res)
+	if _, ok := res.(types.GPIOGetReply); !ok {
+		t.Fatalf("unexpected reply type: %T", res)
 	}
 	// Because the fake pin implements IRQPin and irq params were provided, IRQ should be requested.
 	if out.IRQ == nil {
@@ -99,7 +100,7 @@ func TestGPIOOutputControls(t *testing.T) {
 	ad := out.Adaptor.(*adaptor)
 
 	// set
-	if _, err := ad.Control("gpio", "set", map[string]any{"level": true}); err != nil {
+	if _, err := ad.Control("gpio", "set", types.GPIOSet{Level: true}); err != nil {
 		t.Fatalf("set failed: %v", err)
 	}
 	// toggle
