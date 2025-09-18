@@ -1,19 +1,13 @@
-// Command pico-demo: minimal HAL bring-up for RP2040/Pico with LTC4015 + AHT20.
-// Put this file under: services/hal/cmd/pico-demo/main.go
+// Command pico-demo: HAL bring-up for RP2040/Pico with LTC4015 + AHT20 + UART echo.
 //
 // Build/flash (TinyGo):
 //   tinygo flash -target pico ./services/hal/cmd/pico-demo
 //
-// Wiring assumptions (edit to match your board):
-// - I2C0 at 400 kHz on Pico defaults: SDA=GP4, SCL=GP5 (TinyGo machine defaults).
+// Wiring assumptions (edit in halCfg as needed):
+// - I2C0 @ 400 kHz on Pico defaults: SDA=GP4, SCL=GP5.
 // - AHT20 on I2C address 0x38.
-// - LTC4015 on I2C address 0x67 (adjust to your board; many designs use 0x67/0x68).
-// - SMBALERT# from LTC4015 wired to GP22 (active-low). Change as needed below.
-//
-// Notes for EEs:
-// - Tweak only the `halCfg` block; everything else is plumbing.
-// - All values are in the units stated in-line. If unsure, keep defaults.
-// - Sense resistor values (RSNSB/RSNSI) must match the actual hardware.
+// - LTC4015 on I2C address 0x67; SMBALERT# wired to GP22 (active-low).
+// - UART0 pins per your board config (baud/format set in halCfg).
 
 package main
 
@@ -26,70 +20,69 @@ import (
 	"devicecode-go/services/hal"
 	"devicecode-go/types"
 
-	// Device adaptors are registered via init() in these packages.
-	// This main must live under services/hal/... so these internal imports are legal.
-	_ "devicecode-go/services/hal/internal/devices/aht20adpt"
-	_ "devicecode-go/services/hal/internal/devices/ltc4015adpt"
+	// Register device adaptors.
+	_ "devicecode-go/services/hal/internal/devices/aht20"
+	_ "devicecode-go/services/hal/internal/devices/ltc4015"
+	_ "devicecode-go/services/hal/internal/devices/uart"
 )
 
 func main() {
-	// Small delay to give the USB-CDC console a moment to enumerate on first boot.
 	time.Sleep(3 * time.Second)
+	fmt.Println("\n== Jangala devicecode: Pico demo (HAL + LTC4015 + AHT20 + UART echo) ==")
 
-	fmt.Println("\n== Jangala devicecode: Pico demo (HAL + LTC4015 + AHT20) ==")
-
-	// Create in-process bus and connection.
-	b := bus.NewBus(4)
+	// In-process bus and connection.
+	b := bus.NewBus(64)
 	conn := b.NewConnection("main")
 
-	// Subscribe to HAL state early so we can see "awaiting_config".
+	// Subscriptions.
 	stateSub := conn.Subscribe(bus.T("hal", "state"))
 	defer conn.Unsubscribe(stateSub)
+	allCaps := conn.Subscribe(bus.T("hal", "capability", "#"))
+	defer conn.Unsubscribe(allCaps)
 
-	allSub := conn.Subscribe(bus.T("hal", "capability", "#"))
-	defer conn.Unsubscribe(allSub)
-
-	// Start HAL service.
-	ctx := context.Background()
+	// Start HAL.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go hal.Run(ctx, conn)
 
-	// Wait until HAL reports it's ready for configuration (best-effort).
+	// Wait until HAL is ready for config.
 	waitForAwaitingConfig(stateSub)
 
-	// ---- EDIT BELOW: Hardware configuration for your board ----
-	// I2C bus IDs: "i2c0" or "i2c1" (as provided by the platform factory).
-	// GPIO numbers are Pico GP numbers (0..28).
+	// ----------------------------------------------------------------------------
+	// EDITABLE CONFIGURATION
+	// ----------------------------------------------------------------------------
 	halCfg := types.HALConfig{
 		Devices: []types.Device{
+			// LTC4015 charger / power telemetry (I2C).
 			{
 				ID:   "charger0",
 				Type: "ltc4015",
 				BusRef: types.BusRef{
 					Type: "i2c",
-					ID:   "i2c0",
+					ID:   "i2c0", //each bus is wired to its pico defaults as given in machine package constants
 				},
-				// Params are decoded by the LTC4015 adaptor.
-				// See services/hal/internal/devices/ltc4015/adaptor.go (Params struct).
 				Params: map[string]any{
-					// -- Electrical / design-time parameters --
-					"addr":             0x67, // I²C address (7-bit)
-					"cells":            6,    // Lead-acid 12V nominal = 6 cells
+					// Electrical design parameters (edit to match PCB):
+					"addr":             0x67, // I2C 7-bit address
+					"cells":            6,
 					"chem":             "lead_acid",
-					"rsnsb_uohm":       1500, // Battery sense resistor (µΩ) — edit to match PCB
-					"rsnsi_uohm":       1000, // Input sense resistor (µΩ) — edit to match PCB
-					"targets_writable": true, // Allow profile/target updates at runtime
-					"qcount_prescale":  1024, // If using coulomb counting (optional)
+					"rsnsb_uohm":       1500, // battery sense (µΩ)
+					"rsnsi_uohm":       1000, // input sense (µΩ)
+					"targets_writable": true,
+					"qcount_prescale":  1024,
 
-					// -- Sampling / IRQ / quality-of-life --
-					"sample_every_ms": 1000, // Telemetry period (ms), clamped ≥200ms
-					"smbalert_pin":    22,   // GP number for SMBALERT# (active-low), or omit to disable IRQ
-					"irq_debounce_ms": 2,    // Debounce for the alert GPIO (ms)
+					// Runtime / IRQ:
+					"sample_every_ms": 1000, // ≥200 ms (as datasheet says)
+					"smbalert_pin":    19,   // GP19; remove to disable IRQ
+					"irq_debounce_ms": 2,
 
-					// -- Convenience flags; safe to leave as-is --
-					"force_meas_sys_on": true, // Ensure measurement system active
-					"enable_qcount":     true, // Enable coulomb counter if wired
+					// Convenience:
+					"force_meas_sys_on": true,
+					"enable_qcount":     true,
 				},
 			},
+
+			// AHT20 temperature/humidity (I2C).
 			{
 				ID:   "env0",
 				Type: "aht20",
@@ -97,20 +90,43 @@ func main() {
 					Type: "i2c",
 					ID:   "i2c0",
 				},
-				// AHT20 parameters (address only; defaults to 0x38 if omitted).
 				Params: map[string]any{
 					"addr": 0x38,
 				},
 			},
+
+			// UART device for echo demo.
+			{
+				ID:   "uart_demo",
+				Type: "uart",
+				BusRef: types.BusRef{
+					Type: "uart",
+					ID:   "uart0", // Pico UART0
+				},
+				Params: map[string]any{
+					"baud":          115200,
+					"mode":          "bytes", // or "lines"
+					"max_frame":     128,     // 16..256
+					"idle_flush_ms": 100,     // used in "lines" mode
+					"echo_tx":       false,   // keep false to avoid loop; we echo in software below
+					// Optional format (supported on RP2):
+					"databits": 8,
+					"stopbits": 1,
+					"parity":   "none", // "even" | "odd"
+				},
+			},
 		},
 	}
-	// ---- END OF EDITABLE SECTION ----
+	// ----------------------------------------------------------------------------
 
-	// Publish configuration to HAL.
+	// Publish configuration.
 	conn.Publish(conn.NewMessage(bus.T("config", "hal"), halCfg, false))
 	fmt.Println("Config sent. Streaming telemetry...")
 
-	// Print the first state we see after config, then carry on printing everything else.
+	// Start a simple UART echo server in a separate goroutine.
+	go startUARTEcho(ctx, conn)
+
+	// Print the first post-config state then continue printing.
 	printHALStateFrom(stateSub)
 
 	// Main print loop.
@@ -118,13 +134,72 @@ func main() {
 		select {
 		case m := <-stateSub.Channel():
 			printHALState(m)
-		case m := <-allSub.Channel():
-			printCapability(m)
+		case m := <-allCaps.Channel():
+			printCapability(m, conn)
 		}
 	}
 }
 
-// ----- Printing helpers -----
+// ---------------- UART echo server ----------------
+//
+// Subscribes to all UART events and, for each RX frame, issues a request–reply
+// control call to write the same bytes back to that UART capability.
+// Assumes you are only using this demo UART (or that echoing all is acceptable).
+
+func startUARTEcho(ctx context.Context, conn *bus.Connection) {
+	sub := conn.Subscribe(bus.T("hal", "capability", "uart", "+", "event"))
+	defer conn.Unsubscribe(sub)
+
+	fmt.Println("UART echo server: waiting for RX frames...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-sub.Channel():
+			ev, ok := m.Payload.(types.UARTEvent)
+			if !ok {
+				continue
+			}
+			// Only echo what we received (RX).
+			if ev.Dir != types.UARTRx || ev.N == 0 {
+				continue
+			}
+
+			// Extract numeric capability id from topic[3].
+			if len(m.Topic) < 5 {
+				continue
+			}
+			idTok := m.Topic[3]
+			id, ok := tokAsInt(idTok)
+			if !ok {
+				continue
+			}
+
+			// Prepare control topic: hal/capability/uart/<id>/control/write
+			ctrlTopic := bus.Topic{"hal", "capability", "uart", id, "control", "write"}
+			req := conn.NewMessage(ctrlTopic, types.UARTWrite{Data: append([]byte(nil), ev.Data...)}, false)
+
+			// Request–reply with a short timeout.
+			cctx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+			reply, err := conn.RequestWait(cctx, req)
+			cancel()
+			if err != nil {
+				fmt.Printf("UART echo: write failed: %v\n", err)
+				continue
+			}
+			if rep, ok := reply.Payload.(types.UARTWriteReply); ok && rep.OK {
+				fmt.Printf("UART echo: echoed %d bytes on uart/%d\n", rep.N, id)
+			} else if er, ok := reply.Payload.(types.ErrorReply); ok {
+				fmt.Printf("UART echo: error reply: %s\n", er.Error)
+			} else {
+				fmt.Printf("UART echo: unexpected reply payload: %#v\n", reply.Payload)
+			}
+		}
+	}
+}
+
+// ---------------- Printing helpers ----------------
 
 func waitForAwaitingConfig(sub *bus.Subscription) {
 	timer := time.NewTimer(2 * time.Second)
@@ -173,9 +248,8 @@ func summariseHALState(st types.HALState) string {
 	return fmt.Sprintf("state=%s status=%s\n", st.Level, st.Status)
 }
 
-func printCapability(m *bus.Message) {
+func printCapability(m *bus.Message, _ *bus.Connection) {
 	ts := time.Now().Format(time.RFC3339)
-	// Topic format: hal/capability/<kind>/<id>/<suffix>
 	kind, idStr, suffix := "-", "-", "-"
 	if len(m.Topic) >= 5 {
 		if s, _ := m.Topic[2].(string); s != "" {
@@ -187,7 +261,6 @@ func printCapability(m *bus.Message) {
 		}
 	}
 	switch v := m.Payload.(type) {
-	// --- Info (retained) ---
 	case types.TemperatureInfo:
 		fmt.Printf("[%s] %s/%s info: temperature driver=%s unit=%s precision=%.1f\n",
 			ts, kind, idStr, v.Driver, v.Unit, v.Precision)
@@ -202,8 +275,9 @@ func printCapability(m *bus.Message) {
 			ts, kind, idStr, v.Model, v.Cells, chemString(v.Chemistry), v.TargetsWritable)
 	case types.AlertsInfo:
 		fmt.Printf("[%s] %s/%s info: alerts groups=%v\n", ts, kind, idStr, v.Groups)
+	case types.UARTInfo:
+		fmt.Printf("[%s] %s/%s info: uart driver=%s\n", ts, kind, idStr, v.Driver)
 
-	// --- State (retained) ---
 	case types.CapabilityState:
 		if v.Error != "" {
 			fmt.Printf("[%s] %s/%s state: %s error=%s\n", ts, kind, idStr, linkString(v.Link), v.Error)
@@ -211,7 +285,6 @@ func printCapability(m *bus.Message) {
 			fmt.Printf("[%s] %s/%s state: %s\n", ts, kind, idStr, linkString(v.Link))
 		}
 
-	// --- Values / events ---
 	case types.TemperatureValue:
 		fmt.Printf("[%s] temperature/%s value: %.1f °C (ts=%s)\n",
 			ts, idStr, float64(v.DeciC)/10.0, v.TS.Format(time.RFC3339))
@@ -269,15 +342,41 @@ func printCapability(m *bus.Message) {
 			fmt.Printf("[%s] alerts/%s event: limit=0x%04x chg_state=0x%04x chg_status=0x%04x (ts=%s)\n",
 				ts, idStr, v.Limit, v.ChgState, v.ChgStatus, v.TS.Format(time.RFC3339))
 		}
-
-	// --- GPIO/UART (not used in this demo, left for completeness) ---
 	case types.UARTEvent:
 		dir := map[types.UARTDir]string{types.UARTTx: "tx", types.UARTRx: "rx"}[v.Dir]
 		fmt.Printf("[%s] uart/%s %s: %d bytes\n", ts, idStr, dir, v.N)
 
 	default:
-		// Unknown/other: print a compact summary.
 		fmt.Printf("[%s] %s/%s/%s payload: %#v\n", ts, kind, idStr, suffix, v)
+	}
+}
+
+// ---------------- Small utilities ----------------
+
+func tokAsInt(t any) (int, bool) {
+	switch v := t.(type) {
+	case int:
+		return v, true
+	case int8:
+		return int(v), true
+	case int16:
+		return int(v), true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case uint:
+		return int(v), true
+	case uint8:
+		return int(v), true
+	case uint16:
+		return int(v), true
+	case uint32:
+		return int(v), true
+	case uint64:
+		return int(v), true
+	default:
+		return 0, false
 	}
 }
 
