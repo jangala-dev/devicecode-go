@@ -21,9 +21,9 @@ import (
 	"devicecode-go/types"
 
 	// Register device adaptors.
-	_ "devicecode-go/services/hal/internal/devices/aht20"
-	_ "devicecode-go/services/hal/internal/devices/ltc4015"
-	_ "devicecode-go/services/hal/internal/devices/uart"
+	_ "devicecode-go/services/hal/internal/devices/aht20adpt"
+	_ "devicecode-go/services/hal/internal/devices/ltc4015adpt"
+	_ "devicecode-go/services/hal/internal/devices/uartadpt"
 )
 
 func main() {
