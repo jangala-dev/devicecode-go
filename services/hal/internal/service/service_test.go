@@ -24,7 +24,7 @@ type nopPinFactory struct{}
 
 func (nopPinFactory) ByNumber(int) (halcore.GPIOPin, bool) { return nil, false }
 
-// NEW: no-op UART factory to satisfy Service.New
+// no-op UART factory to satisfy Service.New
 type nopUARTFactory struct{}
 
 func (nopUARTFactory) ByID(id string) (halcore.UARTPort, bool) { return nil, false }
@@ -43,7 +43,6 @@ func (a *svcTestAdaptor) Trigger(ctx context.Context) (time.Duration, error) {
 	return 5 * time.Millisecond, nil
 }
 func (a *svcTestAdaptor) Collect(ctx context.Context) (halcore.Sample, error) {
-	// Emit a trivially typed value; service republishes payload as-is.
 	return halcore.Sample{
 		{Kind: "temp", Payload: types.IntValue{Value: 42, TS: time.Now()}},
 	}, nil
@@ -69,9 +68,10 @@ func ensureRegistered(t *testing.T, typ string, b registry.Builder) {
 	}
 }
 
-func sub(t *testing.T, c *bus.Connection, topic bus.Topic) *bus.Subscription {
+// Build-and-subscribe helper: constructs a topic via bus.T(...)
+func subT(t *testing.T, c *bus.Connection, tokens ...bus.Token) *bus.Subscription {
 	t.Helper()
-	return c.Subscribe(topic)
+	return c.Subscribe(bus.T(tokens...))
 }
 
 func recvWithin[T any](t *testing.T, ch <-chan T, d time.Duration) (T, bool) {
@@ -93,7 +93,6 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	b := bus.NewBus(8)
 	conn := b.NewConnection("test")
 
-	// UPDATED: include nopUARTFactory in constructor
 	s := New(conn, nopBusFactory{}, nopPinFactory{}, nopUARTFactory{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,7 +100,7 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	go s.Run(ctx)
 
 	// Subscribe to retained service state.
-	stateSub := sub(t, conn, bus.Topic{consts.TokHAL, consts.TokState})
+	stateSub := subT(t, conn, consts.TokHAL, consts.TokState)
 	defer conn.Unsubscribe(stateSub)
 
 	// Expect initial idle.
@@ -121,7 +120,7 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	cfg := types.HALConfig{
 		Devices: []types.Device{{ID: "d1", Type: "svc_testdev"}},
 	}
-	conn.Publish(conn.NewMessage(bus.Topic{consts.TokConfig, consts.TokHAL}, cfg, false))
+	conn.Publish(conn.NewMessage(bus.T(consts.TokConfig, consts.TokHAL), cfg, false))
 
 	// State should move to ready.
 	if msg, ok := recvWithin(t, stateSub.Channel(), 500*time.Millisecond); ok {
@@ -137,16 +136,15 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	}
 
 	// Subscribe to values and state for capability temp/0.
-	valSub := sub(t, conn, bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokValue})
+	valSub := subT(t, conn, consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokValue)
 	defer conn.Unsubscribe(valSub)
-	stSub := sub(t, conn, bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokState})
+	stSub := subT(t, conn, consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokState)
 	defer conn.Unsubscribe(stSub)
 
 	// Expect at least one value within a short interval.
 	if msg, ok := recvWithin(t, valSub.Channel(), 1*time.Second); !ok {
 		t.Fatal("timeout waiting for value")
 	} else {
-		// Typed payload – accept any concrete typed value; ensure non-nil.
 		if msg.Payload == nil {
 			t.Fatalf("unexpected nil payload")
 		}
@@ -167,7 +165,7 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 
 	// Exercise control plane: read_now and set_rate.
 	req := conn.NewMessage(
-		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlReadNow},
+		bus.T(consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlReadNow),
 		nil, false,
 	)
 	ctxReq, cancelReq := context.WithTimeout(context.Background(), time.Second)
@@ -176,12 +174,13 @@ func TestServicePublishesStateAndValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read_now request failed: %v", err)
 	}
-	_ = reply // reply presence is sufficient; OK typing is handled by service
+	_ = reply
 
 	// Change rate.
 	req2 := conn.NewMessage(
-		bus.Topic{consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate},
-		types.SetRate{Period: 200 * time.Millisecond}, false,
+		bus.T(consts.TokHAL, consts.TokCapability, "temp", 0, consts.TokControl, consts.CtrlSetRate),
+		types.SetRate{Period: 200 * time.Millisecond},
+		false,
 	)
 	ctxReq2, cancelReq2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancelReq2()
@@ -198,7 +197,6 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 	b := bus.NewBus(8)
 	conn := b.NewConnection("test2")
 
-	// UPDATED: include nopUARTFactory in constructor
 	s := New(conn, nopBusFactory{}, nopPinFactory{}, nopUARTFactory{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -207,7 +205,7 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 
 	// 1) Prove the service is up and subscribed by waiting for the retained "idle" state.
 	waitHALLevel := func(level string, timeout time.Duration) {
-		sub := conn.Subscribe(bus.Topic{consts.TokHAL, consts.TokState})
+		sub := conn.Subscribe(bus.T(consts.TokHAL, consts.TokState))
 		defer conn.Unsubscribe(sub)
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
@@ -227,7 +225,7 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 	waitHALLevel("idle", 1*time.Second)
 
 	// 2) Subscribe to capability state (wildcard id) before applying config.
-	stSub := conn.Subscribe(bus.Topic{consts.TokHAL, consts.TokCapability, "temp", "+", consts.TokState})
+	stSub := conn.Subscribe(bus.T(consts.TokHAL, consts.TokCapability, "temp", "+", consts.TokState))
 	defer conn.Unsubscribe(stSub)
 
 	// Helper to wait for a specified link value on any temp capability.
@@ -252,7 +250,7 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 
 	// Apply config with one device and expect link=up.
 	conn.Publish(conn.NewMessage(
-		bus.Topic{consts.TokConfig, consts.TokHAL},
+		bus.T(consts.TokConfig, consts.TokHAL),
 		types.HALConfig{Devices: []types.Device{{ID: "dX", Type: "svc_testdev2"}}},
 		false,
 	))
@@ -264,7 +262,7 @@ func TestServiceApplyConfigRemovesDevices(t *testing.T) {
 
 	// Reconfigure with no devices and expect link=down for the same id.
 	conn.Publish(conn.NewMessage(
-		bus.Topic{consts.TokConfig, consts.TokHAL},
+		bus.T(consts.TokConfig, consts.TokHAL),
 		types.HALConfig{Devices: nil},
 		false,
 	))

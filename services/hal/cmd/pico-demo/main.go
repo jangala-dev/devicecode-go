@@ -177,7 +177,7 @@ func startUARTEcho(ctx context.Context, conn *bus.Connection) {
 			}
 
 			// Prepare control topic: hal/capability/uart/<id>/control/write
-			ctrlTopic := bus.Topic{"hal", "capability", "uart", id, "control", "write"}
+			ctrlTopic := bus.T("hal", "capability", "uart", id, "control", "write")
 			req := conn.NewMessage(ctrlTopic, types.UARTWrite{Data: append([]byte(nil), ev.Data...)}, false)
 
 			// Request–reply with a short timeout.

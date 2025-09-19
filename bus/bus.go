@@ -3,8 +3,6 @@ package bus
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -18,19 +16,93 @@ var defaultQLen = 3
 
 // Token can be string or int (or any comparable type you choose to use as a key).
 type Token any
-type Topic []Token
+type topic []Token
 
-func T(tokens ...Token) Topic {
+// ---- topic interner
+
+type internNode struct {
+	children map[Token]*internNode
+	topic    topic // canonical slice for this exact path (nil if non-terminal)
+}
+
+var interner struct {
+	mu   sync.Mutex
+	root *internNode
+	// (optional) soft cap; set >0 to stop growing after N distinct topics
+	maxTopics int
+	count     int
+}
+
+func init() {
+	interner.root = &internNode{children: make(map[Token]*internNode)}
+	interner.maxTopics = 0 // 0 = unlimited; you can tune if you want a cap
+}
+
+func internTopic(tokens ...Token) topic {
+	n := interner.root
+	// single critical section keeps it simple and TinyGo-friendly
+	interner.mu.Lock()
+	defer interner.mu.Unlock()
+
+	for _, t := range tokens {
+		if n.children == nil {
+			n.children = make(map[Token]*internNode)
+		}
+		child := n.children[t]
+		if child == nil {
+			// respect cap if configured: stop growing the trie, fall back to fresh slice
+			if interner.maxTopics > 0 && interner.count >= interner.maxTopics {
+				// return a fresh independent slice
+				cp := make(topic, len(tokens))
+				copy(cp, tokens)
+				return cp
+			}
+			child = &internNode{}
+			n.children[t] = child
+		}
+		n = child
+	}
+	if n.topic != nil {
+		return n.topic
+	}
+	// create canonical slice for this exact sequence
+	cp := make(topic, len(tokens))
+	copy(cp, tokens)
+	n.topic = cp
+	interner.count++
+	return cp
+}
+
+// ---- topic creation functions
+
+func validateTokens(tokens ...Token) {
 	for _, tok := range tokens {
 		switch tok.(type) {
-		case string, int, int32, int64, uint, uint32, uint64, uintptr:
-			// fine
+		case string,
+			int, int8, int16, int32, int64,
+			uint, uint8, uint16, uint32, uint64,
+			uintptr:
+			// ok
 		default:
-			// try a map assignment to force panic early if not comparable
-			_ = map[Token]struct{}{tok: {}}
+			panic("bus: token type is not allowed/comparable")
 		}
 	}
-	return Topic(tokens)
+}
+
+// T validates and interns a topic.
+func T(tokens ...Token) topic {
+	validateTokens(tokens...)
+	return internTopic(tokens...)
+}
+
+// Append validates and interns t + tokens, returning a canonical topic.
+// It never aliases the caller’s storage; you always get an interned slice.
+func (t topic) Append(tokens ...Token) topic {
+	validateTokens(tokens...)
+	combined := make([]Token, 0, len(t)+len(tokens))
+	combined = append(combined, t...)
+	combined = append(combined, tokens...)
+	return internTopic(combined...)
 }
 
 // -----------------------------------------------------------------------------
@@ -38,33 +110,33 @@ func T(tokens ...Token) Topic {
 // -----------------------------------------------------------------------------
 
 type Message struct {
-	Topic    Topic
+	Topic    topic
 	Payload  any
 	Retained bool
-	ReplyTo  Topic
-	ID       uint32
+	ReplyTo  topic
 }
 
-func genID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
+func (m *Message) CanReply() bool { return len(m.ReplyTo) != 0 }
 
 // -----------------------------------------------------------------------------
 // Subscription
 // -----------------------------------------------------------------------------
 
 type Subscription struct {
-	topic Topic
+	topic topic
 	ch    chan *Message
 	bus   *Bus
 	conn  *Connection
 }
 
-func (s *Subscription) Topic() Topic             { return s.topic }
+func (s *Subscription) Topic() topic             { return s.topic }
 func (s *Subscription) Channel() <-chan *Message { return s.ch }
 func (s *Subscription) Unsubscribe()             { s.conn.Unsubscribe(s) }
+
+// Convenience wrapper that replies via the owning connection.
+func (s *Subscription) Reply(to *Message, payload any, retained bool) {
+	s.conn.Reply(to, payload, retained)
+}
 
 // -----------------------------------------------------------------------------
 // Trie node (shared for subscribers and retained messages)
@@ -102,7 +174,6 @@ type Bus struct {
 	qLen  int
 	sWild Token
 	mWild Token
-	idCtr atomic.Uint32
 }
 
 func NewBus(queueLen int) *Bus {
@@ -127,18 +198,15 @@ func NewBusWithOptions(o Options) *Bus {
 	}
 }
 
-func (b *Bus) nextID() uint32 { return b.idCtr.Add(1) }
-
-func (b *Bus) NewMessage(topic Topic, payload any, retained bool) *Message {
+func (b *Bus) NewMessage(topic topic, payload any, retained bool) *Message {
 	return &Message{
 		Topic:    topic,
 		Payload:  payload,
 		Retained: retained,
-		ID:       b.nextID(),
 	}
 }
 
-func (b *Bus) addSubscription(topic Topic, sub *Subscription) {
+func (b *Bus) addSubscription(topic topic, sub *Subscription) {
 	b.mu.Lock()
 	n := b.root
 	for _, t := range topic {
@@ -191,7 +259,7 @@ func drainOne(ch chan *Message) {
 }
 
 func (b *Bus) tryDeliver(sub *Subscription, msg *Message) {
-	defer func() { _ = recover() }() // channel may be closed; best-effort delivery
+	defer func() { _ = recover() }() // channel may be closed; best-effort
 	if trySend(sub.ch, msg) {
 		return
 	}
@@ -203,7 +271,7 @@ func (b *Bus) tryDeliver(sub *Subscription, msg *Message) {
 // Unsubscribe + pruning
 // -----------------------------------------------------------------------------
 
-func (b *Bus) unsubscribe(topic Topic, sub *Subscription) {
+func (b *Bus) unsubscribe(topic topic, sub *Subscription) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -247,7 +315,7 @@ func (b *Bus) pruneEmptyLocked(stack []*node, path []Token) {
 // Subscriber collection (topic = concrete message topic)
 // -----------------------------------------------------------------------------
 
-func (b *Bus) collectSubscribersLocked(n *node, topic Topic, depth int, out *[]*Subscription) {
+func (b *Bus) collectSubscribersLocked(n *node, topic topic, depth int, out *[]*Subscription) {
 	if n == nil {
 		return
 	}
@@ -286,7 +354,7 @@ func (b *Bus) retainSetLocked(msg *Message) {
 	n.retained = msg
 }
 
-func (b *Bus) retainDeleteLocked(topic Topic) {
+func (b *Bus) retainDeleteLocked(topic topic) {
 	n := b.root
 	var stack []*node
 	for _, t := range topic {
@@ -304,7 +372,7 @@ func (b *Bus) retainDeleteLocked(topic Topic) {
 	b.pruneEmptyLocked(stack, topic)
 }
 
-func (b *Bus) collectRetainedLocked(n *node, pattern Topic, depth int, out *[]*Message) {
+func (b *Bus) collectRetainedLocked(n *node, pattern topic, depth int, out *[]*Message) {
 	if n == nil {
 		return
 	}
@@ -346,23 +414,24 @@ func (b *Bus) collectAllRetainedLocked(n *node, out *[]*Message) {
 // -----------------------------------------------------------------------------
 
 type Connection struct {
-	bus  *Bus
-	subs []*Subscription
-	mu   sync.Mutex
-	id   string
+	bus   *Bus
+	subs  []*Subscription
+	mu    sync.Mutex
+	id    string
+	rrCtr atomic.Uint32 // per-connection counter for reply tokens
 }
 
 func (b *Bus) NewConnection(id string) *Connection {
 	return &Connection{bus: b, id: id}
 }
 
-func (c *Connection) NewMessage(topic Topic, payload any, retained bool) *Message {
+func (c *Connection) NewMessage(topic topic, payload any, retained bool) *Message {
 	return c.bus.NewMessage(topic, payload, retained)
 }
 
 func (c *Connection) Publish(msg *Message) { c.bus.Publish(msg) }
 
-func (c *Connection) Subscribe(topic Topic) *Subscription {
+func (c *Connection) Subscribe(topic topic) *Subscription {
 	sub := &Subscription{topic: topic, ch: make(chan *Message, c.bus.qLen), bus: c.bus, conn: c}
 	c.bus.addSubscription(topic, sub)
 	c.mu.Lock()
@@ -406,8 +475,9 @@ func removeSub(list []*Subscription, target *Subscription) []*Subscription {
 
 func (c *Connection) Request(msg *Message) *Subscription {
 	if len(msg.ReplyTo) == 0 {
-		// ReplyTo is just a single-token topic containing a unique string
-		msg.ReplyTo = T(genID())
+		// Namespace reply topics to avoid accidental catches by broad '#' subs.
+		// Single integer token keeps allocs zero and is TinyGo-safe.
+		msg.ReplyTo = T("_rr", c.rrCtr.Add(1))
 	}
 	sub := c.Subscribe(msg.ReplyTo)
 	c.Publish(msg)
@@ -433,5 +503,5 @@ func (c *Connection) Reply(to *Message, payload any, retained bool) {
 	if len(to.ReplyTo) == 0 {
 		return
 	}
-	c.Publish(&Message{Topic: to.ReplyTo, Payload: payload, Retained: retained, ID: c.bus.nextID()})
+	c.Publish(&Message{Topic: to.ReplyTo, Payload: payload, Retained: retained})
 }

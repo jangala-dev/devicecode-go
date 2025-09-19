@@ -17,9 +17,9 @@ func TestBasicPubSub(t *testing.T) {
 	b := NewBus(4)
 	conn := b.NewConnection("test")
 
-	sub := conn.Subscribe(Topic{TopicConfig, TopicGeo})
+	sub := conn.Subscribe(T(TopicConfig, TopicGeo))
 
-	msg := conn.NewMessage(Topic{TopicConfig, TopicGeo}, "hello", false)
+	msg := conn.NewMessage(T(TopicConfig, TopicGeo), "hello", false)
 	conn.Publish(msg)
 
 	select {
@@ -36,10 +36,10 @@ func TestRetainedMessage(t *testing.T) {
 	b := NewBus(2)
 	conn := b.NewConnection("test")
 
-	msg := conn.NewMessage(Topic{TopicConfig, TopicGeo}, "persist", true)
+	msg := conn.NewMessage(T(TopicConfig, TopicGeo), "persist", true)
 	conn.Publish(msg)
 
-	sub := conn.Subscribe(Topic{TopicConfig, TopicGeo})
+	sub := conn.Subscribe(T(TopicConfig, TopicGeo))
 
 	select {
 	case got := <-sub.Channel():
@@ -59,26 +59,26 @@ func TestWildcard_SingleLevel(t *testing.T) {
 	b := NewBus(16)
 	c := b.NewConnection("test")
 
-	s1 := c.Subscribe(Topic{"a", "+", "c"})
-	s2 := c.Subscribe(Topic{"a", "+", "+"})
-	s3 := c.Subscribe(Topic{"a", "b", "+"})
-	sNo := c.Subscribe(Topic{"a", "+", "d"})
+	s1 := c.Subscribe(T("a", "+", "c"))
+	s2 := c.Subscribe(T("a", "+", "+"))
+	s3 := c.Subscribe(T("a", "b", "+"))
+	sNo := c.Subscribe(T("a", "+", "d"))
 
-	c.Publish(b.NewMessage(Topic{"a", "b", "c"}, "m1", false))
+	c.Publish(b.NewMessage(T("a", "b", "c"), "m1", false))
 
 	expectOneOf(t, s1, "m1")
 	expectOneOf(t, s2, "m1")
 	expectOneOf(t, s3, "m1")
 	expectNoMessage(t, sNo)
 
-	c.Publish(b.NewMessage(Topic{"a", "x", "y"}, "m2", false))
+	c.Publish(b.NewMessage(T("a", "x", "y"), "m2", false))
 
 	expectOneOf(t, s2, "m2")
 	expectNoMessage(t, s1)
 	expectNoMessage(t, s3)
 	expectNoMessage(t, sNo)
 
-	c.Publish(b.NewMessage(Topic{"a", "c"}, "m3", false))
+	c.Publish(b.NewMessage(T("a", "c"), "m3", false))
 	expectNoMessage(t, s1)
 	expectNoMessage(t, s2)
 	expectNoMessage(t, s3)
@@ -89,24 +89,24 @@ func TestWildcard_MultiLevel(t *testing.T) {
 	b := NewBus(16)
 	c := b.NewConnection("test")
 
-	sAHash := c.Subscribe(Topic{"a", "#"})
-	sHash := c.Subscribe(Topic{"#"})
-	sABHash := c.Subscribe(Topic{"a", "b", "#"})
-	sAExact := c.Subscribe(Topic{"a"})
+	sAHash := c.Subscribe(T("a", "#"))
+	sHash := c.Subscribe(T("#"))
+	sABHash := c.Subscribe(T("a", "b", "#"))
+	sAExact := c.Subscribe(T("a"))
 
-	c.Publish(b.NewMessage(Topic{"a"}, "p1", false))
+	c.Publish(b.NewMessage(T("a"), "p1", false))
 	expectOneOf(t, sAHash, "p1")
 	expectOneOf(t, sHash, "p1")
 	expectOneOf(t, sAExact, "p1")
 	expectNoMessage(t, sABHash)
 
-	c.Publish(b.NewMessage(Topic{"a", "b"}, "p2", false))
+	c.Publish(b.NewMessage(T("a", "b"), "p2", false))
 	expectOneOf(t, sAHash, "p2")
 	expectOneOf(t, sHash, "p2")
 	expectOneOf(t, sABHash, "p2")
 	expectNoMessage(t, sAExact)
 
-	c.Publish(b.NewMessage(Topic{"a", "b", "c"}, "p3", false))
+	c.Publish(b.NewMessage(T("a", "b", "c"), "p3", false))
 	expectOneOf(t, sAHash, "p3")
 	expectOneOf(t, sHash, "p3")
 	expectOneOf(t, sABHash, "p3")
@@ -117,20 +117,20 @@ func TestWildcard_RetainedDelivery(t *testing.T) {
 	b := NewBus(32)
 	c := b.NewConnection("test")
 
-	c.Publish(b.NewMessage(Topic{"a"}, "r0", true))
-	c.Publish(b.NewMessage(Topic{"a", "b"}, "r1", true))
-	c.Publish(b.NewMessage(Topic{"a", "b", "c"}, "r2", true))
-	c.Publish(b.NewMessage(Topic{"a", "x"}, "r3", true))
+	c.Publish(b.NewMessage(T("a"), "r0", true))
+	c.Publish(b.NewMessage(T("a", "b"), "r1", true))
+	c.Publish(b.NewMessage(T("a", "b", "c"), "r2", true))
+	c.Publish(b.NewMessage(T("a", "x"), "r3", true))
 
-	sAll := c.Subscribe(Topic{"a", "#"})
+	sAll := c.Subscribe(T("a", "#"))
 	gotAll := drainPayloads(t, sAll, 4)
 	assertUnorderedEqual(t, gotAll, []string{"r0", "r1", "r2", "r3"})
 
-	sPlusHash := c.Subscribe(Topic{"a", "+", "#"})
+	sPlusHash := c.Subscribe(T("a", "+", "#"))
 	gotPH := drainPayloads(t, sPlusHash, 3)
 	assertUnorderedEqual(t, gotPH, []string{"r1", "r2", "r3"})
 
-	sPlus := c.Subscribe(Topic{"a", "+"})
+	sPlus := c.Subscribe(T("a", "+"))
 	gotP := drainPayloads(t, sPlus, 2)
 	assertUnorderedEqual(t, gotP, []string{"r1", "r3"})
 }
@@ -139,12 +139,12 @@ func TestWildcard_RetainedClear(t *testing.T) {
 	b := NewBus(16)
 	c := b.NewConnection("test")
 
-	c.Publish(b.NewMessage(Topic{"a", "b"}, "keep", true))
-	c.Publish(b.NewMessage(Topic{"a", "y"}, "other", true))
+	c.Publish(b.NewMessage(T("a", "b"), "keep", true))
+	c.Publish(b.NewMessage(T("a", "y"), "other", true))
 
-	c.Publish(b.NewMessage(Topic{"a", "b"}, nil, true))
+	c.Publish(b.NewMessage(T("a", "b"), nil, true))
 
-	s := c.Subscribe(Topic{"a", "#"})
+	s := c.Subscribe(T("a", "#"))
 	got := drainPayloads(t, s, 1)
 
 	if len(got) != 1 || got[0] != "other" {
@@ -156,12 +156,12 @@ func TestWildcard_NoMatchCases(t *testing.T) {
 	b := NewBus(8)
 	c := b.NewConnection("test")
 
-	s := c.Subscribe(Topic{"a", "+", "c"})
+	s := c.Subscribe(T("a", "+", "c"))
 
-	c.Publish(b.NewMessage(Topic{"a", "c"}, "x", false))
+	c.Publish(b.NewMessage(T("a", "c"), "x", false))
 	expectNoMessage(t, s)
 
-	c.Publish(b.NewMessage(Topic{"a", "b", "d"}, "y", false))
+	c.Publish(b.NewMessage(T("a", "b", "d"), "y", false))
 	expectNoMessage(t, s)
 }
 
@@ -174,7 +174,7 @@ func TestRequestReply_RequestWait(t *testing.T) {
 	reqConn := b.NewConnection("requester")
 	respConn := b.NewConnection("responder")
 
-	reqTopic := Topic{"power", "status", "get"}
+	reqTopic := T("power", "status", "get")
 	respSub := respConn.Subscribe(reqTopic)
 	defer respConn.Unsubscribe(respSub)
 
@@ -207,7 +207,7 @@ func TestRequestReply_Timeout(t *testing.T) {
 	b := NewBus(8)
 	reqConn := b.NewConnection("requester")
 
-	req := b.NewMessage(Topic{"service", "noop"}, nil, false)
+	req := b.NewMessage(T("service", "noop"), nil, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
@@ -222,7 +222,7 @@ func TestRequestReply_ManualSubscription(t *testing.T) {
 	reqConn := b.NewConnection("requester")
 	respConn := b.NewConnection("responder")
 
-	reqTopic := Topic{"sensor", "read"}
+	reqTopic := T("sensor", "read")
 	reqSub := respConn.Subscribe(reqTopic)
 	defer respConn.Unsubscribe(reqSub)
 
@@ -258,7 +258,7 @@ func TestRequestReply_ManualSubscription(t *testing.T) {
 // helpers
 // -----------------------------------------------------------------------------
 
-func topicsEqual(a, b Topic) bool {
+func topicsEqual(a, b topic) bool {
 	if len(a) != len(b) {
 		return false
 	}

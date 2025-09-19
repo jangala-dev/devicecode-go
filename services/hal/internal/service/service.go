@@ -60,8 +60,9 @@ type Service struct {
 }
 
 var (
-	topicConfigHAL = bus.Topic{consts.TokConfig, consts.TokHAL}
-	topicCtrl      = bus.Topic{consts.TokHAL, consts.TokCapability, "+", "+", consts.TokControl, "+"}
+	topicConfigHAL = bus.T(consts.TokConfig, consts.TokHAL)
+	topicCapPrefix = bus.T(consts.TokHAL, consts.TokCapability)
+	topicCtrl      = bus.T(consts.TokHAL, consts.TokCapability, "+", "+", consts.TokControl, "+")
 )
 
 func New(conn *bus.Connection, buses halcore.I2CBusFactory, pins halcore.PinFactory, uarts halcore.UARTFactory) *Service {
@@ -389,7 +390,7 @@ func (s *Service) handleUARTEvent(ev uartio.Event) {
 			TS:   ev.TS,
 		}
 		s.conn.Publish(s.conn.NewMessage(
-			capTopicInt(consts.KindUART, id, consts.TokEvent), evt, false))
+			topicCapPrefix.Append(consts.KindUART, id, consts.TokEvent), evt, false))
 		s.pubRet(consts.KindUART, id, consts.TokState,
 			types.CapabilityState{Link: types.LinkUp, TS: ev.TS})
 	}
@@ -418,7 +419,7 @@ func (s *Service) handleResult(r halcore.Result) {
 			continue
 		}
 		s.conn.Publish(s.conn.NewMessage(
-			capTopicInt(rd.Kind, id, consts.TokValue),
+			topicCapPrefix.Append(rd.Kind, id, consts.TokValue),
 			rd.Payload,
 			false,
 		))
@@ -444,7 +445,7 @@ func (s *Service) handleGPIOEvent(ev gpioirq.GPIOEvent) {
 		}[ev.Edge]
 		// Event (non-retained)
 		s.conn.Publish(s.conn.NewMessage(
-			capTopicInt(consts.KindGPIO, id, consts.TokEvent),
+			topicCapPrefix.Append(consts.KindGPIO, id, consts.TokEvent),
 			types.GPIOEvent{Edge: edge, Level: uint8(ev.Level), TS: ts},
 			false,
 		))
@@ -473,7 +474,7 @@ func (s *Service) publishState(level, status string, err error) {
 	if err != nil {
 		pl.Error = err.Error()
 	}
-	s.conn.Publish(s.conn.NewMessage(bus.Topic{consts.TokHAL, consts.TokState}, pl, true))
+	s.conn.Publish(s.conn.NewMessage(bus.T(consts.TokHAL, consts.TokState), pl, true))
 }
 
 func (s *Service) replyErr(req *bus.Message, code string) {
@@ -486,12 +487,8 @@ func (s *Service) replyErr(req *bus.Message, code string) {
 	s.conn.Reply(req, types.ErrorReply{OK: false, Error: code}, false)
 }
 
-func capTopicInt(kind string, id int, suffix string) bus.Topic {
-	return bus.Topic{consts.TokHAL, consts.TokCapability, kind, id, suffix}
-}
-
 func (s *Service) pubRet(kind string, id int, suffix string, p any) {
-	s.conn.Publish(s.conn.NewMessage(capTopicInt(kind, id, suffix), p, true))
+	s.conn.Publish(s.conn.NewMessage(topicCapPrefix.Append(kind, id, suffix), p, true))
 }
 
 func asInt(t any) (int, bool) {
