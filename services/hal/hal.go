@@ -1,22 +1,16 @@
-// services/hal/hal.go
 package hal
 
 import (
 	"context"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/platform"
-	"devicecode-go/services/hal/internal/service"
 )
 
-// Run starts the HAL service until ctx is cancelled.
-// Device modules are brought in via blank imports elsewhere (e.g. in cmd/firmware).
+// Run starts the HAL service (single non-blocking loop).
 func Run(ctx context.Context, conn *bus.Connection) {
-	s := service.New(
-		conn,
-		platform.DefaultI2CFactory(),
-		platform.DefaultPinFactory(),
-		platform.DefaultUARTFactory(),
-	)
-	s.Run(ctx)
+	res := platform.GetResources() // rp2040 provider selected via build tags
+	h := core.NewHAL(conn, res)
+	h.Run(ctx)
 }

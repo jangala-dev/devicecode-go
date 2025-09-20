@@ -16,7 +16,21 @@ var defaultQLen = 3
 
 // Token can be string or int (or any comparable type you choose to use as a key).
 type Token any
+
+// topic is the internal canonical representation (a slice of tokens).
 type topic []Token
+
+// Topic is the exported, sealed topic handle. Only this package can implement it.
+type Topic interface {
+	isBusTopic() // unexported method seals the interface
+	Append(tokens ...Token) Topic
+
+	Len() int
+	At(i int) Token
+}
+
+func (t topic) Len() int       { return len(t) }
+func (t topic) At(i int) Token { return t[i] }
 
 // ---- topic interner
 
@@ -37,6 +51,9 @@ func init() {
 	interner.root = &internNode{children: make(map[Token]*internNode)}
 	interner.maxTopics = 0 // 0 = unlimited; you can tune if you want a cap
 }
+
+// Seals `topic` as implementing `Topic`.
+func (t topic) isBusTopic() {}
 
 func internTopic(tokens ...Token) topic {
 	n := interner.root
@@ -89,15 +106,15 @@ func validateTokens(tokens ...Token) {
 	}
 }
 
-// T validates and interns a topic.
-func T(tokens ...Token) topic {
+// T validates and interns a topic, returning an opaque Topic.
+func T(tokens ...Token) Topic {
 	validateTokens(tokens...)
 	return internTopic(tokens...)
 }
 
-// Append validates and interns t + tokens, returning a canonical topic.
+// Append validates and interns t + tokens, returning a canonical Topic.
 // It never aliases the caller’s storage; you always get an interned slice.
-func (t topic) Append(tokens ...Token) topic {
+func (t topic) Append(tokens ...Token) Topic {
 	validateTokens(tokens...)
 	combined := make([]Token, 0, len(t)+len(tokens))
 	combined = append(combined, t...)
@@ -105,18 +122,30 @@ func (t topic) Append(tokens ...Token) topic {
 	return internTopic(combined...)
 }
 
+// Helpers to work with opaque Topic inside the package.
+func toConcrete(tp Topic) topic {
+	if tp == nil {
+		return nil
+	}
+	return tp.(topic)
+}
+
+func topicLen(tp Topic) int {
+	return len(toConcrete(tp))
+}
+
 // -----------------------------------------------------------------------------
 // Message
 // -----------------------------------------------------------------------------
 
 type Message struct {
-	Topic    topic
+	Topic    Topic
 	Payload  any
 	Retained bool
-	ReplyTo  topic
+	ReplyTo  Topic
 }
 
-func (m *Message) CanReply() bool { return len(m.ReplyTo) != 0 }
+func (m *Message) CanReply() bool { return topicLen(m.ReplyTo) != 0 }
 
 // -----------------------------------------------------------------------------
 // Subscription
@@ -129,7 +158,7 @@ type Subscription struct {
 	conn  *Connection
 }
 
-func (s *Subscription) Topic() topic             { return s.topic }
+func (s *Subscription) Topic() Topic             { return s.topic }
 func (s *Subscription) Channel() <-chan *Message { return s.ch }
 func (s *Subscription) Unsubscribe()             { s.conn.Unsubscribe(s) }
 
@@ -145,7 +174,7 @@ func (s *Subscription) Reply(to *Message, payload any, retained bool) {
 type node struct {
 	children map[Token]*node
 	subs     []*Subscription
-	retained *Message
+	retained *Message // Message.Topic is opaque; internal traversal uses stored path
 }
 
 func ensureChild(n *node, t Token) *node {
@@ -198,24 +227,24 @@ func NewBusWithOptions(o Options) *Bus {
 	}
 }
 
-func (b *Bus) NewMessage(topic topic, payload any, retained bool) *Message {
+func (b *Bus) NewMessage(tp Topic, payload any, retained bool) *Message {
 	return &Message{
-		Topic:    topic,
+		Topic:    tp,
 		Payload:  payload,
 		Retained: retained,
 	}
 }
 
-func (b *Bus) addSubscription(topic topic, sub *Subscription) {
+func (b *Bus) addSubscription(tp topic, sub *Subscription) {
 	b.mu.Lock()
 	n := b.root
-	for _, t := range topic {
+	for _, t := range tp {
 		n = ensureChild(n, t)
 	}
 	n.subs = append(n.subs, sub)
 
 	var retained []*Message
-	b.collectRetainedLocked(b.root, topic, 0, &retained)
+	b.collectRetainedLocked(b.root, tp, 0, &retained)
 	b.mu.Unlock()
 
 	for _, rm := range retained {
@@ -224,15 +253,17 @@ func (b *Bus) addSubscription(topic topic, sub *Subscription) {
 }
 
 func (b *Bus) Publish(msg *Message) {
+	msgTopic := toConcrete(msg.Topic)
+
 	b.mu.Lock()
 	var subs []*Subscription
-	b.collectSubscribersLocked(b.root, msg.Topic, 0, &subs)
+	b.collectSubscribersLocked(b.root, msgTopic, 0, &subs)
 
 	if msg.Retained {
 		if msg.Payload == nil {
-			b.retainDeleteLocked(msg.Topic)
+			b.retainDeleteLocked(msgTopic)
 		} else {
-			b.retainSetLocked(msg)
+			b.retainSetLocked(msgTopic, msg)
 		}
 	}
 	b.mu.Unlock()
@@ -271,13 +302,13 @@ func (b *Bus) tryDeliver(sub *Subscription, msg *Message) {
 // Unsubscribe + pruning
 // -----------------------------------------------------------------------------
 
-func (b *Bus) unsubscribe(topic topic, sub *Subscription) {
+func (b *Bus) unsubscribe(tp topic, sub *Subscription) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	n := b.root
 	var stack []*node
-	for _, t := range topic {
+	for _, t := range tp {
 		if n.children == nil {
 			return
 		}
@@ -295,7 +326,7 @@ func (b *Bus) unsubscribe(topic topic, sub *Subscription) {
 			break
 		}
 	}
-	b.pruneEmptyLocked(stack, topic)
+	b.pruneEmptyLocked(stack, tp)
 }
 
 func (b *Bus) pruneEmptyLocked(stack []*node, path []Token) {
@@ -315,11 +346,11 @@ func (b *Bus) pruneEmptyLocked(stack []*node, path []Token) {
 // Subscriber collection (topic = concrete message topic)
 // -----------------------------------------------------------------------------
 
-func (b *Bus) collectSubscribersLocked(n *node, topic topic, depth int, out *[]*Subscription) {
+func (b *Bus) collectSubscribersLocked(n *node, tp topic, depth int, out *[]*Subscription) {
 	if n == nil {
 		return
 	}
-	if depth == len(topic) {
+	if depth == len(tp) {
 		*out = append(*out, n.subs...)
 		if n.children != nil {
 			if mw := n.children[b.mWild]; mw != nil {
@@ -328,13 +359,13 @@ func (b *Bus) collectSubscribersLocked(n *node, topic topic, depth int, out *[]*
 		}
 		return
 	}
-	tok := topic[depth]
+	tok := tp[depth]
 	if n.children != nil {
 		if child := n.children[tok]; child != nil {
-			b.collectSubscribersLocked(child, topic, depth+1, out)
+			b.collectSubscribersLocked(child, tp, depth+1, out)
 		}
 		if sw := n.children[b.sWild]; sw != nil {
-			b.collectSubscribersLocked(sw, topic, depth+1, out)
+			b.collectSubscribersLocked(sw, tp, depth+1, out)
 		}
 		if mw := n.children[b.mWild]; mw != nil {
 			*out = append(*out, mw.subs...) // '#' matches any remainder
@@ -346,18 +377,18 @@ func (b *Bus) collectSubscribersLocked(n *node, topic topic, depth int, out *[]*
 // Retained storage and collection (pattern = subscription topic with wildcards)
 // -----------------------------------------------------------------------------
 
-func (b *Bus) retainSetLocked(msg *Message) {
+func (b *Bus) retainSetLocked(tp topic, msg *Message) {
 	n := b.root
-	for _, t := range msg.Topic {
+	for _, t := range tp {
 		n = ensureChild(n, t)
 	}
 	n.retained = msg
 }
 
-func (b *Bus) retainDeleteLocked(topic topic) {
+func (b *Bus) retainDeleteLocked(tp topic) {
 	n := b.root
 	var stack []*node
-	for _, t := range topic {
+	for _, t := range tp {
 		if n.children == nil {
 			return
 		}
@@ -369,7 +400,7 @@ func (b *Bus) retainDeleteLocked(topic topic) {
 		n = child
 	}
 	n.retained = nil
-	b.pruneEmptyLocked(stack, topic)
+	b.pruneEmptyLocked(stack, tp)
 }
 
 func (b *Bus) collectRetainedLocked(n *node, pattern topic, depth int, out *[]*Message) {
@@ -425,15 +456,16 @@ func (b *Bus) NewConnection(id string) *Connection {
 	return &Connection{bus: b, id: id}
 }
 
-func (c *Connection) NewMessage(topic topic, payload any, retained bool) *Message {
-	return c.bus.NewMessage(topic, payload, retained)
+func (c *Connection) NewMessage(tp Topic, payload any, retained bool) *Message {
+	return c.bus.NewMessage(tp, payload, retained)
 }
 
 func (c *Connection) Publish(msg *Message) { c.bus.Publish(msg) }
 
-func (c *Connection) Subscribe(topic topic) *Subscription {
-	sub := &Subscription{topic: topic, ch: make(chan *Message, c.bus.qLen), bus: c.bus, conn: c}
-	c.bus.addSubscription(topic, sub)
+func (c *Connection) Subscribe(tp Topic) *Subscription {
+	ct := toConcrete(tp)
+	sub := &Subscription{topic: ct, ch: make(chan *Message, c.bus.qLen), bus: c.bus, conn: c}
+	c.bus.addSubscription(ct, sub)
 	c.mu.Lock()
 	c.subs = append(c.subs, sub)
 	c.mu.Unlock()
@@ -474,7 +506,7 @@ func removeSub(list []*Subscription, target *Subscription) []*Subscription {
 // -----------------------------------------------------------------------------
 
 func (c *Connection) Request(msg *Message) *Subscription {
-	if len(msg.ReplyTo) == 0 {
+	if topicLen(msg.ReplyTo) == 0 {
 		// Namespace reply topics to avoid accidental catches by broad '#' subs.
 		// Single integer token keeps allocs zero and is TinyGo-safe.
 		msg.ReplyTo = T("_rr", c.rrCtr.Add(1))
@@ -500,7 +532,7 @@ func (c *Connection) RequestWait(ctx context.Context, msg *Message) (*Message, e
 }
 
 func (c *Connection) Reply(to *Message, payload any, retained bool) {
-	if len(to.ReplyTo) == 0 {
+	if topicLen(to.ReplyTo) == 0 {
 		return
 	}
 	c.Publish(&Message{Topic: to.ReplyTo, Payload: payload, Retained: retained})
