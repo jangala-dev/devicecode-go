@@ -17,21 +17,34 @@ type HAL struct {
 	conn *bus.Connection
 	res  Resources
 
-	nextID map[string]int    // next numeric id per kind string
-	capToD map[capKey]string // (kind,id) -> devID
-	dev    map[string]Device // devID -> device
+	nextID   map[string]int            // next numeric id per kind
+	capToDev map[capKey]string         // (kind,id) -> devID
+	dev      map[string]Device         // devID -> device
+	devCapID map[string]map[string]int // devID -> kind -> id
 
+	exec    map[string]*devExec // per-device executor (optional)
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
 }
 
+type devExec struct {
+	q chan execReq
+}
+type execReq struct {
+	ctx  context.Context
+	msg  *bus.Message // reply-to (optional)
+	kind types.Kind
+}
+
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
 	return &HAL{
-		conn:   conn,
-		res:    res,
-		nextID: map[string]int{},
-		capToD: map[capKey]string{},
-		dev:    map[string]Device{},
+		conn:     conn,
+		res:      res,
+		nextID:   map[string]int{},
+		capToDev: map[capKey]string{},
+		dev:      map[string]Device{},
+		devCapID: map[string]map[string]int{},
+		exec:     map[string]*devExec{},
 	}
 }
 
@@ -78,21 +91,16 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		if _, exists := h.dev[d.ID]; exists {
 			continue
 		}
-
 		b, ok := lookupBuilder(d.Type)
-		// TRACE
 		if !ok {
 			println("[hal] no builder for type:", d.Type, "id:", d.ID)
 			continue
-		} else {
-			println("[hal] builder found for:", d.Type, "id:", d.ID)
 		}
-
 		dev, err := b.Build(ctx, BuilderInput{
 			ID:     d.ID,
 			Type:   d.Type,
 			Params: d.Params,
-			Pins:   h.res.Pins,
+			Res:    h.res,
 		})
 		if err != nil {
 			println("[hal] build failed for:", d.ID, "err:", err.Error())
@@ -103,12 +111,15 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			continue
 		}
 		h.dev[dev.ID()] = dev
+		h.devCapID[dev.ID()] = map[string]int{}
 
+		// Register capabilities
 		for _, cs := range dev.Capabilities() {
 			k := string(cs.Kind)
 			id := h.nextID[k]
 			h.nextID[k]++
-			h.capToD[capKey{kind: k, id: id}] = dev.ID()
+			h.capToDev[capKey{kind: k, id: id}] = dev.ID()
+			h.devCapID[dev.ID()][k] = id
 
 			h.conn.Publish(h.conn.NewMessage(
 				capInfo(k, id),
@@ -120,9 +131,46 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				types.CapabilityState{Link: types.LinkDown, TSms: nowMs()},
 				true,
 			))
+		}
 
-			// TRACE
-			println("[hal] published info/state for", k, "cap id", itoa(id))
+		// Create a small executor queue for read_now (bounded, lazy)
+		ex := &devExec{q: make(chan execReq, 8)}
+		h.exec[dev.ID()] = ex
+		go h.runExecutor(ctx, dev, ex)
+	}
+}
+
+func (h *HAL) runExecutor(ctx context.Context, dev Device, ex *devExec) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case r := <-ex.q:
+			var last any
+			_ = dev.Read(r.ctx, func(k types.Kind, payload any) {
+				kindStr := string(k)
+
+				// Safe nested lookup
+				m, ok := h.devCapID[dev.ID()]
+				if !ok {
+					return
+				}
+				id, ok := m[kindStr]
+				if !ok {
+					return
+				}
+
+				last = payload
+				h.conn.Publish(h.conn.NewMessage(capValue(kindStr, id), payload, false))
+				h.conn.Publish(h.conn.NewMessage(
+					capState(kindStr, id),
+					types.CapabilityState{Link: types.LinkUp, TSms: nowMs()},
+					true,
+				))
+			})
+			if r.msg != nil && r.msg.CanReply() && last != nil {
+				h.conn.Reply(r.msg, last, false)
+			}
 		}
 	}
 }
@@ -135,7 +183,7 @@ func (h *HAL) handleControl(ctx context.Context, msg *bus.Message) {
 	idNum, _ := toInt(msg.Topic.At(3))
 	verb, _ := msg.Topic.At(5).(string)
 
-	devID, ok := h.capToD[capKey{kind: kind, id: idNum}]
+	devID, ok := h.capToDev[capKey{kind: kind, id: idNum}]
 	if !ok {
 		h.replyErr(msg, "unknown_capability")
 		return
@@ -148,22 +196,18 @@ func (h *HAL) handleControl(ctx context.Context, msg *bus.Message) {
 
 	switch verb {
 	case "read_now":
-		var last any
-		err := dev.Read(ctx, func(k types.Kind, payload any) {
-			if string(k) != kind {
-				return
-			}
-			last = payload
-			h.conn.Publish(h.conn.NewMessage(capValue(kind, idNum), payload, false))
-			h.conn.Publish(h.conn.NewMessage(capState(kind, idNum),
-				types.CapabilityState{Link: types.LinkUp, TSms: nowMs()}, true))
-		})
-		if err != nil {
-			h.replyErr(msg, err.Error())
+		ex := h.exec[devID]
+		if ex == nil {
+			h.replyErr(msg, "busy")
 			return
 		}
-		if msg.CanReply() && last != nil {
-			h.conn.Reply(msg, last, false)
+		// Enqueue non-blocking; if full, fail fast
+		req := execReq{ctx: ctx, msg: msg, kind: types.Kind(kind)}
+		select {
+		case ex.q <- req:
+			// reply will be sent by executor
+		default:
+			h.replyErr(msg, "busy")
 		}
 	default:
 		res, err := dev.Control(types.Kind(kind), verb, msg.Payload)
@@ -173,6 +217,11 @@ func (h *HAL) handleControl(ctx context.Context, msg *bus.Message) {
 		}
 		if msg.CanReply() {
 			h.conn.Reply(msg, res, false)
+		}
+		// If the device returned a typed value, publish it as telemetry too.
+		switch res.(type) {
+		case types.LEDValue:
+			h.conn.Publish(h.conn.NewMessage(capValue(kind, idNum), res, false))
 		}
 		h.conn.Publish(h.conn.NewMessage(capState(kind, idNum),
 			types.CapabilityState{Link: types.LinkUp, TSms: nowMs()}, true))
@@ -212,26 +261,3 @@ func toInt(v any) (int, bool) {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	sign := ""
-	if i < 0 {
-		sign = "-"
-		i = -i
-	}
-	var buf [32]byte
-	b := len(buf)
-	for i > 0 {
-		b--
-		buf[b] = byte('0' + (i % 10))
-		i /= 10
-	}
-	if sign != "" {
-		b--
-		buf[b] = '-'
-	}
-	return string(buf[b:])
-}

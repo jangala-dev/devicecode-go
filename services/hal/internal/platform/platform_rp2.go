@@ -11,6 +11,6 @@ import (
 
 func GetResources() core.Resources {
 	return core.Resources{
-		Pins: provider.NewPinFactory(),
+		Reg: provider.NewResourceRegistry(),
 	}
 }

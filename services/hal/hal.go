@@ -8,9 +8,8 @@ import (
 	"devicecode-go/services/hal/internal/platform"
 )
 
-// Run starts the HAL service (single non-blocking loop).
 func Run(ctx context.Context, conn *bus.Connection) {
-	res := platform.GetResources() // rp2040 provider selected via build tags
+	res := platform.GetResources()
 	h := core.NewHAL(conn, res)
 	h.Run(ctx)
 }
