@@ -35,6 +35,13 @@ type Info struct {
 	Detail        interface{} `json:"detail,omitempty"`
 }
 
+// ---- LED capability params ----
+
+type LEDParams struct {
+	Pin     int  `json:"pin"`
+	Initial bool `json:"initial,omitempty"`
+}
+
 // ---- LED capability payloads ----
 
 type LEDInfo struct {

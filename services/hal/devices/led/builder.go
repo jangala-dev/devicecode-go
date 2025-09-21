@@ -18,17 +18,22 @@ type Params struct {
 type builder struct{}
 
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
-	var p Params
-	if m, ok := in.Params.(map[string]any); ok {
-		if v, ok := m["pin"].(float64); ok {
-			p.Pin = int(v)
-		}
-		if v, ok := m["initial"].(bool); ok {
-			p.Initial = v
-		}
+	var p types.LEDParams
+
+	switch v := in.Params.(type) {
+	case types.LEDParams:
+		p = v
+	case *types.LEDParams:
+		p = *v
+	default:
+		return nil, errors.New("invalid_params_type") // caller must pass types.LEDParams
 	}
-	if p.Pin == 0 && p.Initial { /* acceptable */
+
+	// Enforce explicit pin
+	if p.Pin < 0 {
+		return nil, errors.New("invalid_or_missing_pin")
 	}
+
 	pin, ok := in.Pins.ByNumber(p.Pin)
 	if !ok {
 		return nil, errors.New("unknown_pin")
@@ -36,7 +41,6 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	return &Device{id: in.ID, pin: pin, initial: p.Initial}, nil
 }
 
-// Device implements a single LED capability on a GPIO.
 type Device struct {
 	id      string
 	pin     core.GPIOPin

@@ -58,10 +58,11 @@ func topicStr(t bus.Topic) string {
 }
 
 func main() {
+	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
 	println("[main] bootstrapping bus …")
-	b := bus.NewBus(64)
+	b := bus.NewBus(4)
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
@@ -82,9 +83,9 @@ func main() {
 			{
 				ID:   "led0",
 				Type: "gpio_led",
-				Params: map[string]any{
-					"pin":     25,
-					"initial": false,
+				Params: types.LEDParams{
+					Pin:     25,
+					Initial: false,
 				},
 			},
 		},
@@ -103,23 +104,12 @@ func main() {
 		println("[main] read_now reply on", topicStr(reply.Topic))
 	}
 
-	// Toggle a few times
 	toggle := bus.T("hal", "capability", string(types.KindLED), 0, "control", "toggle")
-	for i := 0; i < 3; i++ {
-		println("[main] toggle", itoa(i))
+
+	for {
 		if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(toggle, map[string]any{}, false)); err != nil {
 			println("[main] toggle error:", err.Error())
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-
-	// Set LED on
-	set := bus.T("hal", "capability", string(types.KindLED), 0, "control", "set")
-	println("[main] set {level:true}")
-	if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(set, map[string]any{"level": true}, false)); err != nil {
-		println("[main] set error:", err.Error())
-	}
-
-	println("[main] running; observe [monitor] lines above. Reset to exit.")
-	select {}
 }

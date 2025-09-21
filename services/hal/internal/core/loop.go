@@ -78,10 +78,16 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		if _, exists := h.dev[d.ID]; exists {
 			continue
 		}
+
 		b, ok := lookupBuilder(d.Type)
+		// TRACE
 		if !ok {
+			println("[hal] no builder for type:", d.Type, "id:", d.ID)
 			continue
+		} else {
+			println("[hal] builder found for:", d.Type, "id:", d.ID)
 		}
+
 		dev, err := b.Build(ctx, BuilderInput{
 			ID:     d.ID,
 			Type:   d.Type,
@@ -89,12 +95,15 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			Pins:   h.res.Pins,
 		})
 		if err != nil {
+			println("[hal] build failed for:", d.ID, "err:", err.Error())
 			continue
 		}
 		if err := dev.Init(ctx); err != nil {
+			println("[hal] init failed for:", d.ID)
 			continue
 		}
 		h.dev[dev.ID()] = dev
+
 		for _, cs := range dev.Capabilities() {
 			k := string(cs.Kind)
 			id := h.nextID[k]
@@ -111,6 +120,9 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				types.CapabilityState{Link: types.LinkDown, TSms: nowMs()},
 				true,
 			))
+
+			// TRACE
+			println("[hal] published info/state for", k, "cap id", itoa(id))
 		}
 	}
 }
@@ -200,3 +212,26 @@ func toInt(v any) (int, bool) {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	sign := ""
+	if i < 0 {
+		sign = "-"
+		i = -i
+	}
+	var buf [32]byte
+	b := len(buf)
+	for i > 0 {
+		b--
+		buf[b] = byte('0' + (i % 10))
+		i /= 10
+	}
+	if sign != "" {
+		b--
+		buf[b] = '-'
+	}
+	return string(buf[b:])
+}
