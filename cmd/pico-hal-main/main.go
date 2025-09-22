@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"runtime"
 	"time"
 
 	"devicecode-go/bus"
@@ -32,29 +33,27 @@ func itoa(i int) string {
 	}
 	return string(buf[b:])
 }
-func topicStr(t bus.Topic) string {
-	n := t.Len()
-	out := ""
-	for i := 0; i < n; i++ {
+func printTopicWith(prefix string, t bus.Topic) {
+	print(prefix)
+	print(" ")
+	for i := 0; i < t.Len(); i++ {
 		if i > 0 {
-			out += "/"
+			print("/")
 		}
 		switch v := t.At(i).(type) {
 		case string:
-			out += v
+			print(v)
 		case int:
-			out += itoa(v)
+			print(v)
 		case int32:
-			out += itoa(int(v))
+			print(int(v))
 		case int64:
-			out += itoa(int(v))
-		case float64:
-			out += itoa(int(v))
+			print(int(v))
 		default:
-			out += "?"
+			print("?")
 		}
 	}
-	return out
+	println()
 }
 
 func main() {
@@ -70,7 +69,7 @@ func main() {
 	mon := uiConn.Subscribe(bus.T("hal", "#"))
 	go func() {
 		for m := range mon.Channel() {
-			println("[monitor] <-", topicStr(m.Topic))
+			printTopicWith("[monitor] <-", m.Topic)
 		}
 	}()
 
@@ -98,18 +97,36 @@ func main() {
 	// Try read_now on capability led/0
 	readNow := bus.T("hal", "capability", string(types.KindLED), 0, "control", "read_now")
 	println("[main] sending read_now for led/0 …")
-	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(readNow, map[string]any{}, false)); err != nil {
+	// read_now
+	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(readNow, nil, false)); err != nil {
 		println("[main] read_now error:", err.Error())
 	} else {
-		println("[main] read_now reply on", topicStr(reply.Topic))
+		printTopicWith("[main] read_now reply on", reply.Topic)
 	}
 
 	toggle := bus.T("hal", "capability", string(types.KindLED), 0, "control", "toggle")
 
 	for {
-		if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(toggle, map[string]any{}, false)); err != nil {
+		if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(toggle, nil, false)); err != nil {
 			println("[main] toggle error:", err.Error())
 		}
+		printMem()
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// printMem prints a compact snapshot of TinyGo runtime memory stats.
+// Uses builtin println to avoid fmt overhead/allocations.
+func printMem() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	println(
+		"[mem]",
+		"alloc:", uint32(ms.Alloc),
+		"heapInuse:", uint32(ms.HeapInuse),
+		"heapSys:", uint32(ms.HeapSys),
+		"mallocs:", uint32(ms.Mallocs),
+		"frees:", uint32(ms.Frees),
+	)
 }

@@ -112,6 +112,15 @@ func T(tokens ...Token) Topic {
 	return internTopic(tokens...)
 }
 
+// TNoIntern validates but DOES NOT intern the tokens.
+// Intended for short-lived subjects (e.g. per-request replies).
+func TNoIntern(tokens ...Token) Topic {
+	validateTokens(tokens...)
+	cp := make(topic, len(tokens))
+	copy(cp, tokens)
+	return cp
+}
+
 // Append validates and interns t + tokens, returning a canonical Topic.
 // It never aliases the caller’s storage; you always get an interned slice.
 func (t topic) Append(tokens ...Token) Topic {
@@ -507,9 +516,7 @@ func removeSub(list []*Subscription, target *Subscription) []*Subscription {
 
 func (c *Connection) Request(msg *Message) *Subscription {
 	if topicLen(msg.ReplyTo) == 0 {
-		// Namespace reply topics to avoid accidental catches by broad '#' subs.
-		// Single integer token keeps allocs zero and is TinyGo-safe.
-		msg.ReplyTo = T("_rr", c.rrCtr.Add(1))
+		msg.ReplyTo = TNoIntern("_rr", c.rrCtr.Add(1)) // <- changed
 	}
 	sub := c.Subscribe(msg.ReplyTo)
 	c.Publish(msg)
