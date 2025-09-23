@@ -51,13 +51,19 @@ type GPIOHandle interface {
 // ---- Unified registry interface ----
 
 type ResourceRegistry interface {
-	// Buses (placeholders for future extensions)
+	// Optional classification/introspection.
 	ClassOf(id ResourceID) (BusClass, bool)
-	Txn(id ResourceID) (TxnOwner, bool)
-	Stream(id ResourceID) (StreamOwner, bool)
 
-	// GPIO
+	// Exclusive claims (release on Device.Close). Providers for I²C/UART will fill these in later.
+	ClaimTxn(devID string, id ResourceID, _ *struct{}) (TxnOwner, error)
+	ClaimStream(devID string, id ResourceID, _ *struct{}) (StreamOwner, error)
+
+	// GPIO (already implemented on RP2040).
 	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
+
+	// Releases (idempotent; safe to call even if not claimed).
+	ReleaseTxn(devID string, id ResourceID)
+	ReleaseStream(devID string, id ResourceID)
 	ReleaseGPIO(devID string, pin int)
 }
 
@@ -65,4 +71,7 @@ type ResourceRegistry interface {
 var (
 	ErrUnknownPin = errors.New("unknown_pin")
 	ErrPinInUse   = errors.New("pin_in_use")
+
+	ErrUnknownBus = errors.New("unknown_bus")
+	ErrBusInUse   = errors.New("bus_in_use")
 )

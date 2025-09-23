@@ -1,4 +1,4 @@
-//go:build pico && board_pico_default
+//go:build pico
 
 package boards
 
@@ -6,13 +6,15 @@ import (
 	_ "devicecode-go/services/hal/devices/led"
 )
 
-// Minimal descriptor for Pico bring-up; onboard LED is GP25.
-type Descriptor struct {
-	Name string
-	LED  int
+type Board struct {
+	Name             string
+	OnboardLED       int
+	GPIOMin, GPIOMax int
 }
 
-var Selected = Descriptor{
-	Name: "pico_default",
-	LED:  25,
+var SelectedBoard = Board{
+	Name:       "raspberrypi_pico",
+	OnboardLED: 25,
+	GPIOMin:    0,
+	GPIOMax:    28,
 }

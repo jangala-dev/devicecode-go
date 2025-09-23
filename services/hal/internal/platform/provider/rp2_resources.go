@@ -6,10 +6,11 @@ import (
 	"sync"
 
 	"devicecode-go/services/hal/internal/core"
+	"devicecode-go/services/hal/internal/platform/boards"
 	"machine"
 )
 
-// Concrete GPIO handle
+// Concrete GPIO handle (unchanged)
 type rp2Pin struct {
 	p machine.Pin
 	n int
@@ -44,7 +45,7 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// Unified resource registry (GPIO today; bus methods stubbed)
+// Unified resource registry (GPIO today; bus claimers stubbed)
 type gpioRegistry struct {
 	mu    sync.Mutex
 	used  map[int]string  // pin -> devID
@@ -60,14 +61,24 @@ func NewResourceRegistry() core.ResourceRegistry {
 
 // ---- core.ResourceRegistry implementation ----
 
-func (g *gpioRegistry) ClassOf(id core.ResourceID) (core.BusClass, bool) { return 0, false }
-func (g *gpioRegistry) Txn(id core.ResourceID) (core.TxnOwner, bool)     { return nil, false }
-func (g *gpioRegistry) Stream(id core.ResourceID) (core.StreamOwner, bool) {
-	return nil, false
+func (g *gpioRegistry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
+	return 0, false // no buses yet on RP2040 provider
 }
 
+// Buses — stubs for now
+func (g *gpioRegistry) ClaimTxn(devID string, id core.ResourceID, _ *struct{}) (core.TxnOwner, error) {
+	return nil, core.ErrUnknownBus
+}
+func (g *gpioRegistry) ClaimStream(devID string, id core.ResourceID, _ *struct{}) (core.StreamOwner, error) {
+	return nil, core.ErrUnknownBus
+}
+func (g *gpioRegistry) ReleaseTxn(devID string, id core.ResourceID)    {}
+func (g *gpioRegistry) ReleaseStream(devID string, id core.ResourceID) {}
+
+// GPIO
 func (g *gpioRegistry) lookup(n int) (*rp2Pin, bool) {
-	if n < 0 || n > 28 {
+	min, max := boards.SelectedBoard.GPIOMin, boards.SelectedBoard.GPIOMax
+	if n < min || n > max {
 		return nil, false
 	}
 	if p, ok := g.cache[n]; ok {

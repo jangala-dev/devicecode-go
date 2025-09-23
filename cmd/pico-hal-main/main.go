@@ -74,38 +74,23 @@ func main() {
 	}()
 
 	println("[main] starting hal.Run …")
+	// hal.Run publishes the compile-time setup (if any) before entering its loop.
 	go hal.Run(ctx, halConn)
 
-	// Publish a public, strongly-typed HALConfig
-	cfg := types.HALConfig{
-		Devices: []types.HALDevice{
-			{
-				ID:   "led0",
-				Type: "gpio_led",
-				Params: types.LEDParams{
-					Pin:     25,
-					Initial: false,
-				},
-			},
-		},
-	}
-	println("[main] publishing config/hal …")
-	uiConn.Publish(uiConn.NewMessage(bus.T("config", "hal"), cfg, true))
-
+	// Allow time for HAL to apply the initial (compile-time) config and publish retained info/state.
 	time.Sleep(250 * time.Millisecond)
 
-	// Try read_now on capability led/0
+	// read_now on capability led/0
 	readNow := bus.T("hal", "capability", string(types.KindLED), 0, "control", "read_now")
 	println("[main] sending read_now for led/0 …")
-	// read_now
 	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(readNow, nil, false)); err != nil {
 		println("[main] read_now error:", err.Error())
 	} else {
 		printTopicWith("[main] read_now reply on", reply.Topic)
 	}
 
+	// toggle loop on led/0
 	toggle := bus.T("hal", "capability", string(types.KindLED), 0, "control", "toggle")
-
 	for {
 		if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(toggle, nil, false)); err != nil {
 			println("[main] toggle error:", err.Error())
@@ -116,11 +101,9 @@ func main() {
 }
 
 // printMem prints a compact snapshot of TinyGo runtime memory stats.
-// Uses builtin println to avoid fmt overhead/allocations.
 func printMem() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-
 	println(
 		"[mem]",
 		"alloc:", uint32(ms.Alloc),
