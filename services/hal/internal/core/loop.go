@@ -22,18 +22,10 @@ type HAL struct {
 	dev      map[string]Device         // devID -> device
 	devCapID map[string]map[string]int // devID -> kind -> id
 
-	exec    map[string]*devExec // per-device executor (optional)
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
-}
 
-type devExec struct {
-	q chan execReq
-}
-type execReq struct {
-	ctx  context.Context
-	msg  *bus.Message // reply-to (optional)
-	kind types.Kind
+	events <-chan Event // owner → HAL events
 }
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
@@ -44,13 +36,14 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		capToDev: map[capKey]string{},
 		dev:      map[string]Device{},
 		devCapID: map[string]map[string]int{},
-		exec:     map[string]*devExec{},
 	}
 }
 
 func (h *HAL) Run(ctx context.Context) {
 	h.cfgSub = h.conn.Subscribe(topicConfigHAL())
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
+	h.events = h.res.Reg.Events()
+
 	defer h.conn.Unsubscribe(h.cfgSub)
 	defer h.conn.Unsubscribe(h.ctrlSub)
 
@@ -79,8 +72,12 @@ APPLY:
 		case <-ctx.Done():
 			h.pubHALState("stopped", "context_cancelled")
 			return
+
 		case m := <-h.ctrlSub.Channel():
-			h.handleControl(ctx, m)
+			h.handleControl(m) // strictly non-blocking
+
+		case ev := <-h.events:
+			h.handleEvent(ev) // publish value/state based on owner events
 		}
 	}
 }
@@ -113,11 +110,12 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		h.dev[dev.ID()] = dev
 		h.devCapID[dev.ID()] = map[string]int{}
 
-		// Register capabilities
+		// Register capabilities and publish retained info + initial state:down
 		for _, cs := range dev.Capabilities() {
 			k := string(cs.Kind)
 			id := h.nextID[k]
 			h.nextID[k]++
+
 			h.capToDev[capKey{kind: k, id: id}] = dev.ID()
 			h.devCapID[dev.ID()][k] = id
 
@@ -132,50 +130,10 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				true,
 			))
 		}
-
-		// Create a small executor queue for read_now (bounded, lazy)
-		ex := &devExec{q: make(chan execReq, 8)}
-		h.exec[dev.ID()] = ex
-		go h.runExecutor(ctx, dev, ex)
 	}
 }
 
-func (h *HAL) runExecutor(ctx context.Context, dev Device, ex *devExec) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case r := <-ex.q:
-			var last any
-			_ = dev.Read(r.ctx, func(k types.Kind, payload any) {
-				kindStr := string(k)
-
-				// Safe nested lookup
-				m, ok := h.devCapID[dev.ID()]
-				if !ok {
-					return
-				}
-				id, ok := m[kindStr]
-				if !ok {
-					return
-				}
-
-				last = payload
-				h.conn.Publish(h.conn.NewMessage(capValue(kindStr, id), payload, false))
-				h.conn.Publish(h.conn.NewMessage(
-					capState(kindStr, id),
-					types.CapabilityState{Link: types.LinkUp, TSms: nowMs()},
-					true,
-				))
-			})
-			if r.msg != nil && r.msg.CanReply() && last != nil {
-				h.conn.Reply(r.msg, last, false)
-			}
-		}
-	}
-}
-
-func (h *HAL) handleControl(ctx context.Context, msg *bus.Message) {
+func (h *HAL) handleControl(msg *bus.Message) {
 	if msg.Topic.Len() < 6 {
 		return
 	}
@@ -194,38 +152,50 @@ func (h *HAL) handleControl(ctx context.Context, msg *bus.Message) {
 		return
 	}
 
-	switch verb {
-	case "read_now":
-		ex := h.exec[devID]
-		if ex == nil {
-			h.replyErr(msg, "busy")
-			return
-		}
-		// Enqueue non-blocking; if full, fail fast
-		req := execReq{ctx: ctx, msg: msg, kind: types.Kind(kind)}
-		select {
-		case ex.q <- req:
-			// reply will be sent by executor
-		default:
-			h.replyErr(msg, "busy")
-		}
-	default:
-		res, err := dev.Control(types.Kind(kind), verb, msg.Payload)
-		if err != nil {
-			h.replyErr(msg, err.Error())
-			return
-		}
-		if msg.CanReply() {
-			h.conn.Reply(msg, res, false)
-		}
-		// If the device returned a typed value, publish it as telemetry too.
-		switch res.(type) {
-		case types.LEDValue:
-			h.conn.Publish(h.conn.NewMessage(capValue(kind, idNum), res, false))
-		}
-		h.conn.Publish(h.conn.NewMessage(capState(kind, idNum),
-			types.CapabilityState{Link: types.LinkUp, TSms: nowMs()}, true))
+	// Device.Control is non-blocking and returns enqueue outcome only.
+	res, err := dev.Control(types.Kind(kind), verb, msg.Payload)
+	if err != nil {
+		h.replyErr(msg, err.Error())
+		return
 	}
+	if msg.CanReply() {
+		if res.OK {
+			h.conn.Reply(msg, types.OKReply{OK: true}, false)
+		} else {
+			h.conn.Reply(msg, types.ErrorReply{OK: false, Error: coalesce(res.Error, "busy")}, false)
+		}
+	}
+}
+
+func (h *HAL) handleEvent(ev Event) {
+	// Map (kind, devID) → numeric capability id.
+	devCaps, ok := h.devCapID[ev.DevID]
+	if !ok {
+		return
+	}
+	id, ok := devCaps[string(ev.Kind)]
+	if !ok {
+		return
+	}
+
+	k := string(ev.Kind)
+	if ev.Err != "" {
+		// Failure: retained state → degraded; do not publish a value.
+		h.conn.Publish(h.conn.NewMessage(
+			capState(k, id),
+			types.CapabilityState{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
+			true,
+		))
+		return
+	}
+
+	// Success: publish value + retained up state.
+	h.conn.Publish(h.conn.NewMessage(capValue(k, id), ev.Payload, false))
+	h.conn.Publish(h.conn.NewMessage(
+		capState(k, id),
+		types.CapabilityState{Link: types.LinkUp, TSms: ev.TSms},
+		true,
+	))
 }
 
 func (h *HAL) pubHALState(level, status string) {
@@ -239,6 +209,9 @@ func (h *HAL) pubHALState(level, status string) {
 func (h *HAL) replyErr(msg *bus.Message, code string) {
 	if !msg.CanReply() {
 		return
+	}
+	if code == "" {
+		code = "error"
 	}
 	h.conn.Reply(msg, types.ErrorReply{OK: false, Error: code}, false)
 }
@@ -261,3 +234,10 @@ func toInt(v any) (int, bool) {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
+
+func coalesce(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
+}

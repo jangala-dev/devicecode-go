@@ -56,50 +56,6 @@ func printTopicWith(prefix string, t bus.Topic) {
 	println()
 }
 
-func main() {
-	time.Sleep(3 * time.Second)
-	ctx := context.Background()
-
-	println("[main] bootstrapping bus …")
-	b := bus.NewBus(4)
-	halConn := b.NewConnection("hal")
-	uiConn := b.NewConnection("ui")
-
-	println("[main] subscribing to hal/# for diagnostics …")
-	mon := uiConn.Subscribe(bus.T("hal", "#"))
-	go func() {
-		for m := range mon.Channel() {
-			printTopicWith("[monitor] <-", m.Topic)
-		}
-	}()
-
-	println("[main] starting hal.Run …")
-	// hal.Run publishes the compile-time setup (if any) before entering its loop.
-	go hal.Run(ctx, halConn)
-
-	// Allow time for HAL to apply the initial (compile-time) config and publish retained info/state.
-	time.Sleep(250 * time.Millisecond)
-
-	// read_now on capability led/0
-	readNow := bus.T("hal", "capability", string(types.KindLED), 0, "control", "read_now")
-	println("[main] sending read_now for led/0 …")
-	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(readNow, nil, false)); err != nil {
-		println("[main] read_now error:", err.Error())
-	} else {
-		printTopicWith("[main] read_now reply on", reply.Topic)
-	}
-
-	// toggle loop on led/0
-	toggle := bus.T("hal", "capability", string(types.KindLED), 0, "control", "toggle")
-	for {
-		if _, err := uiConn.RequestWait(ctx, uiConn.NewMessage(toggle, nil, false)); err != nil {
-			println("[main] toggle error:", err.Error())
-		}
-		printMem()
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
 // printMem prints a compact snapshot of TinyGo runtime memory stats.
 func printMem() {
 	var ms runtime.MemStats
@@ -112,4 +68,68 @@ func printMem() {
 		"mallocs:", uint32(ms.Mallocs),
 		"frees:", uint32(ms.Frees),
 	)
+}
+
+func main() {
+	// Give the board a moment to settle (USB, clocks, etc.)
+	time.Sleep(3 * time.Second)
+	ctx := context.Background()
+
+	println("[main] bootstrapping bus …")
+	b := bus.NewBus(4)
+	halConn := b.NewConnection("hal")
+	uiConn := b.NewConnection("ui")
+
+	println("[main] starting hal.Run …")
+	// hal.Run publishes the compile-time setup (if any) before entering its loop.
+	go hal.Run(ctx, halConn)
+
+	// Allow time for HAL to apply the initial (compile-time) config and publish retained info/state.
+	time.Sleep(250 * time.Millisecond)
+
+	// Topics for led/0
+	ledKind := string(types.KindLED)
+	tValue := bus.T("hal", "capability", ledKind, 0, "value")
+	tCtrlRead := bus.T("hal", "capability", ledKind, 0, "control", "read")
+	tCtrlToggle := bus.T("hal", "capability", ledKind, 0, "control", "toggle")
+
+	// Subscribe to value updates (authoritative data path)
+	println("[main] subscribing to led/0 value …")
+	valSub := uiConn.Subscribe(tValue)
+
+	// Kick-off: request a read (reply is just ok/busy; value arrives on tValue)
+	println("[main] requesting initial read of led/0 …")
+	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tCtrlRead, nil, false)); err != nil {
+		println("[main] read control request error:", err.Error())
+	} else {
+		printTopicWith("[main] read control reply on", reply.Topic)
+	}
+
+	println("[main] entering event loop (toggle every 500ms; print received values) …")
+
+	for {
+		select {
+		case m := <-valSub.Channel():
+			// Expect types.LEDValue on payload
+			switch v := m.Payload.(type) {
+			case types.LEDValue:
+				print("[value] led/0 level=")
+				println(uint8(v.Level))
+			case map[string]any:
+				// Minimal fallback if routed via map (shouldn't happen with typed publishers)
+				println("[value] led/0 (map payload)")
+			default:
+				println("[value] led/0 (unknown payload)")
+			}
+
+		case <-time.After(500 * time.Millisecond):
+			// Toggle the LED; control reply is immediate ok/busy. Actual level is observed via value subscription.
+			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tCtrlToggle, nil, false)); err != nil {
+				println("[main] toggle control error:", err.Error())
+			} else {
+				printTopicWith("[main] toggle control reply on", reply.Topic)
+			}
+			printMem()
+		}
+	}
 }

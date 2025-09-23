@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+
 	"devicecode-go/types"
 )
 
@@ -13,13 +14,20 @@ type CapabilitySpec struct {
 	TTLms int // reserved for cache; 0 = none
 }
 
+// Enqueue-only control outcome returned by devices.
+type EnqueueResult struct {
+	OK    bool   // accepted/enqueued
+	Error string // "busy","unsupported","invalid_payload","unknown_pin",...
+}
+
+// Device is device-centric: all controls are non-blocking and enqueue work
+// at the relevant owner(s). Values are delivered later via owner events.
 type Device interface {
 	ID() string
 	Capabilities() []CapabilitySpec
 	Init(ctx context.Context) error
-	Read(ctx context.Context, emit func(kind types.Kind, payload any)) error
-	Control(kind types.Kind, method string, payload any) (any, error)
-	Close() error // optional: release claimed resources
+	Control(kind types.Kind, method string, payload any) (EnqueueResult, error)
+	Close() error
 }
 
 // ---- HAL-injected resources ----
@@ -28,7 +36,8 @@ type Resources struct {
 	Reg ResourceRegistry
 }
 
-// Builder input
+// Builder input and registration
+
 type BuilderInput struct {
 	ID, Type string
 	Params   any

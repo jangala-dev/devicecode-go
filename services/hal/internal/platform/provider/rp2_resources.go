@@ -4,13 +4,16 @@ package provider
 
 import (
 	"sync"
+	"time"
 
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/platform/boards"
+	"devicecode-go/types"
 	"machine"
 )
 
-// Concrete GPIO handle (unchanged)
+// Concrete GPIO handle
+
 type rp2Pin struct {
 	p machine.Pin
 	n int
@@ -45,24 +48,28 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// Unified resource registry (GPIO today; bus claimers stubbed)
+// Unified resource registry (GPIO today; buses stubs)
+
 type gpioRegistry struct {
 	mu    sync.Mutex
 	used  map[int]string  // pin -> devID
 	cache map[int]*rp2Pin // pin -> handle
+
+	evCh chan core.Event // owner→HAL events
 }
 
 func NewResourceRegistry() core.ResourceRegistry {
 	return &gpioRegistry{
 		used:  make(map[int]string),
 		cache: make(map[int]*rp2Pin),
+		evCh:  make(chan core.Event, 64),
 	}
 }
 
 // ---- core.ResourceRegistry implementation ----
 
 func (g *gpioRegistry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
-	return 0, false // no buses yet on RP2040 provider
+	return 0, false // no buses yet on this provider
 }
 
 // Buses — stubs for now
@@ -75,7 +82,10 @@ func (g *gpioRegistry) ClaimStream(devID string, id core.ResourceID, _ *struct{}
 func (g *gpioRegistry) ReleaseTxn(devID string, id core.ResourceID)    {}
 func (g *gpioRegistry) ReleaseStream(devID string, id core.ResourceID) {}
 
-// GPIO
+func (g *gpioRegistry) Events() <-chan core.Event { return g.evCh }
+
+// GPIO lookup/claim
+
 func (g *gpioRegistry) lookup(n int) (*rp2Pin, bool) {
 	min, max := boards.SelectedBoard.GPIOMin, boards.SelectedBoard.GPIOMax
 	if n < min || n > max {
@@ -108,4 +118,80 @@ func (g *gpioRegistry) ReleaseGPIO(devID string, n int) {
 		delete(g.used, n)
 	}
 	g.mu.Unlock()
+}
+
+// ---- GPIO owner operations (synchronous but emit events to HAL) ----
+
+func (g *gpioRegistry) publish(devID string, kind types.Kind, payload any) {
+	select {
+	case g.evCh <- core.Event{
+		DevID:   devID,
+		Kind:    kind,
+		Payload: payload,
+		TSms:    time.Now().UnixMilli(),
+	}:
+	default:
+		// Drop under pressure to protect system; state remains last good.
+	}
+}
+
+func (g *gpioRegistry) publishErr(devID string, kind types.Kind, code string) {
+	select {
+	case g.evCh <- core.Event{
+		DevID: devID,
+		Kind:  kind,
+		Err:   code,
+		TSms:  time.Now().UnixMilli(),
+	}:
+	default:
+	}
+}
+
+// Expose small, non-blocking ops for devices to call (no goroutines/closures).
+
+func (g *gpioRegistry) GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error) {
+	g.mu.Lock()
+	h, ok := g.cache[pin]
+	g.mu.Unlock()
+	if !ok {
+		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
+	}
+	h.Set(level)
+	var v uint8
+	if level {
+		v = 1
+	}
+	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	return core.EnqueueResult{OK: true}, nil
+}
+
+func (g *gpioRegistry) GPIOToggle(devID string, pin int) (core.EnqueueResult, error) {
+	g.mu.Lock()
+	h, ok := g.cache[pin]
+	g.mu.Unlock()
+	if !ok {
+		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
+	}
+	h.Toggle()
+	var v uint8
+	if h.Get() {
+		v = 1
+	}
+	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	return core.EnqueueResult{OK: true}, nil
+}
+
+func (g *gpioRegistry) GPIORead(devID string, pin int) (core.EnqueueResult, error) {
+	g.mu.Lock()
+	h, ok := g.cache[pin]
+	g.mu.Unlock()
+	if !ok {
+		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
+	}
+	var v uint8
+	if h.Get() {
+		v = 1
+	}
+	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	return core.EnqueueResult{OK: true}, nil
 }

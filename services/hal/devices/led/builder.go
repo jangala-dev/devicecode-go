@@ -12,6 +12,14 @@ func init() { core.RegisterBuilder("gpio_led", builder{}) }
 
 type builder struct{}
 
+// gpioOps is a narrow interface the registry implements on RP2040.
+// This keeps the device decoupled from the concrete provider type.
+type gpioOps interface {
+	GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error)
+	GPIOToggle(devID string, pin int) (core.EnqueueResult, error)
+	GPIORead(devID string, pin int) (core.EnqueueResult, error)
+}
+
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
 	var p types.LEDParams
 	switch v := in.Params.(type) {
@@ -29,12 +37,18 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if err != nil {
 		return nil, err
 	}
-	return &Device{id: in.ID, pin: h, initial: p.Initial}, nil
+	ops, ok := in.Res.Reg.(gpioOps)
+	if !ok {
+		return nil, errors.New("gpio_ops_unavailable")
+	}
+	return &Device{id: in.ID, pin: h, pinN: p.Pin, ops: ops, initial: p.Initial}, nil
 }
 
 type Device struct {
 	id      string
 	pin     core.GPIOHandle
+	pinN    int
+	ops     gpioOps
 	initial bool
 }
 
@@ -55,57 +69,44 @@ func (d *Device) Init(ctx context.Context) error {
 	return d.pin.ConfigureOutput(d.initial)
 }
 
-func (d *Device) Read(ctx context.Context, emit func(k types.Kind, payload any)) error {
-	l := d.pin.Get()
-	var lvl uint8
-	if l {
-		lvl = 1
-	}
-	emit(types.KindLED, types.LEDValue{Level: lvl})
-	return nil
-}
-
-func (d *Device) Control(kind types.Kind, method string, payload any) (any, error) {
+// Control is enqueue-only and immediate. Values are emitted via registry events.
+func (d *Device) Control(kind types.Kind, method string, payload any) (core.EnqueueResult, error) {
 	if kind != types.KindLED {
-		return nil, errors.New("unsupported_kind")
+		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
 	switch method {
 	case "set":
-		// Accept either typed or map payloads.
 		var lvl bool
-		if p, ok := payload.(types.LEDSet); ok {
+		switch p := payload.(type) {
+		case types.LEDSet:
 			lvl = p.Level
-		} else if m, ok := payload.(map[string]any); ok {
-			b, ok2 := m["level"].(bool)
-			if !ok2 {
-				return nil, errors.New("invalid_payload")
+		case map[string]any:
+			b, ok := p["level"].(bool)
+			if !ok {
+				return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 			}
 			lvl = b
-		} else {
-			return nil, errors.New("invalid_payload")
+		case nil:
+			// treat missing payload as invalid
+			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
+		default:
+			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 		}
-		d.pin.Set(lvl)
-		var v uint8
-		if lvl {
-			v = 1
-		}
-		return types.LEDValue{Level: v}, nil
+		return d.ops.GPIOSet(d.id, d.pinN, lvl)
 
 	case "toggle":
-		d.pin.Toggle()
-		var v uint8
-		if d.pin.Get() {
-			v = 1
-		}
-		return types.LEDValue{Level: v}, nil
+		return d.ops.GPIOToggle(d.id, d.pinN)
+
+	case "read":
+		return d.ops.GPIORead(d.id, d.pinN)
 
 	default:
-		return nil, errors.New("unsupported_method")
+		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
 }
 
 func (d *Device) Close() error {
-	// Optional: release claim (safe if registry is retained between configs)
-	// in.Res.Reg.ReleaseGPIO(d.id, d.pin.Number())  // not accessible here; skip for now
+	// Optionally release on reconfig when implemented:
+	// in.Res.Reg.ReleaseGPIO(d.id, d.pinN)
 	return nil
 }
