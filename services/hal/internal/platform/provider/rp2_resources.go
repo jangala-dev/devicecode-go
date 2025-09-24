@@ -12,6 +12,9 @@ import (
 	"machine"
 )
 
+// Ensure the provider satisfies the registry contract at compile time.
+var _ core.ResourceRegistry = (*gpioRegistry)(nil)
+
 // Concrete GPIO handle
 
 type rp2Pin struct {
@@ -48,7 +51,7 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// Unified resource registry (GPIO today; buses stubs)
+// Unified resource registry (GPIO today; bus methods stubbed)
 
 type gpioRegistry struct {
 	mu    sync.Mutex
@@ -69,17 +72,20 @@ func NewResourceRegistry() core.ResourceRegistry {
 // ---- core.ResourceRegistry implementation ----
 
 func (g *gpioRegistry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
-	return 0, false // no buses yet on this provider
+	// No buses exposed yet on this provider.
+	return 0, false
 }
 
-// Buses — stubs for now
-func (g *gpioRegistry) ClaimTxn(devID string, id core.ResourceID, _ *struct{}) (core.TxnOwner, error) {
+// Transactional buses (I²C) — stubs for now
+func (g *gpioRegistry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner, error) {
 	return nil, core.ErrUnknownBus
 }
-func (g *gpioRegistry) ClaimStream(devID string, id core.ResourceID, _ *struct{}) (core.StreamOwner, error) {
+func (g *gpioRegistry) ReleaseI2C(devID string, id core.ResourceID) {}
+
+// Stream buses — stubs for now
+func (g *gpioRegistry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
 	return nil, core.ErrUnknownBus
 }
-func (g *gpioRegistry) ReleaseTxn(devID string, id core.ResourceID)    {}
 func (g *gpioRegistry) ReleaseStream(devID string, id core.ResourceID) {}
 
 func (g *gpioRegistry) Events() <-chan core.Event { return g.evCh }
@@ -147,7 +153,7 @@ func (g *gpioRegistry) publishErr(devID string, kind types.Kind, code string) {
 	}
 }
 
-// Expose small, non-blocking ops for devices to call (no goroutines/closures).
+// Expose small, non-blocking ops for devices to call (no extra goroutines).
 
 func (g *gpioRegistry) GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error) {
 	g.mu.Lock()

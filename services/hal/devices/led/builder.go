@@ -12,14 +12,6 @@ func init() { core.RegisterBuilder("gpio_led", builder{}) }
 
 type builder struct{}
 
-// gpioOps is a narrow interface the registry implements on RP2040.
-// This keeps the device decoupled from the concrete provider type.
-type gpioOps interface {
-	GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error)
-	GPIOToggle(devID string, pin int) (core.EnqueueResult, error)
-	GPIORead(devID string, pin int) (core.EnqueueResult, error)
-}
-
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
 	var p types.LEDParams
 	switch v := in.Params.(type) {
@@ -37,18 +29,18 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if err != nil {
 		return nil, err
 	}
-	ops, ok := in.Res.Reg.(gpioOps)
-	if !ok {
-		return nil, errors.New("gpio_ops_unavailable")
-	}
-	return &Device{id: in.ID, pin: h, pinN: p.Pin, ops: ops, initial: p.Initial}, nil
+	return &Device{
+		id: in.ID, pin: h, pinN: p.Pin,
+		reg:     in.Res.Reg, // depend only on the stable registry
+		initial: p.Initial,
+	}, nil
 }
 
 type Device struct {
 	id      string
 	pin     core.GPIOHandle
 	pinN    int
-	ops     gpioOps
+	reg     core.ResourceRegistry
 	initial bool
 }
 
@@ -86,19 +78,16 @@ func (d *Device) Control(kind types.Kind, method string, payload any) (core.Enqu
 				return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 			}
 			lvl = b
-		case nil:
-			// treat missing payload as invalid
-			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 		default:
 			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 		}
-		return d.ops.GPIOSet(d.id, d.pinN, lvl)
+		return d.reg.GPIOSet(d.id, d.pinN, lvl)
 
 	case "toggle":
-		return d.ops.GPIOToggle(d.id, d.pinN)
+		return d.reg.GPIOToggle(d.id, d.pinN)
 
 	case "read":
-		return d.ops.GPIORead(d.id, d.pinN)
+		return d.reg.GPIORead(d.id, d.pinN)
 
 	default:
 		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
@@ -107,6 +96,6 @@ func (d *Device) Control(kind types.Kind, method string, payload any) (core.Enqu
 
 func (d *Device) Close() error {
 	// Optionally release on reconfig when implemented:
-	// in.Res.Reg.ReleaseGPIO(d.id, d.pinN)
+	// d.reg.ReleaseGPIO(d.id, d.pinN)
 	return nil
 }

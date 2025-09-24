@@ -107,6 +107,9 @@ func main() {
 
 	println("[main] entering event loop (toggle every 500ms; print received values) …")
 
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+
 	for {
 		select {
 		case m := <-valSub.Channel():
@@ -121,8 +124,9 @@ func main() {
 			default:
 				println("[value] led/0 (unknown payload)")
 			}
+			_ = m
 
-		case <-time.After(500 * time.Millisecond):
+		case <-t.C:
 			// Toggle the LED; control reply is immediate ok/busy. Actual level is observed via value subscription.
 			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tCtrlToggle, nil, false)); err != nil {
 				println("[main] toggle control error:", err.Error())

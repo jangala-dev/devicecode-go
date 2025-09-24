@@ -6,7 +6,7 @@ import (
 	"devicecode-go/types"
 )
 
-// ---- Bus taxonomy (reserved for future I²C/UART/etc.) ----
+// ---- Bus taxonomy ----
 
 type BusClass uint8
 
@@ -17,21 +17,33 @@ const (
 
 type ResourceID string // e.g. "i2c0", "uart0", "gpio25"
 
-// Transactional buses (serialised operations)
-type TxnOwner interface {
-	// Submit a transactional operation (to be defined when added).
-	// For now kept as a placeholder to preserve the shape.
+// ---- Transactional buses (serialised operations) ----
+
+// I2COwner exposes a single atomic transaction.
+// timeoutMS: 0 => provider default.
+type I2COwner interface {
+	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
 }
 
-// Stream buses (independent RX/TX)
+// ---- Stream buses (independent RX/TX) ----
+
 type StreamEvent struct {
 	DevID string
 	Data  []byte
 	TSms  int64
 }
+
+type StreamStats struct {
+	RxDrops uint32
+	TxDrops uint32
+	RxQLen  uint32
+	TxQLen  uint32
+}
+
 type StreamOwner interface {
-	// Submit/send non-blocking (to be defined when added).
-	// Placeholder for future UART/CAN owners.
+	TrySend(p []byte) bool      // non-blocking; false if queue full
+	Events() <-chan StreamEvent // RX (and optional TX echo)
+	Stats() StreamStats         // optional telemetry
 }
 
 // ---- GPIO handles ----
@@ -60,7 +72,7 @@ type Event struct {
 	Kind    types.Kind // capability kind (e.g. KindLED)
 	Payload any        // typed value payload (e.g. types.LEDValue)
 	TSms    int64      // ms timestamp
-	// Err when non-empty signals operation failure; HAL sets state:degraded and does not publish value.
+	// Err when non-empty signals failure; HAL sets state:degraded and does not publish value.
 	Err string // "timeout","io_error","unsupported","unknown_pin",...
 }
 
@@ -70,21 +82,29 @@ type ResourceRegistry interface {
 	// Optional classification/introspection.
 	ClassOf(id ResourceID) (BusClass, bool)
 
-	// Exclusive claims (release on Device.Close). Owners filled in later for I²C/UART.
-	ClaimTxn(devID string, id ResourceID, _ *struct{}) (TxnOwner, error)
-	ClaimStream(devID string, id ResourceID, _ *struct{}) (StreamOwner, error)
+	// Transactional buses
+	ClaimI2C(devID string, id ResourceID) (I2COwner, error)
+	ReleaseI2C(devID string, id ResourceID)
 
-	// GPIO (implemented on RP2040 provider).
-	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
-	ReleaseTxn(devID string, id ResourceID)
+	// Stream buses
+	ClaimStream(devID string, id ResourceID) (StreamOwner, error)
 	ReleaseStream(devID string, id ResourceID)
+
+	// GPIO
+	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
 	ReleaseGPIO(devID string, pin int)
+
+	// Provider-owned GPIO ops that also emit events
+	GPIOSet(devID string, pin int, level bool) (EnqueueResult, error)
+	GPIOToggle(devID string, pin int) (EnqueueResult, error)
+	GPIORead(devID string, pin int) (EnqueueResult, error)
 
 	// Owners push values/errors here; HAL consumes and publishes.
 	Events() <-chan Event
 }
 
 // Short error codes
+
 var (
 	ErrUnknownPin = errors.New("unknown_pin")
 	ErrPinInUse   = errors.New("pin_in_use")
