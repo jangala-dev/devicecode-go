@@ -126,7 +126,7 @@ func (g *gpioRegistry) ReleaseGPIO(devID string, n int) {
 	g.mu.Unlock()
 }
 
-// ---- GPIO owner operations (synchronous but emit events to HAL) ----
+// ---- GPIO owner operations (synchronous; emit events to HAL) ----
 
 func (g *gpioRegistry) publish(devID string, kind types.Kind, payload any) {
 	select {
@@ -135,9 +135,10 @@ func (g *gpioRegistry) publish(devID string, kind types.Kind, payload any) {
 		Kind:    kind,
 		Payload: payload,
 		TSms:    time.Now().UnixMilli(),
+		// IsEvent=false => HAL will publish retained .../value
 	}:
 	default:
-		// Drop under pressure to protect system; state remains last good.
+		// Drop under pressure to protect system; status remains last good.
 	}
 }
 

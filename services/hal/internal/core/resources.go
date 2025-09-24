@@ -65,15 +65,20 @@ type GPIOHandle interface {
 	Toggle()
 }
 
-// ---- Owner → HAL event (single shape) ----
+// ---- Owner → HAL telemetry (single shape) ----
+// By default, an Event represents a "value-like" update that HAL should
+// publish to .../value (retained). If IsEvent is true, HAL instead publishes
+// to .../event (non-retained). Err, when non-empty, causes HAL to publish
+// only .../status=degraded (retained).
 
 type Event struct {
-	DevID   string     // logical device id (e.g. "led0")
-	Kind    types.Kind // capability kind (e.g. KindLED)
-	Payload any        // typed value payload (e.g. types.LEDValue)
-	TSms    int64      // ms timestamp
-	// Err when non-empty signals failure; HAL sets state:degraded and does not publish value.
-	Err string // "timeout","io_error","unsupported","unknown_pin",...
+	DevID    string     // logical device id (e.g. "led0")
+	Kind     types.Kind // capability kind (e.g. KindLED)
+	Payload  any        // typed value payload (e.g. types.LEDValue)
+	TSms     int64      // ms timestamp
+	Err      string     // "timeout","io_error","unsupported","unknown_pin",...
+	IsEvent  bool       // true => publish to .../event (non-retained)
+	EventTag string     // optional subtopic tag for events (e.g. "rx","tx")
 }
 
 // ---- Unified registry interface ----

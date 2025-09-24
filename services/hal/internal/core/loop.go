@@ -77,7 +77,7 @@ APPLY:
 			h.handleControl(m) // strictly non-blocking
 
 		case ev := <-h.events:
-			h.handleEvent(ev) // publish value/state based on owner events
+			h.handleEvent(ev) // publish value/status or event/status
 		}
 	}
 }
@@ -110,7 +110,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		h.dev[dev.ID()] = dev
 		h.devCapID[dev.ID()] = map[string]int{}
 
-		// Register capabilities and publish retained info + initial state:down
+		// Register capabilities and publish retained info + initial status:down
 		for _, cs := range dev.Capabilities() {
 			k := string(cs.Kind)
 			id := h.nextID[k]
@@ -124,8 +124,9 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				types.Info{SchemaVersion: cs.Info.SchemaVersion, Driver: cs.Info.Driver, Detail: cs.Info.Detail},
 				true,
 			))
+			// Initial status (retained)
 			h.conn.Publish(h.conn.NewMessage(
-				capState(k, id),
+				capStatus(k, id),
 				types.CapabilityState{Link: types.LinkDown, TSms: nowMs()},
 				true,
 			))
@@ -179,20 +180,34 @@ func (h *HAL) handleEvent(ev Event) {
 	}
 
 	k := string(ev.Kind)
+
+	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
-		// Failure: retained state → degraded; do not publish a value.
 		h.conn.Publish(h.conn.NewMessage(
-			capState(k, id),
+			capStatus(k, id),
 			types.CapabilityState{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
 			true,
 		))
 		return
 	}
 
-	// Success: publish value + retained up state.
-	h.conn.Publish(h.conn.NewMessage(capValue(k, id), ev.Payload, false))
+	// 2) Success:
+	//    a) If marked as event => publish non-retained event (optionally tagged);
+	//       still update retained status:up.
+	//    b) Else => publish retained value and retained status:up.
+	if ev.IsEvent {
+		if ev.EventTag != "" {
+			h.conn.Publish(h.conn.NewMessage(capEventTagged(k, id, ev.EventTag), ev.Payload, false))
+		} else {
+			h.conn.Publish(h.conn.NewMessage(capEvent(k, id), ev.Payload, false))
+		}
+	} else {
+		h.conn.Publish(h.conn.NewMessage(capValue(k, id), ev.Payload, true)) // retained last-known good
+	}
+
+	// Retained status: up
 	h.conn.Publish(h.conn.NewMessage(
-		capState(k, id),
+		capStatus(k, id),
 		types.CapabilityState{Link: types.LinkUp, TSms: ev.TSms},
 		true,
 	))
