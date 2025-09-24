@@ -21,6 +21,10 @@ type ResourceID string // e.g. "i2c0", "uart0", "gpio25"
 
 // I2COwner exposes a single atomic transaction.
 // timeoutMS: 0 => provider default.
+//
+// The implementation serialises all hardware access behind a single worker
+// per bus. Callers may invoke Tx from their own goroutines; Tx itself blocks
+// until the transaction completes or times out.
 type I2COwner interface {
 	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
 }
@@ -79,6 +83,21 @@ type Event struct {
 	Err      string     // "timeout","io_error","unsupported","unknown_pin",...
 	IsEvent  bool       // true => publish to .../event (non-retained)
 	EventTag string     // optional subtopic tag for events (e.g. "rx","tx")
+}
+
+// ---- Event emission (devices → HAL via provider) ----
+
+type EventEmitter interface {
+	// Emit tries to enqueue an Event for HAL publication.
+	// It must be non-blocking; false indicates a drop under pressure.
+	Emit(ev Event) bool
+}
+
+// ---- HAL-injected resources ----
+
+type Resources struct {
+	Reg ResourceRegistry
+	Pub EventEmitter // devices use this to emit typed values/events
 }
 
 // ---- Unified registry interface ----

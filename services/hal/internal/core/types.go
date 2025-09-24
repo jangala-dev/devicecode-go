@@ -30,12 +30,6 @@ type Device interface {
 	Close() error
 }
 
-// ---- HAL-injected resources ----
-
-type Resources struct {
-	Reg ResourceRegistry
-}
-
 // Builder input and registration
 
 type BuilderInput struct {

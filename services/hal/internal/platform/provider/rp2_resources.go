@@ -8,14 +8,16 @@ import (
 
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/platform/boards"
+	"devicecode-go/services/hal/internal/platform/setups"
 	"devicecode-go/types"
 	"machine"
 )
 
-// Ensure the provider satisfies the registry contract at compile time.
-var _ core.ResourceRegistry = (*gpioRegistry)(nil)
+// Ensure the provider satisfies the contracts at compile time.
+var _ core.ResourceRegistry = (*rp2Registry)(nil)
+var _ core.EventEmitter = (*rp2Registry)(nil)
 
-// Concrete GPIO handle
+// ---- Concrete GPIO handle ----
 
 type rp2Pin struct {
 	p machine.Pin
@@ -51,86 +53,210 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// Unified resource registry (GPIO today; bus methods stubbed)
+// ---- I²C owner (one worker per bus, serialises hardware access) ----
 
-type gpioRegistry struct {
-	mu    sync.Mutex
-	used  map[int]string  // pin -> devID
-	cache map[int]*rp2Pin // pin -> handle
-
-	evCh chan core.Event // owner→HAL events
+type i2cJob struct {
+	addr      uint16
+	w, r      []byte
+	timeoutMS int
+	done      chan error
 }
 
-func NewResourceRegistry() core.ResourceRegistry {
-	return &gpioRegistry{
-		used:  make(map[int]string),
-		cache: make(map[int]*rp2Pin),
-		evCh:  make(chan core.Event, 64),
+type i2cOwner struct {
+	id    core.ResourceID
+	hw    *machine.I2C
+	jobs  chan i2cJob
+	quit  chan struct{}
+	defTO time.Duration
+}
+
+func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
+	o := &i2cOwner{
+		id:    id,
+		hw:    hw,
+		jobs:  make(chan i2cJob, 16),
+		quit:  make(chan struct{}),
+		defTO: 25 * time.Millisecond,
 	}
+	go o.loop()
+	return o
+}
+
+func (o *i2cOwner) loop() {
+	for {
+		select {
+		case j := <-o.jobs:
+			errCh := make(chan error, 1)
+			go func() {
+				err := o.hw.Tx(j.addr, j.w, j.r)
+				errCh <- err
+			}()
+			to := o.defTO
+			if j.timeoutMS > 0 {
+				to = time.Duration(j.timeoutMS) * time.Millisecond
+			}
+			var err error
+			select {
+			case err = <-errCh:
+			case <-time.After(to):
+				// surface as a generic timeout error to caller; devices publish final status
+				err = core.ErrUnknownBus
+			}
+			select {
+			case j.done <- err:
+			default:
+			}
+
+		case <-o.quit:
+			return
+		}
+	}
+}
+
+// Satisfy core.I2COwner: enqueue and wait for completion (caller’s goroutine).
+func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, timeoutMS int) error {
+	j := i2cJob{
+		addr:      addr,
+		w:         w,
+		r:         r,
+		timeoutMS: timeoutMS,
+		done:      make(chan error, 1),
+	}
+	select {
+	case o.jobs <- j:
+	default:
+		return core.ErrBusInUse // saturated
+	}
+	return <-j.done
+}
+
+// ---- Unified resource registry (GPIO + I²C owners) ----
+
+type rp2Registry struct {
+	mu sync.Mutex
+
+	// GPIO
+	usedGPIO map[int]string  // pin -> devID
+	gpio     map[int]*rp2Pin // pin -> handle
+
+	// I²C
+	i2cOwners map[core.ResourceID]*i2cOwner
+
+	// Telemetry sink for HAL
+	evCh chan core.Event
+}
+
+// Accept the selected plan here to break the provider<->platform cycle.
+func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
+	r := &rp2Registry{
+		usedGPIO:  make(map[int]string),
+		gpio:      make(map[int]*rp2Pin),
+		i2cOwners: make(map[core.ResourceID]*i2cOwner),
+		evCh:      make(chan core.Event, 64),
+	}
+
+	// Instantiate I²C owners from the provided plan (pins and frequency).
+	for _, p := range plan.I2C {
+		var hw *machine.I2C
+		switch p.ID {
+		case "i2c0":
+			hw = machine.I2C0
+		case "i2c1":
+			hw = machine.I2C1
+		default:
+			continue
+		}
+		// Configure pins & bus frequency.
+		sda := machine.Pin(p.SDA)
+		scl := machine.Pin(p.SCL)
+		sda.Configure(machine.PinConfig{Mode: machine.PinI2C})
+		scl.Configure(machine.PinConfig{Mode: machine.PinI2C})
+		hw.Configure(machine.I2CConfig{
+			SCL:       scl,
+			SDA:       sda,
+			Frequency: p.Hz,
+		})
+		r.i2cOwners[core.ResourceID(p.ID)] = newI2COwner(core.ResourceID(p.ID), hw)
+	}
+
+	return r
 }
 
 // ---- core.ResourceRegistry implementation ----
 
-func (g *gpioRegistry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
-	// No buses exposed yet on this provider.
+func (r *rp2Registry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
+	switch string(id) {
+	case "i2c0", "i2c1":
+		return core.BusTransactional, true
+	}
+	// No other buses exposed yet on this provider.
 	return 0, false
 }
 
-// Transactional buses (I²C) — stubs for now
-func (g *gpioRegistry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner, error) {
+// Transactional buses (I²C)
+func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o := r.i2cOwners[id]
+	if o == nil {
+		return nil, core.ErrUnknownBus
+	}
+	return o, nil
+}
+func (r *rp2Registry) ReleaseI2C(devID string, id core.ResourceID) {
+	// Nothing to do for now. Owners are long-lived per bus.
+}
+
+// Stream buses — still stubs
+func (r *rp2Registry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
 	return nil, core.ErrUnknownBus
 }
-func (g *gpioRegistry) ReleaseI2C(devID string, id core.ResourceID) {}
+func (r *rp2Registry) ReleaseStream(devID string, id core.ResourceID) {}
 
-// Stream buses — stubs for now
-func (g *gpioRegistry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
-	return nil, core.ErrUnknownBus
-}
-func (g *gpioRegistry) ReleaseStream(devID string, id core.ResourceID) {}
+// Event channel for HAL
+func (r *rp2Registry) Events() <-chan core.Event { return r.evCh }
 
-func (g *gpioRegistry) Events() <-chan core.Event { return g.evCh }
+// ---- GPIO lookup/claim ----
 
-// GPIO lookup/claim
-
-func (g *gpioRegistry) lookup(n int) (*rp2Pin, bool) {
+func (r *rp2Registry) lookupGPIO(n int) (*rp2Pin, bool) {
 	min, max := boards.SelectedBoard.GPIOMin, boards.SelectedBoard.GPIOMax
 	if n < min || n > max {
 		return nil, false
 	}
-	if p, ok := g.cache[n]; ok {
+	if p, ok := r.gpio[n]; ok {
 		return p, true
 	}
 	h := &rp2Pin{p: machine.Pin(n), n: n}
-	g.cache[n] = h
+	r.gpio[n] = h
 	return h, true
 }
 
-func (g *gpioRegistry) ClaimGPIO(devID string, n int) (core.GPIOHandle, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if _, ok := g.lookup(n); !ok {
+func (r *rp2Registry) ClaimGPIO(devID string, n int) (core.GPIOHandle, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.lookupGPIO(n); !ok {
 		return nil, core.ErrUnknownPin
 	}
-	if owner, inUse := g.used[n]; inUse && owner != "" {
+	if owner, inUse := r.usedGPIO[n]; inUse && owner != "" {
 		return nil, core.ErrPinInUse
 	}
-	g.used[n] = devID
-	return g.cache[n], nil
+	r.usedGPIO[n] = devID
+	return r.gpio[n], nil
 }
 
-func (g *gpioRegistry) ReleaseGPIO(devID string, n int) {
-	g.mu.Lock()
-	if owner, ok := g.used[n]; ok && owner == devID {
-		delete(g.used, n)
+func (r *rp2Registry) ReleaseGPIO(devID string, n int) {
+	r.mu.Lock()
+	if owner, ok := r.usedGPIO[n]; ok && owner == devID {
+		delete(r.usedGPIO, n)
 	}
-	g.mu.Unlock()
+	r.mu.Unlock()
 }
 
 // ---- GPIO owner operations (synchronous; emit events to HAL) ----
 
-func (g *gpioRegistry) publish(devID string, kind types.Kind, payload any) {
+func (r *rp2Registry) publish(devID string, kind types.Kind, payload any) {
 	select {
-	case g.evCh <- core.Event{
+	case r.evCh <- core.Event{
 		DevID:   devID,
 		Kind:    kind,
 		Payload: payload,
@@ -138,13 +264,12 @@ func (g *gpioRegistry) publish(devID string, kind types.Kind, payload any) {
 		// IsEvent=false => HAL will publish retained .../value
 	}:
 	default:
-		// Drop under pressure to protect system; status remains last good.
 	}
 }
 
-func (g *gpioRegistry) publishErr(devID string, kind types.Kind, code string) {
+func (r *rp2Registry) publishErr(devID string, kind types.Kind, code string) {
 	select {
-	case g.evCh <- core.Event{
+	case r.evCh <- core.Event{
 		DevID: devID,
 		Kind:  kind,
 		Err:   code,
@@ -154,12 +279,20 @@ func (g *gpioRegistry) publishErr(devID string, kind types.Kind, code string) {
 	}
 }
 
-// Expose small, non-blocking ops for devices to call (no extra goroutines).
+// Satisfy EventEmitter (devices can emit typed values directly).
+func (r *rp2Registry) Emit(ev core.Event) bool {
+	select {
+	case r.evCh <- ev:
+		return true
+	default:
+		return false
+	}
+}
 
-func (g *gpioRegistry) GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error) {
-	g.mu.Lock()
-	h, ok := g.cache[pin]
-	g.mu.Unlock()
+func (r *rp2Registry) GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error) {
+	r.mu.Lock()
+	h, ok := r.gpio[pin]
+	r.mu.Unlock()
 	if !ok {
 		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
 	}
@@ -168,14 +301,14 @@ func (g *gpioRegistry) GPIOSet(devID string, pin int, level bool) (core.EnqueueR
 	if level {
 		v = 1
 	}
-	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
 	return core.EnqueueResult{OK: true}, nil
 }
 
-func (g *gpioRegistry) GPIOToggle(devID string, pin int) (core.EnqueueResult, error) {
-	g.mu.Lock()
-	h, ok := g.cache[pin]
-	g.mu.Unlock()
+func (r *rp2Registry) GPIOToggle(devID string, pin int) (core.EnqueueResult, error) {
+	r.mu.Lock()
+	h, ok := r.gpio[pin]
+	r.mu.Unlock()
 	if !ok {
 		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
 	}
@@ -184,14 +317,14 @@ func (g *gpioRegistry) GPIOToggle(devID string, pin int) (core.EnqueueResult, er
 	if h.Get() {
 		v = 1
 	}
-	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
 	return core.EnqueueResult{OK: true}, nil
 }
 
-func (g *gpioRegistry) GPIORead(devID string, pin int) (core.EnqueueResult, error) {
-	g.mu.Lock()
-	h, ok := g.cache[pin]
-	g.mu.Unlock()
+func (r *rp2Registry) GPIORead(devID string, pin int) (core.EnqueueResult, error) {
+	r.mu.Lock()
+	h, ok := r.gpio[pin]
+	r.mu.Unlock()
 	if !ok {
 		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
 	}
@@ -199,6 +332,6 @@ func (g *gpioRegistry) GPIORead(devID string, pin int) (core.EnqueueResult, erro
 	if h.Get() {
 		v = 1
 	}
-	g.publish(devID, types.KindLED, types.LEDValue{Level: v})
+	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
 	return core.EnqueueResult{OK: true}, nil
 }

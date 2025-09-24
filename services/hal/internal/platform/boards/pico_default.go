@@ -3,7 +3,7 @@
 package boards
 
 import (
-	_ "devicecode-go/services/hal/devices/led" // keep device registration if you rely on it here
+	_ "devicecode-go/services/hal/devices/led" //
 )
 
 var SelectedBoard = Board{
