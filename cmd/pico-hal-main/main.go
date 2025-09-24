@@ -107,26 +107,18 @@ func main() {
 
 	println("[main] entering event loop (toggle every 500ms; print received values) …")
 
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
-
 	for {
 		select {
 		case m := <-valSub.Channel():
-			// Expect types.LEDValue on payload
-			switch v := m.Payload.(type) {
-			case types.LEDValue:
+			// Expect strictly typed types.LEDValue on payload
+			if v, ok := m.Payload.(types.LEDValue); ok {
 				print("[value] led/0 level=")
 				println(uint8(v.Level))
-			case map[string]any:
-				// Minimal fallback if routed via map (shouldn't happen with typed publishers)
-				println("[value] led/0 (map payload)")
-			default:
-				println("[value] led/0 (unknown payload)")
+			} else {
+				println("[value] led/0 (unexpected payload type)")
 			}
-			_ = m
 
-		case <-t.C:
+		case <-time.After(500 * time.Millisecond):
 			// Toggle the LED; control reply is immediate ok/busy. Actual level is observed via value subscription.
 			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tCtrlToggle, nil, false)); err != nil {
 				println("[main] toggle control error:", err.Error())

@@ -61,34 +61,22 @@ func (d *Device) Init(ctx context.Context) error {
 	return d.pin.ConfigureOutput(d.initial)
 }
 
-// Control is enqueue-only and immediate. Values are emitted via registry events.
+// services/hal/devices/led/builder.go
 func (d *Device) Control(kind types.Kind, method string, payload any) (core.EnqueueResult, error) {
 	if kind != types.KindLED {
 		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
 	switch method {
 	case "set":
-		var lvl bool
-		switch p := payload.(type) {
-		case types.LEDSet:
-			lvl = p.Level
-		case map[string]any:
-			b, ok := p["level"].(bool)
-			if !ok {
-				return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
-			}
-			lvl = b
-		default:
+		p, ok := payload.(types.LEDSet)
+		if !ok {
 			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 		}
-		return d.reg.GPIOSet(d.id, d.pinN, lvl)
-
+		return d.reg.GPIOSet(d.id, d.pinN, p.Level)
 	case "toggle":
 		return d.reg.GPIOToggle(d.id, d.pinN)
-
 	case "read":
 		return d.reg.GPIORead(d.id, d.pinN)
-
 	default:
 		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
