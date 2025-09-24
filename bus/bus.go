@@ -265,8 +265,25 @@ func (b *Bus) Publish(msg *Message) {
 	msgTopic := toConcrete(msg.Topic)
 
 	b.mu.Lock()
+	// collect into map to dedupe
 	var subs []*Subscription
+	// optional fast-path: reuse slice, then dedupe only if likely duplicates
 	b.collectSubscribersLocked(b.root, msgTopic, 0, &subs)
+
+	// Deduplicate
+	if len(subs) > 1 {
+		seen := make(map[*Subscription]struct{}, len(subs))
+		j := 0
+		for _, s := range subs {
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			subs[j] = s
+			j++
+		}
+		subs = subs[:j]
+	}
 
 	if msg.Retained {
 		if msg.Payload == nil {
