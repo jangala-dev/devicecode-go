@@ -2,7 +2,13 @@
 
 package setups
 
-import "devicecode-go/types"
+import (
+	_ "devicecode-go/services/hal/devices/aht20"
+	_ "devicecode-go/services/hal/devices/led"
+	_ "devicecode-go/services/hal/devices/shtc3"
+
+	"devicecode-go/types"
+)
 
 // SelectedPlan wires controllers to pins and sets operating parameters for this setup.
 var SelectedPlan = ResourcePlan{

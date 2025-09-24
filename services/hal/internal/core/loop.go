@@ -127,7 +127,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			// Initial status (retained)
 			h.conn.Publish(h.conn.NewMessage(
 				capStatus(k, id),
-				types.CapabilityState{Link: types.LinkDown, TSms: nowMs()},
+				types.CapabilityStatus{Link: types.LinkDown, TSms: nowMs()},
 				true,
 			))
 		}
@@ -185,7 +185,7 @@ func (h *HAL) handleEvent(ev Event) {
 	if ev.Err != "" {
 		h.conn.Publish(h.conn.NewMessage(
 			capStatus(k, id),
-			types.CapabilityState{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
+			types.CapabilityStatus{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
 			true,
 		))
 		return
@@ -208,7 +208,7 @@ func (h *HAL) handleEvent(ev Event) {
 	// Retained status: up
 	h.conn.Publish(h.conn.NewMessage(
 		capStatus(k, id),
-		types.CapabilityState{Link: types.LinkUp, TSms: ev.TSms},
+		types.CapabilityStatus{Link: types.LinkUp, TSms: ev.TSms},
 		true,
 	))
 }

@@ -14,7 +14,7 @@ const (
 	LinkDegraded = "degraded"
 )
 
-type CapabilityState struct {
+type CapabilityStatus struct {
 	Link  string `json:"link"`
 	TSms  int64  `json:"ts_ms"`
 	Error string `json:"error,omitempty"`

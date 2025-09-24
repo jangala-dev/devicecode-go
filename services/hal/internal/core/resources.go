@@ -135,4 +135,5 @@ var (
 
 	ErrUnknownBus = errors.New("unknown_bus")
 	ErrBusInUse   = errors.New("bus_in_use")
+	ErrTimeout    = errors.New("timeout")
 )

@@ -86,26 +86,13 @@ func (o *i2cOwner) loop() {
 	for {
 		select {
 		case j := <-o.jobs:
-			errCh := make(chan error, 1)
-			go func() {
-				err := o.hw.Tx(j.addr, j.w, j.r)
-				errCh <- err
-			}()
-			to := o.defTO
-			if j.timeoutMS > 0 {
-				to = time.Duration(j.timeoutMS) * time.Millisecond
-			}
-			var err error
-			select {
-			case err = <-errCh:
-			case <-time.After(to):
-				// surface as a generic timeout error to caller; devices publish final status
-				err = core.ErrUnknownBus
-			}
-			select {
-			case j.done <- err:
-			default:
-			}
+			// Perform the transaction synchronously; TinyGo's machine.I2C.Tx
+			// should return promptly on RP2040. This avoids spawning a goroutine
+			// per job and therefore avoids leaks under timeout pressure.
+			err := o.hw.Tx(j.addr, j.w, j.r)
+
+			// Always signal completion to the caller; do not use a non-blocking send.
+			j.done <- err
 
 		case <-o.quit:
 			return
