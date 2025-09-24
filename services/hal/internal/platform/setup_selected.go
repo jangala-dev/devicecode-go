@@ -7,4 +7,6 @@ import (
 	"devicecode-go/types"
 )
 
-func getSelectedOrEmpty() types.HALConfig { return setups.SelectedSetup }
+// Internal helpers used by setup.go to avoid duplicate public APIs.
+func getSelectedSetup() types.HALConfig    { return setups.SelectedSetup }
+func getSelectedPlan() setups.ResourcePlan { return setups.SelectedPlan }

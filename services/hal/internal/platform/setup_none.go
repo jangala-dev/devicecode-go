@@ -2,6 +2,10 @@
 
 package platform
 
-import "devicecode-go/types"
+import (
+	"devicecode-go/services/hal/internal/platform/setups"
+	"devicecode-go/types"
+)
 
-func getSelectedOrEmpty() types.HALConfig { return types.HALConfig{} }
+func getSelectedSetup() types.HALConfig    { return types.HALConfig{} }
+func getSelectedPlan() setups.ResourcePlan { return setups.ResourcePlan{} }

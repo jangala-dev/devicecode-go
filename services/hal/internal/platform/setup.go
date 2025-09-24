@@ -1,7 +1,10 @@
 package platform
 
-import "devicecode-go/types"
+import (
+	"devicecode-go/services/hal/internal/platform/setups"
+	"devicecode-go/types"
+)
 
-func GetInitialConfig() types.HALConfig {
-	return getSelectedOrEmpty()
-}
+// Public accessors used by hal.Run and the provider.
+func GetInitialConfig() types.HALConfig    { return getSelectedSetup() }
+func GetSelectedPlan() setups.ResourcePlan { return getSelectedPlan() }

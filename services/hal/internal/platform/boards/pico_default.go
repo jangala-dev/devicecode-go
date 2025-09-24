@@ -3,18 +3,26 @@
 package boards
 
 import (
-	_ "devicecode-go/services/hal/devices/led"
+	_ "devicecode-go/services/hal/devices/led" // keep device registration if you rely on it here
 )
 
-type Board struct {
-	Name             string
-	OnboardLED       int
-	GPIOMin, GPIOMax int
-}
-
 var SelectedBoard = Board{
-	Name:       "raspberrypi_pico",
-	OnboardLED: 25,
-	GPIOMin:    0,
-	GPIOMax:    28,
+	Name:    "raspberrypi_pico",
+	GPIOMin: 0,
+	GPIOMax: 28,
+	I2C:     []string{"i2c0", "i2c1"},
+	SPI:     nil, // add when you expose SPI owners
+	UART:    []string{"uart0", "uart1"},
+	Defaults: struct {
+		I2C0_SDA, I2C0_SCL int
+		I2C1_SDA, I2C1_SCL int
+		UART0_TX, UART0_RX int
+		UART1_TX, UART1_RX int
+	}{
+		// RP2040 default pins (GPIO numbers)
+		I2C0_SDA: 4, I2C0_SCL: 5,
+		I2C1_SDA: 2, I2C1_SCL: 3,
+		UART0_TX: 0, UART0_RX: 1,
+		UART1_TX: 4, UART1_RX: 5,
+	},
 }
