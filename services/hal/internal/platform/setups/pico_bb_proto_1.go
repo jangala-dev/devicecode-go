@@ -3,9 +3,8 @@
 package setups
 
 import (
-	_ "devicecode-go/services/hal/devices/aht20"
+	aht20dev "devicecode-go/services/hal/devices/aht20"
 	_ "devicecode-go/services/hal/devices/led"
-	_ "devicecode-go/services/hal/devices/shtc3"
 
 	"devicecode-go/types"
 )
@@ -14,12 +13,12 @@ import (
 var SelectedPlan = ResourcePlan{
 	I2C: []I2CPlan{
 		{ID: "i2c0", SDA: 4, SCL: 5, Hz: 400_000},
-		{ID: "i2c1", SDA: 2, SCL: 3, Hz: 400_000},
+		// {ID: "i2c1", SDA: 2, SCL: 3, Hz: 400_000},
 	},
-	UART: []UARTPlan{
-		{ID: "uart0", TX: 0, RX: 1, Baud: 115200},
-		// add more as needed
-	},
+	// UART: []UARTPlan{
+	// 	{ID: "uart0", TX: 0, RX: 1, Baud: 115200},
+	// 	// add more as needed
+	// },
 }
 
 // SelectedSetup lists logical devices for HAL to instantiate on boot.
@@ -36,6 +35,9 @@ var SelectedSetup = types.HALConfig{
 
 		// On-board LED
 		{ID: "led0", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
+
+		// Environmental sensor on i2c0 (AHT20 at default address 0x38)
+		{ID: "sht0", Type: "shtc3", Params: aht20dev.Params{Bus: "i2c0"}},
 
 		// Future (when providers/devices are present):
 		// {ID:"ltc0",    Type:"ltc4015", Params: {..., Bus:"i2c1", Addr:0x67, SMBAlert:20}},
