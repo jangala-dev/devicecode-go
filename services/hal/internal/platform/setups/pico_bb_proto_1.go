@@ -37,7 +37,7 @@ var SelectedSetup = types.HALConfig{
 		{ID: "led0", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
 
 		// Environmental sensor on i2c0 (AHT20 at default address 0x38)
-		{ID: "sht0", Type: "shtc3", Params: aht20dev.Params{Bus: "i2c0"}},
+		{ID: "aht0", Type: "aht20", Params: aht20dev.Params{Bus: "i2c0"}},
 
 		// Future (when providers/devices are present):
 		// {ID:"ltc0",    Type:"ltc4015", Params: {..., Bus:"i2c1", Addr:0x67, SMBAlert:20}},
