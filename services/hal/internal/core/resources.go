@@ -2,8 +2,6 @@ package core
 
 import (
 	"errors"
-
-	"devicecode-go/types"
 )
 
 // ---- Bus taxonomy ----
@@ -69,23 +67,22 @@ type GPIOHandle interface {
 	Toggle()
 }
 
-// ---- Owner → HAL telemetry (single shape) ----
-// By default, an Event represents a "value-like" update that HAL should
-// publish to .../value (retained). If IsEvent is true, HAL instead publishes
-// to .../event (non-retained). Err, when non-empty, causes HAL to publish
-// only .../status=degraded (retained).
+// ---- Device → HAL telemetry (single shape) ----
+// By default, an Event represents a "value-like" update for a capability that
+// HAL should publish to .../value (retained). If IsEvent is true, HAL instead
+// publishes to .../event (non-retained). Err, when non-empty, causes HAL to
+// publish only .../status=degraded (retained).
 
 type Event struct {
-	DevID    string     // logical device id (e.g. "led0")
-	Kind     types.Kind // capability kind (e.g. KindLED)
-	Payload  any        // typed value payload (e.g. types.LEDValue)
-	TSms     int64      // ms timestamp
-	Err      string     // "timeout","io_error","unsupported","unknown_pin",...
-	IsEvent  bool       // true => publish to .../event (non-retained)
-	EventTag string     // optional subtopic tag for events (e.g. "rx","tx")
+	CapID    CapID  // target capability identity (assigned by HAL)
+	Payload  any    // typed value payload (e.g. types.LEDValue)
+	TSms     int64  // ms timestamp
+	Err      string // "timeout","io_error","unsupported","unknown_pin",...
+	IsEvent  bool   // true => publish to .../event (non-retained)
+	EventTag string // optional subtopic tag for events (e.g. "rx","tx")
 }
 
-// ---- Event emission (devices → HAL via provider) ----
+// ---- Event emission (devices → HAL) ----
 
 type EventEmitter interface {
 	// Emit tries to enqueue an Event for HAL publication.
@@ -97,7 +94,7 @@ type EventEmitter interface {
 
 type Resources struct {
 	Reg ResourceRegistry
-	Pub EventEmitter // devices use this to emit typed values/events
+	Pub EventEmitter // provided by HAL; devices use it to emit values/events
 }
 
 // ---- Unified registry interface ----
@@ -117,14 +114,6 @@ type ResourceRegistry interface {
 	// GPIO
 	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
 	ReleaseGPIO(devID string, pin int)
-
-	// Provider-owned GPIO ops that also emit events
-	GPIOSet(devID string, pin int, level bool) (EnqueueResult, error)
-	GPIOToggle(devID string, pin int) (EnqueueResult, error)
-	GPIORead(devID string, pin int) (EnqueueResult, error)
-
-	// Owners push values/errors here; HAL consumes and publishes.
-	Events() <-chan Event
 }
 
 // Short error codes

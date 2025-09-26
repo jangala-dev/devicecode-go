@@ -17,37 +17,47 @@ type capKey struct {
 type capMeta struct {
 	domain string
 	name   string
+	kind   string
 }
 
 type HAL struct {
 	conn *bus.Connection
 	res  Resources
 
-	// Routing maps
-	capToDev map[capKey]string             // (domain,kind,name) -> devID
-	dev      map[string]Device             // devID -> device
-	devCap   map[string]map[string]capMeta // devID -> kind -> {domain,name}
+	// Device registry
+	dev map[string]Device // devID -> device
+
+	// Capability indices
+	capIndex    map[capKey]CapID // (domain,kind,name) -> CapID
+	capOwner    map[CapID]string // CapID -> devID
+	capMetaByID map[CapID]capMeta
+	nextCapID   CapID
 
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
 
-	events <-chan Event // owner → HAL events
+	// Device → HAL events
+	evCh chan Event
 }
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
-	return &HAL{
-		conn:     conn,
-		res:      res,
-		capToDev: map[capKey]string{},
-		dev:      map[string]Device{},
-		devCap:   map[string]map[string]capMeta{},
+	h := &HAL{
+		conn:        conn,
+		res:         res,
+		dev:         map[string]Device{},
+		capIndex:    map[capKey]CapID{},
+		capOwner:    map[CapID]string{},
+		capMetaByID: map[CapID]capMeta{},
+		evCh:        make(chan Event, 128),
 	}
+	// HAL provides the emitter to devices.
+	h.res.Pub = h
+	return h
 }
 
 func (h *HAL) Run(ctx context.Context) {
 	h.cfgSub = h.conn.Subscribe(topicConfigHAL())
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
-	h.events = h.res.Reg.Events()
 
 	defer h.conn.Unsubscribe(h.cfgSub)
 	defer h.conn.Unsubscribe(h.ctrlSub)
@@ -81,7 +91,7 @@ APPLY:
 		case m := <-h.ctrlSub.Channel():
 			h.handleControl(m) // strictly non-blocking
 
-		case ev := <-h.events:
+		case ev := <-h.evCh:
 			h.handleEvent(ev) // publish value/status or event/status
 		}
 	}
@@ -113,10 +123,11 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			continue
 		}
 		h.dev[dev.ID()] = dev
-		h.devCap[dev.ID()] = map[string]capMeta{}
 
-		// Register capabilities and publish retained info + initial status:down
-		for _, cs := range dev.Capabilities() {
+		// Register capabilities, assign CapIDs, and publish retained info + initial status:down
+		caps := dev.Capabilities()
+		ids := make([]CapID, len(caps))
+		for i, cs := range caps {
 			k := string(cs.Kind)
 			domain := cs.Domain
 			if domain == "" {
@@ -127,8 +138,13 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				name = dev.ID()
 			}
 
-			h.capToDev[capKey{domain: domain, kind: k, name: name}] = dev.ID()
-			h.devCap[dev.ID()][k] = capMeta{domain: domain, name: name}
+			id := h.nextCapID
+			h.nextCapID++
+
+			h.capIndex[capKey{domain: domain, kind: k, name: name}] = id
+			h.capOwner[id] = dev.ID()
+			h.capMetaByID[id] = capMeta{domain: domain, name: name, kind: k}
+			ids[i] = id
 
 			h.conn.Publish(h.conn.NewMessage(
 				capInfo(domain, k, name),
@@ -142,6 +158,8 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 				true,
 			))
 		}
+		// Hand CapIDs back to device.
+		dev.BindCapabilities(ids)
 	}
 }
 
@@ -155,19 +173,20 @@ func (h *HAL) handleControl(msg *bus.Message) {
 	name, _ := msg.Topic.At(4).(string)
 	verb, _ := msg.Topic.At(6).(string)
 
-	devID, ok := h.capToDev[capKey{domain: domain, kind: kind, name: name}]
+	id, ok := h.capIndex[capKey{domain: domain, kind: kind, name: name}]
 	if !ok {
 		h.replyErr(msg, "unknown_capability")
 		return
 	}
-	dev := h.dev[devID]
+	ownerID := h.capOwner[id]
+	dev := h.dev[ownerID]
 	if dev == nil {
 		h.replyErr(msg, "no_device")
 		return
 	}
 
 	// Device.Control is non-blocking and returns enqueue outcome only.
-	res, err := dev.Control(types.Kind(kind), verb, msg.Payload)
+	res, err := dev.Control(id, verb, msg.Payload)
 	if err != nil {
 		h.replyErr(msg, err.Error())
 		return
@@ -182,18 +201,13 @@ func (h *HAL) handleControl(msg *bus.Message) {
 }
 
 func (h *HAL) handleEvent(ev Event) {
-	// Map (kind, devID) → {domain,name}
-	devCaps, ok := h.devCap[ev.DevID]
-	if !ok {
-		return
-	}
-	meta, ok := devCaps[string(ev.Kind)]
+	meta, ok := h.capMetaByID[ev.CapID]
 	if !ok {
 		return
 	}
 
 	domain := meta.domain
-	k := string(ev.Kind)
+	k := meta.kind
 	name := meta.name
 
 	// 1) Error → retained status:degraded; no value/event published.
@@ -267,5 +281,16 @@ func defaultDomainFor(kind string) string {
 		return "power"
 	default:
 		return "io"
+	}
+}
+
+// ---- HAL as EventEmitter ----
+
+func (h *HAL) Emit(ev Event) bool {
+	select {
+	case h.evCh <- ev:
+		return true
+	default:
+		return false
 	}
 }

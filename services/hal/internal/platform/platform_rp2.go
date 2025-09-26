@@ -12,6 +12,5 @@ func GetResources() core.Resources {
 	reg := provider.NewResourceRegistry(plan) // pass plan into provider; no platform import in provider
 	return core.Resources{
 		Reg: reg,
-		Pub: reg, // registry implements core.EventEmitter
 	}
 }

@@ -3,6 +3,7 @@ package led
 import (
 	"context"
 	"errors"
+	"time"
 
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
@@ -31,7 +32,8 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	}
 	return &Device{
 		id: in.ID, pin: h, pinN: p.Pin,
-		reg:     in.Res.Reg, // depend only on the stable registry
+		reg:     in.Res.Reg, // stable registry
+		pub:     in.Res.Pub, // HAL emitter
 		initial: p.Initial,
 	}, nil
 }
@@ -42,6 +44,8 @@ type Device struct {
 	pinN    int
 	reg     core.ResourceRegistry
 	initial bool
+	pub     core.EventEmitter
+	capID   core.CapID
 }
 
 func (d *Device) ID() string { return d.id }
@@ -59,30 +63,52 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	}}
 }
 
+func (d *Device) BindCapabilities(ids []core.CapID) {
+	if len(ids) > 0 {
+		d.capID = ids[0]
+	}
+}
+
 func (d *Device) Init(ctx context.Context) error {
 	return d.pin.ConfigureOutput(d.initial)
 }
 
 // services/hal/devices/led/builder.go
-func (d *Device) Control(kind types.Kind, method string, payload any) (core.EnqueueResult, error) {
-	if kind != types.KindLED {
-		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
-	}
+func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "set":
 		p, ok := payload.(types.LEDSet)
 		if !ok {
 			return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
 		}
-		return d.reg.GPIOSet(d.id, d.pinN, p.Level)
+		d.pin.Set(p.Level)
+		d.emitValueNow()
+		return core.EnqueueResult{OK: true}, nil
 	case "toggle":
-		return d.reg.GPIOToggle(d.id, d.pinN)
+		d.pin.Toggle()
+		d.emitValueNow()
+		return core.EnqueueResult{OK: true}, nil
 	case "read":
-		return d.reg.GPIORead(d.id, d.pinN)
+		d.emitValueNow()
+		return core.EnqueueResult{OK: true}, nil
 	default:
 		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
 }
+
+func (d *Device) emitValueNow() {
+	var v uint8
+	if d.pin.Get() {
+		v = 1
+	}
+	_ = d.pub.Emit(core.Event{
+		CapID:   d.capID,
+		Payload: types.LEDValue{Level: v},
+		TSms:    timeNowMs(),
+	})
+}
+
+func timeNowMs() int64 { return time.Now().UnixMilli() }
 
 func (d *Device) Close() error {
 	// Optionally release on reconfig when implemented:

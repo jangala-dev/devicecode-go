@@ -9,13 +9,11 @@ import (
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/platform/boards"
 	"devicecode-go/services/hal/internal/platform/setups"
-	"devicecode-go/types"
 	"machine"
 )
 
 // Ensure the provider satisfies the contracts at compile time.
 var _ core.ResourceRegistry = (*rp2Registry)(nil)
-var _ core.EventEmitter = (*rp2Registry)(nil)
 
 // ---- Concrete GPIO handle ----
 
@@ -117,7 +115,7 @@ func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, timeoutMS int) error {
 	return <-j.done
 }
 
-// ---- Unified resource registry (GPIO + I²C owners) ----
+// ---- Unified resource registry (GPIO + I2C owners) ----
 
 type rp2Registry struct {
 	mu sync.Mutex
@@ -128,9 +126,6 @@ type rp2Registry struct {
 
 	// I²C
 	i2cOwners map[core.ResourceID]*i2cOwner
-
-	// Telemetry sink for HAL
-	evCh chan core.Event
 }
 
 // Accept the selected plan here to break the provider<->platform cycle.
@@ -139,7 +134,6 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 		usedGPIO:  make(map[int]string),
 		gpio:      make(map[int]*rp2Pin),
 		i2cOwners: make(map[core.ResourceID]*i2cOwner),
-		evCh:      make(chan core.Event, 64),
 	}
 
 	// Instantiate I²C owners from the provided plan (pins and frequency).
@@ -200,9 +194,6 @@ func (r *rp2Registry) ClaimStream(devID string, id core.ResourceID) (core.Stream
 }
 func (r *rp2Registry) ReleaseStream(devID string, id core.ResourceID) {}
 
-// Event channel for HAL
-func (r *rp2Registry) Events() <-chan core.Event { return r.evCh }
-
 // ---- GPIO lookup/claim ----
 
 func (r *rp2Registry) lookupGPIO(n int) (*rp2Pin, bool) {
@@ -237,88 +228,4 @@ func (r *rp2Registry) ReleaseGPIO(devID string, n int) {
 		delete(r.usedGPIO, n)
 	}
 	r.mu.Unlock()
-}
-
-// ---- GPIO owner operations (synchronous; emit events to HAL) ----
-
-func (r *rp2Registry) publish(devID string, kind types.Kind, payload any) {
-	select {
-	case r.evCh <- core.Event{
-		DevID:   devID,
-		Kind:    kind,
-		Payload: payload,
-		TSms:    time.Now().UnixMilli(),
-		// IsEvent=false => HAL will publish retained .../value
-	}:
-	default:
-	}
-}
-
-func (r *rp2Registry) publishErr(devID string, kind types.Kind, code string) {
-	select {
-	case r.evCh <- core.Event{
-		DevID: devID,
-		Kind:  kind,
-		Err:   code,
-		TSms:  time.Now().UnixMilli(),
-	}:
-	default:
-	}
-}
-
-// Satisfy EventEmitter (devices can emit typed values directly).
-func (r *rp2Registry) Emit(ev core.Event) bool {
-	select {
-	case r.evCh <- ev:
-		return true
-	default:
-		return false
-	}
-}
-
-func (r *rp2Registry) GPIOSet(devID string, pin int, level bool) (core.EnqueueResult, error) {
-	r.mu.Lock()
-	h, ok := r.gpio[pin]
-	r.mu.Unlock()
-	if !ok {
-		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
-	}
-	h.Set(level)
-	var v uint8
-	if level {
-		v = 1
-	}
-	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
-	return core.EnqueueResult{OK: true}, nil
-}
-
-func (r *rp2Registry) GPIOToggle(devID string, pin int) (core.EnqueueResult, error) {
-	r.mu.Lock()
-	h, ok := r.gpio[pin]
-	r.mu.Unlock()
-	if !ok {
-		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
-	}
-	h.Toggle()
-	var v uint8
-	if h.Get() {
-		v = 1
-	}
-	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
-	return core.EnqueueResult{OK: true}, nil
-}
-
-func (r *rp2Registry) GPIORead(devID string, pin int) (core.EnqueueResult, error) {
-	r.mu.Lock()
-	h, ok := r.gpio[pin]
-	r.mu.Unlock()
-	if !ok {
-		return core.EnqueueResult{OK: false, Error: "unknown_pin"}, nil
-	}
-	var v uint8
-	if h.Get() {
-		v = 1
-	}
-	r.publish(devID, types.KindLED, types.LEDValue{Level: v})
-	return core.EnqueueResult{OK: true}, nil
 }

@@ -6,6 +6,13 @@ import (
 	"devicecode-go/types"
 )
 
+// ---- Identity ---
+
+// CapID is a compact, system-unique identifier for a single capability.
+// It is assigned by the HAL when applying configuration and remains stable
+// for the lifetime of that configuration.
+type CapID uint32
+
 // ---- Capability & device model ----
 
 type CapabilitySpec struct {
@@ -24,13 +31,17 @@ type EnqueueResult struct {
 	Error string // "busy","unsupported","invalid_payload","unknown_pin",...
 }
 
-// Device is device-centric: all controls are non-blocking and enqueue work
-// at the relevant owner(s). Values are delivered later via owner events.
+// Device is device-centric: all controls are non-blocking and enqueue work.
+// Values/events are emitted later by the device itself via the HAL emitter.
 type Device interface {
 	ID() string
 	Capabilities() []CapabilitySpec
+	// BindCapabilities is called exactly once after HAL assigns CapIDs.
+	// The slice aligns positionally with Capabilities().
+	BindCapabilities(ids []CapID)
+
 	Init(ctx context.Context) error
-	Control(kind types.Kind, method string, payload any) (EnqueueResult, error)
+	Control(cap CapID, method string, payload any) (EnqueueResult, error)
 	Close() error
 }
 

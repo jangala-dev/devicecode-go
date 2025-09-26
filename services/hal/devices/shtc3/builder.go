@@ -51,8 +51,10 @@ type Device struct {
 	drv shtc3.Device
 	pub core.EventEmitter
 
-	q    chan string
-	stop chan struct{}
+	q       chan string
+	stop    chan struct{}
+	capTemp core.CapID
+	capHum  core.CapID
 }
 
 func (d *Device) ID() string { return d.id }
@@ -82,6 +84,16 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	}
 }
 
+func (d *Device) BindCapabilities(ids []core.CapID) {
+	// Expect exactly 2: [temperature, humidity] in Capabilities() order.
+	if len(ids) >= 1 {
+		d.capTemp = ids[0]
+	}
+	if len(ids) >= 2 {
+		d.capHum = ids[1]
+	}
+}
+
 func (d *Device) Init(ctx context.Context) error {
 	d.stop = make(chan struct{})
 	_ = d.drv.WakeUp()
@@ -95,7 +107,7 @@ func (d *Device) Close() error {
 	return nil
 }
 
-func (d *Device) Control(kind types.Kind, method string, payload any) (core.EnqueueResult, error) {
+func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
 		select {
@@ -143,14 +155,12 @@ func (d *Device) handleRead() {
 	}
 	ts := time.Now().UnixMilli()
 	d.pub.Emit(core.Event{
-		DevID:   d.id,
-		Kind:    types.KindTemperature,
+		CapID:   d.capTemp,
 		Payload: types.TemperatureValue{DeciC: int16(decic)},
 		TSms:    ts,
 	})
 	d.pub.Emit(core.Event{
-		DevID:   d.id,
-		Kind:    types.KindHumidity,
+		CapID:   d.capHum,
 		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
 		TSms:    ts,
 	})
@@ -158,14 +168,12 @@ func (d *Device) handleRead() {
 
 func (d *Device) emitErr(code string, t0 int64) {
 	d.pub.Emit(core.Event{
-		DevID: d.id,
-		Kind:  types.KindTemperature,
+		CapID: d.capTemp,
 		Err:   code,
 		TSms:  t0,
 	})
 	d.pub.Emit(core.Event{
-		DevID: d.id,
-		Kind:  types.KindHumidity,
+		CapID: d.capHum,
 		Err:   code,
 		TSms:  t0,
 	})
