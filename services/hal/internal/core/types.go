@@ -9,7 +9,11 @@ import (
 // ---- Capability & device model ----
 
 type CapabilitySpec struct {
-	Kind  types.Kind
+	// Public addressing
+	Domain string     // eg. "io","power","env"; if empty, HAL will infer a default
+	Kind   types.Kind // capability kind (eg. KindLED, KindTemperature)
+	Name   string     // logical instance name (role/location); if empty, HAL uses device ID
+
 	Info  types.Info
 	TTLms int // reserved for cache; 0 = none
 }

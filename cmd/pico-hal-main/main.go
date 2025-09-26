@@ -124,15 +124,16 @@ func main() {
 	time.Sleep(250 * time.Millisecond)
 
 	// ---------- LED topics/subscriptions ----------
+	// Using hal/cap/<domain>/<kind>/<name>/...
 	ledKind := string(types.KindLED)
-	tLEDValue := bus.T("hal", "capability", ledKind, 0, "value")
-	tLEDCtrlRead := bus.T("hal", "capability", ledKind, 0, "control", "read")
-	tLEDCtrlToggle := bus.T("hal", "capability", ledKind, 0, "control", "toggle")
+	tLEDValue := bus.T("hal", "cap", "io", ledKind, "onboard", "value")
+	tLEDCtrlRead := bus.T("hal", "cap", "io", ledKind, "onboard", "control", "read")
+	tLEDCtrlToggle := bus.T("hal", "cap", "io", ledKind, "onboard", "control", "toggle")
 
-	println("[main] subscribing to led/0 value …")
+	println("[main] subscribing to io/led/onboard value …")
 	ledSub := uiConn.Subscribe(tLEDValue)
 
-	println("[main] requesting initial read of led/0 …")
+	println("[main] requesting initial read of io/led/onboard …")
 	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tLEDCtrlRead, nil, false)); err != nil {
 		println("[main] read control request error:", err.Error())
 	} else {
@@ -140,21 +141,20 @@ func main() {
 	}
 
 	// ---------- SHTC3 topics/subscriptions ----------
-	// Assumes exactly one temperature & humidity capability each (id 0),
-	// as per pico_rich_dev setup with a single SHTC3 on i2c0.
+	// Addresses chosen in pico_rich_dev: name "core" for both temperature and humidity.
 	tempKind := string(types.KindTemperature)
 	humidKind := string(types.KindHumidity)
 
-	tTempValue := bus.T("hal", "capability", tempKind, 0, "value")
-	tHumidValue := bus.T("hal", "capability", humidKind, 0, "value")
-	tTempCtrlRead := bus.T("hal", "capability", tempKind, 0, "control", "read")
+	tTempValue := bus.T("hal", "cap", "env", tempKind, "core", "value")
+	tHumidValue := bus.T("hal", "cap", "env", humidKind, "core", "value")
+	tTempCtrlRead := bus.T("hal", "cap", "env", tempKind, "core", "control", "read")
 
-	println("[main] subscribing to temp/0 and humid/0 values …")
+	println("[main] subscribing to env/temperature/core and env/humidity/core values …")
 	tempSub := uiConn.Subscribe(tTempValue)
 	humidSub := uiConn.Subscribe(tHumidValue)
 
 	// Kick-off: request an initial sensor read (publishes both temp & humid values)
-	println("[main] requesting initial read of temp/0 (shtc3) …")
+	println("[main] requesting initial read of env/temperature/core …")
 	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tTempCtrlRead, nil, false)); err != nil {
 		println("[main] temp read control request error:", err.Error())
 	} else {
@@ -174,24 +174,24 @@ func main() {
 		case m := <-ledSub.Channel():
 			// Expect strictly typed types.LEDValue on payload
 			if v, ok := m.Payload.(types.LEDValue); ok {
-				print("[value] led/0 level=")
+				print("[value] io/led/onboard level=")
 				println(uint8(v.Level))
 			} else {
-				println("[value] led/0 (unexpected payload type)")
+				println("[value] io/led/onboard (unexpected payload type)")
 			}
 
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
-				printDeci("[value] temp/0 °C=", int(v.DeciC))
+				printDeci("[value] env/temperature/core °C=", int(v.DeciC))
 			} else {
-				println("[value] temp/0 (unexpected payload type)")
+				println("[value] env/temperature/core (unexpected payload type)")
 			}
 
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
-				printHundredths("[value] humid/0 %RH=", int(v.RHx100))
+				printHundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 			} else {
-				println("[value] humid/0 (unexpected payload type)")
+				println("[value] env/humidity/core (unexpected payload type)")
 			}
 
 		case <-ledTicker.C:

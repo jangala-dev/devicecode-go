@@ -60,7 +60,9 @@ func (d *Device) ID() string { return d.id }
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{
 		{
-			Kind: types.KindTemperature,
+			Domain: "env",
+			Kind:   types.KindTemperature,
+			Name:   d.id,
 			Info: types.Info{
 				SchemaVersion: 1,
 				Driver:        "shtc3",
@@ -68,7 +70,9 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			},
 		},
 		{
-			Kind: types.KindHumidity,
+			Domain: "env",
+			Kind:   types.KindHumidity,
+			Name:   d.id,
 			Info: types.Info{
 				SchemaVersion: 1,
 				Driver:        "shtc3",

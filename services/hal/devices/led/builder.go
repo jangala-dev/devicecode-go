@@ -48,7 +48,9 @@ func (d *Device) ID() string { return d.id }
 
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{{
-		Kind: types.KindLED,
+		Domain: "io",
+		Kind:   types.KindLED,
+		Name:   d.id, // keep simple; you may later allow an override in params
 		Info: types.Info{
 			SchemaVersion: 1,
 			Driver:        "gpio_led",

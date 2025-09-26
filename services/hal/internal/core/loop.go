@@ -9,18 +9,24 @@ import (
 )
 
 type capKey struct {
-	kind string
-	id   int
+	domain string
+	kind   string
+	name   string
+}
+
+type capMeta struct {
+	domain string
+	name   string
 }
 
 type HAL struct {
 	conn *bus.Connection
 	res  Resources
 
-	nextID   map[string]int            // next numeric id per kind
-	capToDev map[capKey]string         // (kind,id) -> devID
-	dev      map[string]Device         // devID -> device
-	devCapID map[string]map[string]int // devID -> kind -> id
+	// Routing maps
+	capToDev map[capKey]string             // (domain,kind,name) -> devID
+	dev      map[string]Device             // devID -> device
+	devCap   map[string]map[string]capMeta // devID -> kind -> {domain,name}
 
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
@@ -32,10 +38,9 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 	return &HAL{
 		conn:     conn,
 		res:      res,
-		nextID:   map[string]int{},
 		capToDev: map[capKey]string{},
 		dev:      map[string]Device{},
-		devCapID: map[string]map[string]int{},
+		devCap:   map[string]map[string]capMeta{},
 	}
 }
 
@@ -84,49 +89,55 @@ APPLY:
 
 func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 	for i := range cfg.Devices {
-		d := cfg.Devices[i]
-		if _, exists := h.dev[d.ID]; exists {
+		dc := cfg.Devices[i]
+		if _, exists := h.dev[dc.ID]; exists {
 			continue
 		}
-		b, ok := lookupBuilder(d.Type)
+		b, ok := lookupBuilder(dc.Type)
 		if !ok {
-			println("[hal] no builder for type:", d.Type, "id:", d.ID)
+			println("[hal] no builder for type:", dc.Type, "id:", dc.ID)
 			continue
 		}
 		dev, err := b.Build(ctx, BuilderInput{
-			ID:     d.ID,
-			Type:   d.Type,
-			Params: d.Params,
+			ID:     dc.ID,
+			Type:   dc.Type,
+			Params: dc.Params,
 			Res:    h.res,
 		})
 		if err != nil {
-			println("[hal] build failed for:", d.ID, "err:", err.Error())
+			println("[hal] build failed for:", dc.ID, "err:", err.Error())
 			continue
 		}
 		if err := dev.Init(ctx); err != nil {
-			println("[hal] init failed for:", d.ID)
+			println("[hal] init failed for:", dc.ID)
 			continue
 		}
 		h.dev[dev.ID()] = dev
-		h.devCapID[dev.ID()] = map[string]int{}
+		h.devCap[dev.ID()] = map[string]capMeta{}
 
 		// Register capabilities and publish retained info + initial status:down
 		for _, cs := range dev.Capabilities() {
 			k := string(cs.Kind)
-			id := h.nextID[k]
-			h.nextID[k]++
+			domain := cs.Domain
+			if domain == "" {
+				domain = defaultDomainFor(string(cs.Kind))
+			}
+			name := cs.Name
+			if name == "" {
+				name = dev.ID()
+			}
 
-			h.capToDev[capKey{kind: k, id: id}] = dev.ID()
-			h.devCapID[dev.ID()][k] = id
+			h.capToDev[capKey{domain: domain, kind: k, name: name}] = dev.ID()
+			h.devCap[dev.ID()][k] = capMeta{domain: domain, name: name}
 
 			h.conn.Publish(h.conn.NewMessage(
-				capInfo(k, id),
+				capInfo(domain, k, name),
 				types.Info{SchemaVersion: cs.Info.SchemaVersion, Driver: cs.Info.Driver, Detail: cs.Info.Detail},
 				true,
 			))
 			// Initial status (retained)
 			h.conn.Publish(h.conn.NewMessage(
-				capStatus(k, id),
+				capStatus(domain, k, name),
 				types.CapabilityStatus{Link: types.LinkDown, TSms: nowMs()},
 				true,
 			))
@@ -135,14 +146,16 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 }
 
 func (h *HAL) handleControl(msg *bus.Message) {
-	if msg.Topic.Len() < 6 {
+	// hal/cap/<domain>/<kind>/<name>/control/<verb>
+	if msg.Topic.Len() < 7 {
 		return
 	}
-	kind, _ := msg.Topic.At(2).(string)
-	idNum, _ := toInt(msg.Topic.At(3))
-	verb, _ := msg.Topic.At(5).(string)
+	domain, _ := msg.Topic.At(2).(string)
+	kind, _ := msg.Topic.At(3).(string)
+	name, _ := msg.Topic.At(4).(string)
+	verb, _ := msg.Topic.At(6).(string)
 
-	devID, ok := h.capToDev[capKey{kind: kind, id: idNum}]
+	devID, ok := h.capToDev[capKey{domain: domain, kind: kind, name: name}]
 	if !ok {
 		h.replyErr(msg, "unknown_capability")
 		return
@@ -169,22 +182,24 @@ func (h *HAL) handleControl(msg *bus.Message) {
 }
 
 func (h *HAL) handleEvent(ev Event) {
-	// Map (kind, devID) → numeric capability id.
-	devCaps, ok := h.devCapID[ev.DevID]
+	// Map (kind, devID) → {domain,name}
+	devCaps, ok := h.devCap[ev.DevID]
 	if !ok {
 		return
 	}
-	id, ok := devCaps[string(ev.Kind)]
+	meta, ok := devCaps[string(ev.Kind)]
 	if !ok {
 		return
 	}
 
+	domain := meta.domain
 	k := string(ev.Kind)
+	name := meta.name
 
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
 		h.conn.Publish(h.conn.NewMessage(
-			capStatus(k, id),
+			capStatus(domain, k, name),
 			types.CapabilityStatus{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
 			true,
 		))
@@ -197,17 +212,17 @@ func (h *HAL) handleEvent(ev Event) {
 	//    b) Else => publish retained value and retained status:up.
 	if ev.IsEvent {
 		if ev.EventTag != "" {
-			h.conn.Publish(h.conn.NewMessage(capEventTagged(k, id, ev.EventTag), ev.Payload, false))
+			h.conn.Publish(h.conn.NewMessage(capEventTagged(domain, k, name, ev.EventTag), ev.Payload, false))
 		} else {
-			h.conn.Publish(h.conn.NewMessage(capEvent(k, id), ev.Payload, false))
+			h.conn.Publish(h.conn.NewMessage(capEvent(domain, k, name), ev.Payload, false))
 		}
 	} else {
-		h.conn.Publish(h.conn.NewMessage(capValue(k, id), ev.Payload, true)) // retained last-known good
+		h.conn.Publish(h.conn.NewMessage(capValue(domain, k, name), ev.Payload, true)) // retained last-known good
 	}
 
 	// Retained status: up
 	h.conn.Publish(h.conn.NewMessage(
-		capStatus(k, id),
+		capStatus(domain, k, name),
 		types.CapabilityStatus{Link: types.LinkUp, TSms: ev.TSms},
 		true,
 	))
@@ -231,23 +246,6 @@ func (h *HAL) replyErr(msg *bus.Message, code string) {
 	h.conn.Reply(msg, types.ErrorReply{OK: false, Error: code}, false)
 }
 
-func toInt(v any) (int, bool) {
-	switch x := v.(type) {
-	case int:
-		return x, true
-	case int32:
-		return int(x), true
-	case int64:
-		return int(x), true
-	case float32:
-		return int(x), true
-	case float64:
-		return int(x), true
-	default:
-		return 0, false
-	}
-}
-
 func nowMs() int64 { return time.Now().UnixMilli() }
 
 func coalesce(s, d string) string {
@@ -255,4 +253,19 @@ func coalesce(s, d string) string {
 		return d
 	}
 	return s
+}
+
+// Default domain inference keeps devices simple if they don't set Domain explicitly.
+// It is string-based to avoid depending on specific enum constants in types.
+func defaultDomainFor(kind string) string {
+	switch kind {
+	case "temperature", "humidity":
+		return "env"
+	case "led", "pwm", "button":
+		return "io"
+	case "switch", "rail", "voltage", "current", "power":
+		return "power"
+	default:
+		return "io"
+	}
 }

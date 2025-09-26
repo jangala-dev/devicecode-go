@@ -16,10 +16,10 @@ var SelectedPlan = ResourcePlan{
 
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
-		// On-board LED
-		{ID: "led0", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
+		// On-board LED (name => public address hal/cap/io/led/onboard/…)
+		{ID: "onboard", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
 
-		// Environmental sensor on i2c0 (SHTC3 at fixed address 0x70)
-		{ID: "sht0", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0"}},
+		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
+		{ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0"}},
 	},
 }

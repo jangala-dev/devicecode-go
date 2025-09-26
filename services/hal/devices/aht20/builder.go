@@ -9,7 +9,6 @@ import (
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
 
-	// Adjust this path to where you store the AHT20 driver you pasted.
 	"devicecode-go/drivers/aht20"
 )
 
@@ -63,7 +62,9 @@ func (d *Device) ID() string { return d.id }
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{
 		{
-			Kind: types.KindTemperature,
+			Domain: "env",
+			Kind:   types.KindTemperature,
+			Name:   d.id,
 			Info: types.Info{
 				SchemaVersion: 1,
 				Driver:        "aht20",
@@ -71,7 +72,9 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			},
 		},
 		{
-			Kind: types.KindHumidity,
+			Domain: "env",
+			Kind:   types.KindHumidity,
+			Name:   d.id,
 			Info: types.Info{
 				SchemaVersion: 1,
 				Driver:        "aht20",
@@ -83,7 +86,6 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 func (d *Device) Init(ctx context.Context) error {
 	d.stop = make(chan struct{})
-	// Configure with sane defaults (the driver tolerates repeated calls).
 	d.drv.Configure()
 	go d.loop()
 	return nil
@@ -91,11 +93,9 @@ func (d *Device) Init(ctx context.Context) error {
 
 func (d *Device) Close() error {
 	close(d.stop)
-	// The bus owner is long-lived; nothing to release beyond matching your API.
 	return nil
 }
 
-// Non-blocking; accepts "read" for either kind.
 func (d *Device) Control(kind types.Kind, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
@@ -123,13 +123,10 @@ func (d *Device) loop() {
 
 func (d *Device) handleRead() {
 	start := time.Now().UnixMilli()
-	// Full cycle: trigger then bounded polling handled inside Read().
 	if err := d.drv.Read(); err != nil {
 		d.emitErr(err.Error(), start)
 		return
 	}
-	// Convert to fixed-point types.
-	// Driver exposes DeciCelsius() and DeciRelHumidity() from cached sample.
 	decic := d.drv.DeciCelsius()
 	if decic > 32767 {
 		decic = 32767
@@ -137,14 +134,13 @@ func (d *Device) handleRead() {
 	if decic < -32768 {
 		decic = -32768
 	}
-	rhx100 := d.drv.DeciRelHumidity() * 10 // Deci% => hundredths of %
+	rhx100 := d.drv.DeciRelHumidity() * 10
 	if rhx100 < 0 {
 		rhx100 = 0
 	}
 	if rhx100 > 10000 {
 		rhx100 = 10000
 	}
-
 	ts := time.Now().UnixMilli()
 	d.pub.Emit(core.Event{
 		DevID:   d.id,
