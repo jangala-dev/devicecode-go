@@ -57,6 +57,14 @@ type LEDSet struct {
 	Level bool `json:"level"`
 }
 
+const (
+	KindSwitch Kind = "switch"
+)
+
+type SwitchValue struct{ On bool }
+type SwitchSet struct{ On bool }  // control payload
+type SwitchInfo struct{ Pin int } // mirror LEDInfo shape if you like
+
 // Generic replies
 type OKReply struct {
 	OK bool `json:"ok"`

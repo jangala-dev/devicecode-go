@@ -3,7 +3,7 @@
 package setups
 
 import (
-	_ "devicecode-go/services/hal/devices/led"
+	"devicecode-go/services/hal/devices/gpio_dout"
 	shtc3dev "devicecode-go/services/hal/devices/shtc3"
 
 	"devicecode-go/types"
@@ -17,7 +17,7 @@ var SelectedPlan = ResourcePlan{
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 		// On-board LED (name => public address hal/cap/io/led/onboard/…)
-		{ID: "onboard", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
+		{ID: "onboard", Type: "gpio_led", Params: gpio_dout.Params{Pin: 25, ActiveLow: false, Initial: false}},
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
 		{ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0"}},

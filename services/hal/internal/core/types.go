@@ -39,7 +39,6 @@ type Device interface {
 	// BindCapabilities is called exactly once after HAL assigns CapIDs.
 	// The slice aligns positionally with Capabilities().
 	BindCapabilities(ids []CapID)
-
 	Init(ctx context.Context) error
 	Control(cap CapID, method string, payload any) (EnqueueResult, error)
 	Close() error

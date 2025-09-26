@@ -201,7 +201,7 @@ func main() {
 			} else {
 				printTopicWith("[main] toggle control reply on", reply.Topic)
 			}
-			// runtime.GC()
+			runtime.GC()
 			printMem()
 
 		case <-sensorTicker.C:

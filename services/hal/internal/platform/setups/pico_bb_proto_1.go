@@ -3,9 +3,8 @@
 package setups
 
 import (
-	_ "devicecode-go/services/hal/devices/aht20"
-	_ "devicecode-go/services/hal/devices/led"
-	_ "devicecode-go/services/hal/devices/shtc3"
+	aht20dev "devicecode-go/services/hal/devices/aht20"
+	"devicecode-go/services/hal/devices/gpio_dout"
 
 	"devicecode-go/types"
 )
@@ -27,18 +26,16 @@ var SelectedPlan = ResourcePlan{
 // (for now, these enables are gpio_led; you can migrate to a switch kind later).
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
-		// Gates / enables (published now under hal/cap/io/led/<name>/…)
-		{ID: "button-led", Type: "gpio_led", Params: types.LEDParams{Pin: 11, Initial: true}}, // active-low ext. pull-up
-		{ID: "eg25", Type: "gpio_led", Params: types.LEDParams{Pin: 6, Initial: false}},
-		{ID: "rm520n", Type: "gpio_led", Params: types.LEDParams{Pin: 7, Initial: false}},
-		{ID: "aw7915", Type: "gpio_led", Params: types.LEDParams{Pin: 8, Initial: false}},
-		{ID: "cm5-5v", Type: "gpio_led", Params: types.LEDParams{Pin: 9, Initial: false}},
-		{ID: "fan-5v", Type: "gpio_led", Params: types.LEDParams{Pin: 10, Initial: false}},
-		{ID: "boost-load", Type: "gpio_led", Params: types.LEDParams{Pin: 14, Initial: false}},
+		// Gates / enables -> switches (power domain)
+		{ID: "mpcie-usb", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 6, ActiveLow: false, Initial: false}},
+		{ID: "m2", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 7, ActiveLow: false, Initial: false}},
+		{ID: "mpcie", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 8, ActiveLow: false, Initial: false}},
+		{ID: "cm5-5v", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 9, ActiveLow: false, Initial: false}},
+		{ID: "fan-5v", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 10, ActiveLow: false, Initial: false}},
+		{ID: "boost-load", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 14, ActiveLow: false, Initial: false}},
 
-		// On-board LED
-		{ID: "onboard", Type: "gpio_led", Params: types.LEDParams{Pin: 25, Initial: false}},
+		{ID: "onboard", Type: "gpio_led", Params: gpio_dout.Params{Pin: 25, ActiveLow: false, Initial: false}},
 
-		// (future) I²C/SPI/UART devices when providers/devices are present.
+		{ID: "core", Type: "aht20", Params: aht20dev.Params{Bus: "i2c0"}},
 	},
 }
