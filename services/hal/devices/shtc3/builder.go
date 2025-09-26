@@ -30,16 +30,11 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if err != nil {
 		return nil, err
 	}
-	bus := drvshim.NewI2C(own).WithTimeout(50)
-	drv := shtc3.New(bus)
-
 	return &Device{
 		id:  in.ID,
 		bus: p.Bus,
 		i2c: own,
-		drv: drv,
 		pub: in.Res.Pub,
-		q:   make(chan string, 4),
 	}, nil
 }
 
@@ -48,11 +43,8 @@ type Device struct {
 	bus string
 
 	i2c core.I2COwner
-	drv shtc3.Device
 	pub core.EventEmitter
 
-	q       chan string
-	stop    chan struct{}
 	capTemp core.CapID
 	capHum  core.CapID
 }
@@ -95,75 +87,63 @@ func (d *Device) BindCapabilities(ids []core.CapID) {
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	d.stop = make(chan struct{})
-	_ = d.drv.WakeUp()
-	go d.loop()
+	// No goroutine. Device is passive; reads happen when commanded.
 	return nil
 }
 
-func (d *Device) Close() error {
-	_ = d.drv.Sleep()
-	close(d.stop)
-	return nil
-}
+func (d *Device) Close() error { return nil }
 
 func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
-		select {
-		case d.q <- "read":
-			return core.EnqueueResult{OK: true}, nil
-		default:
+		ok := d.i2c.TryEnqueue(func(bus core.I2CBus) error {
+			// Construct a driver bound to the worker's bus each time.
+			drv := shtc3.New(drvshim.NewI2CFromBus(bus))
+
+			// Wake, read, sleep in one job to keep the bus time bounded.
+			_ = drv.WakeUp()
+			defer func() { _ = drv.Sleep() }()
+
+			t0 := time.Now().UnixMilli()
+			tmc, rhx100, err := drv.ReadTemperatureHumidity()
+			if err != nil {
+				d.emitErr(err.Error(), t0)
+				return nil
+			}
+			// shtc3 returns milli°C and hundredths of %RH.
+			decic := tmc / 100 // milli°C -> deci°C
+			if decic > 32767 {
+				decic = 32767
+			}
+			if decic < -32768 {
+				decic = -32768
+			}
+			if rhx100 < 0 {
+				rhx100 = 0
+			}
+			if rhx100 > 10000 {
+				rhx100 = 10000
+			}
+			ts := time.Now().UnixMilli()
+			d.pub.Emit(core.Event{
+				CapID:   d.capTemp,
+				Payload: types.TemperatureValue{DeciC: int16(decic)},
+				TSms:    ts,
+			})
+			d.pub.Emit(core.Event{
+				CapID:   d.capHum,
+				Payload: types.HumidityValue{RHx100: uint16(rhx100)},
+				TSms:    ts,
+			})
+			return nil
+		})
+		if !ok {
 			return core.EnqueueResult{OK: false, Error: "busy"}, nil
 		}
+		return core.EnqueueResult{OK: true}, nil
 	default:
 		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
 	}
-}
-
-func (d *Device) loop() {
-	for {
-		select {
-		case <-d.q:
-			d.handleRead()
-		case <-d.stop:
-			return
-		}
-	}
-}
-
-func (d *Device) handleRead() {
-	t0 := time.Now().UnixMilli()
-	tmc, rhx100, err := d.drv.ReadTemperatureHumidity()
-	if err != nil {
-		d.emitErr(err.Error(), t0)
-		return
-	}
-	// shtc3 returns milli°C and hundredths of %RH.
-	decic := tmc / 100 // milli°C -> deci°C
-	if decic > 32767 {
-		decic = 32767
-	}
-	if decic < -32768 {
-		decic = -32768
-	}
-	if rhx100 < 0 {
-		rhx100 = 0
-	}
-	if rhx100 > 10000 {
-		rhx100 = 10000
-	}
-	ts := time.Now().UnixMilli()
-	d.pub.Emit(core.Event{
-		CapID:   d.capTemp,
-		Payload: types.TemperatureValue{DeciC: int16(decic)},
-		TSms:    ts,
-	})
-	d.pub.Emit(core.Event{
-		CapID:   d.capHum,
-		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
-		TSms:    ts,
-	})
 }
 
 func (d *Device) emitErr(code string, t0 int64) {

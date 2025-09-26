@@ -4,7 +4,6 @@ package provider
 
 import (
 	"sync"
-	"time"
 
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/platform/boards"
@@ -51,68 +50,55 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// ---- I²C owner (one worker per bus, serialises hardware access) ----
-
-type i2cJob struct {
-	addr      uint16
-	w, r      []byte
-	timeoutMS int
-	done      chan error
-}
+// ---- I²C owner (one worker per bus; serialises hardware access) ----
 
 type i2cOwner struct {
-	id    core.ResourceID
-	hw    *machine.I2C
-	jobs  chan i2cJob
-	quit  chan struct{}
-	defTO time.Duration
+	id   core.ResourceID
+	hw   *machine.I2C
+	jobs chan func(bus core.I2CBus) error
+	quit chan struct{}
 }
 
 func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 	o := &i2cOwner{
-		id:    id,
-		hw:    hw,
-		jobs:  make(chan i2cJob, 16),
-		quit:  make(chan struct{}),
-		defTO: 25 * time.Millisecond,
+		id:   id,
+		hw:   hw,
+		jobs: make(chan func(core.I2CBus) error, 16),
+		quit: make(chan struct{}),
 	}
 	go o.loop()
 	return o
 }
 
+// thin adapter to satisfy core.I2CBus inside the worker
+type txBus struct{ hw *machine.I2C }
+
+func (b txBus) Tx(addr uint16, w, r []byte) error { return b.hw.Tx(addr, w, r) }
+
 func (o *i2cOwner) loop() {
+	b := txBus{hw: o.hw}
 	for {
 		select {
-		case j := <-o.jobs:
-			// Perform the transaction synchronously; TinyGo's machine.I2C.Tx
-			// should return promptly on RP2040. This avoids spawning a goroutine
-			// per job and therefore avoids leaks under timeout pressure.
-			err := o.hw.Tx(j.addr, j.w, j.r)
-
-			// Always signal completion to the caller; do not use a non-blocking send.
-			j.done <- err
-
+		case job := <-o.jobs:
+			_ = job(b) // swallow error or add telemetry if desired
 		case <-o.quit:
 			return
 		}
 	}
 }
 
-// Satisfy core.I2COwner: enqueue and wait for completion (caller’s goroutine).
-func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, timeoutMS int) error {
-	j := i2cJob{
-		addr:      addr,
-		w:         w,
-		r:         r,
-		timeoutMS: timeoutMS,
-		done:      make(chan error, 1),
-	}
+// core.I2COwner
+func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, _ int) error {
+	// Direct synchronous transaction (caller blocks).
+	return o.hw.Tx(addr, w, r)
+}
+func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
 	select {
-	case o.jobs <- j:
+	case o.jobs <- job:
+		return true
 	default:
-		return core.ErrBusInUse // saturated
+		return false
 	}
-	return <-j.done
 }
 
 // ---- Unified resource registry (GPIO + I2C owners) ----

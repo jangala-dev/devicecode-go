@@ -15,16 +15,24 @@ const (
 
 type ResourceID string // e.g. "i2c0", "uart0", "gpio25"
 
-// ---- Transactional buses (serialised operations) ----
+// ---- Transactional buses ----
+// This repo standardises on a single *per-bus* worker goroutine that serialises
+// all hardware access. Callers can either:
+//   1) perform a direct synchronous transaction via Tx (blocks the caller), or
+//   2) enqueue a job onto the bus worker with TryEnqueue (non-blocking control).
 
-// I2COwner exposes a single atomic transaction.
-// timeoutMS: 0 => provider default.
-//
-// The implementation serialises all hardware access behind a single worker
-// per bus. Callers may invoke Tx from their own goroutines; Tx itself blocks
-// until the transaction completes or times out.
+// I2CBus is the minimal surface a job needs while running on the worker.
+type I2CBus interface {
+	Tx(addr uint16, w []byte, r []byte) error
+}
+
+// I2COwner exposes both direct Tx and job enqueue.
+// timeoutMS: 0 => provider default for direct Tx (if the provider supports one).
 type I2COwner interface {
 	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
+	// TryEnqueue submits a job to the per-bus worker. It MUST be non-blocking:
+	// returns false if the queue is saturated.
+	TryEnqueue(job func(bus I2CBus) error) bool
 }
 
 // ---- Stream buses (independent RX/TX) ----
