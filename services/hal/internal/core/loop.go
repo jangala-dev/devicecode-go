@@ -70,7 +70,7 @@ func (h *HAL) Run(ctx context.Context) {
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
-				h.replyErr(m, errcode.HALNotReady)
+				h.reply(m, false, errcode.HALNotReady, nil)
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
@@ -141,7 +141,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 func (h *HAL) handleControl(msg *bus.Message) {
 	// hal/cap/<domain>/<kind>/<name>/control/<verb>
 	if msg.Topic.Len() < 7 {
-		h.replyErr(msg, errcode.InvalidTopic)
+		h.reply(msg, false, errcode.InvalidTopic, nil)
 		return
 	}
 	domain, _ := msg.Topic.At(2).(string)
@@ -151,46 +151,36 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 	ownerID, ok := h.capIndex[capKey{domain: domain, kind: kind, name: name}]
 	if !ok {
-		h.replyErr(msg, errcode.UnknownCapability)
+		h.reply(msg, false, errcode.UnknownCapability, nil)
 		return
 	}
 	dev := h.dev[ownerID]
 	if dev == nil {
-		h.replyErr(msg, errcode.Error) // defensive fallback
+		h.reply(msg, false, errcode.Error, nil) // defensive fallback
 		return
 	}
 
 	res, err := dev.Control(CapAddr{Domain: domain, Kind: kind, Name: name}, verb, msg.Payload)
 	if err != nil {
-		h.replyFromError(msg, err)
+		h.reply(msg, false, "", err)
 		return
 	}
 	if !msg.CanReply() {
 		return
 	}
 	if res.OK {
-		h.replyOK(msg)
+		h.reply(msg, true, "", nil)
 		return
 	}
-	code := res.Error
-	if code == "" {
-		code = errcode.Busy
-	}
-	h.conn.Reply(msg, types.ErrorReply{OK: false, Error: string(code)}, false)
+	h.reply(msg, false, res.Error, nil)
 }
 
 func (h *HAL) handleEvent(ev Event) {
-	d := ev.Addr.Domain
-	k := ev.Addr.Kind
-	n := ev.Addr.Name
+	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
 
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
-		h.conn.Publish(h.conn.NewMessage(
-			capStatus(d, k, n),
-			types.CapabilityStatus{Link: types.LinkDegraded, TSms: ev.TSms, Error: ev.Err},
-			true,
-		))
+		h.pubStatus(d, k, n, ev.TSms, ev.Err)
 		return
 	}
 
@@ -204,18 +194,28 @@ func (h *HAL) handleEvent(ev Event) {
 	} else {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 	}
-	// Retained status: up
-	h.conn.Publish(h.conn.NewMessage(
-		capStatus(d, k, n),
-		types.CapabilityStatus{Link: types.LinkUp, TSms: ev.TSms},
-		true,
-	))
+	// 3) Retained status: up
+	h.pubStatus(d, k, n, ev.TSms, "")
 }
 
 func (h *HAL) pubHALState(level, status string) {
 	h.conn.Publish(h.conn.NewMessage(
 		T("hal", "state"),
 		types.HALState{Level: level, Status: status, TSms: timex.NowMs()},
+		true,
+	))
+}
+
+// pubStatus publishes a retained status update for a capability.
+// err=="" → LinkUp; otherwise LinkDegraded and Error is included.
+func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
+	link := types.LinkUp
+	if err != "" {
+		link = types.LinkDegraded
+	}
+	h.conn.Publish(h.conn.NewMessage(
+		capStatus(domain, kind, name),
+		types.CapabilityStatus{Link: link, TSms: ts, Error: err},
 		true,
 	))
 }
