@@ -109,32 +109,10 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		h.dev[dev.ID()] = dev
 
 		// Register capabilities, publish retained info + initial status:down
-		caps := dev.Capabilities()
-		for _, cs := range caps {
-			k := string(cs.Kind)
-			domain := cs.Domain
-			if domain == "" {
-				domain = defaultDomainFor(k)
-			}
-			name := cs.Name
-			if name == "" {
-				name = dev.ID()
-			}
-
-			h.capIndex[capKey{domain: domain, kind: k, name: name}] = dev.ID()
-
-			h.conn.Publish(h.conn.NewMessage(
-				capInfo(domain, k, name),
-				types.Info{SchemaVersion: cs.Info.SchemaVersion, Driver: cs.Info.Driver, Detail: cs.Info.Detail},
-				true,
-			))
-			// Initial status (retained)
-			h.conn.Publish(h.conn.NewMessage(
-				capStatus(domain, k, name),
-				types.CapabilityStatus{Link: types.LinkDown, TSms: timex.NowMs()},
-				true,
-			))
+		for _, cs := range dev.Capabilities() {
+			h.registerCap(dev.ID(), cs)
 		}
+
 	}
 }
 
@@ -177,13 +155,11 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
-
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
 		h.pubStatus(d, k, n, ev.TSms, ev.Err)
 		return
 	}
-
 	// 2) Success: event vs value
 	if ev.IsEvent {
 		if ev.EventTag != "" {
@@ -202,6 +178,37 @@ func (h *HAL) pubHALState(level, status string) {
 	h.conn.Publish(h.conn.NewMessage(
 		T("hal", "state"),
 		types.HALState{Level: level, Status: status, TSms: timex.NowMs()},
+		true,
+	))
+}
+
+// registerCap indexes the capability and publishes its info and initial status:down (retained).
+func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
+	k := string(cs.Kind)
+	domain := cs.Domain
+	if domain == "" {
+		domain = defaultDomainFor(k)
+	}
+	name := cs.Name
+	if name == "" {
+		name = devID
+	}
+	// Index for control routing.
+	h.capIndex[capKey{domain: domain, kind: k, name: name}] = devID
+	// Publish static info (retained).
+	h.conn.Publish(h.conn.NewMessage(
+		capInfo(domain, k, name),
+		types.Info{
+			SchemaVersion: cs.Info.SchemaVersion,
+			Driver:        cs.Info.Driver,
+			Detail:        cs.Info.Detail,
+		},
+		true,
+	))
+	// Publish initial status: down (retained).
+	h.conn.Publish(h.conn.NewMessage(
+		capStatus(domain, k, name),
+		types.CapabilityStatus{Link: types.LinkDown, TSms: timex.NowMs()},
 		true,
 	))
 }
