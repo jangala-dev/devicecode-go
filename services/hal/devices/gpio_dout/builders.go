@@ -8,14 +8,15 @@ import (
 )
 
 func init() {
-	core.RegisterBuilder("gpio_led", builderLED{})
-	core.RegisterBuilder("gpio_switch", builderSwitch{})
+	// Register both device kinds with a single parameterised builder.
+	core.RegisterBuilder("gpio_led", gpioBuilder{role: RoleLED})
+	core.RegisterBuilder("gpio_switch", gpioBuilder{role: RoleSwitch})
 }
 
-type builderLED struct{}
-type builderSwitch struct{}
+// One builder, parameterised by device role.
+type gpioBuilder struct{ role Role }
 
-func (builderLED) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
+func (b gpioBuilder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
 	p, err := parseParams(in.Params)
 	if err != nil {
 		return nil, err
@@ -25,25 +26,14 @@ func (builderLED) Build(ctx context.Context, in core.BuilderInput) (core.Device,
 		return nil, err
 	}
 	gpio := ph.AsGPIO()
-	return New(RoleLED, in.ID, p, gpio, in.Res.Pub), nil
+
+	// Note: Device.New applies sensible defaults:
+	//  - RoleSwitch => domain "power" if empty
+	//  - RoleLED    => domain "io"    if empty
+	return New(b.role, in.ID, p, gpio, in.Res.Pub), nil
 }
 
-func (builderSwitch) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
-	p, err := parseParams(in.Params)
-	if err != nil {
-		return nil, err
-	}
-	if p.Domain == "" {
-		p.Domain = "power"
-	}
-	ph, err := in.Res.Reg.ClaimPin(in.ID, p.Pin, core.FuncGPIOOut)
-	if err != nil {
-		return nil, err
-	}
-	gpio := ph.AsGPIO()
-	return New(RoleSwitch, in.ID, p, gpio, in.Res.Pub), nil
-}
-
+// Parameter parsing retained as-is.
 func parseParams(v any) (Params, error) {
 	switch p := v.(type) {
 	case Params:
