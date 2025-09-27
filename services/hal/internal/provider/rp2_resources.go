@@ -5,6 +5,7 @@ package provider
 import (
 	"sync"
 
+	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/provider/boards"
 	"devicecode-go/services/hal/internal/provider/setups"
@@ -166,7 +167,7 @@ func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner,
 	defer r.mu.Unlock()
 	o := r.i2cOwners[id]
 	if o == nil {
-		return nil, core.ErrUnknownBus
+		return nil, errcode.UnknownBus
 	}
 	return o, nil
 }
@@ -176,7 +177,7 @@ func (r *rp2Registry) ReleaseI2C(devID string, id core.ResourceID) {
 
 // Stream buses — still stubs
 func (r *rp2Registry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
-	return nil, core.ErrUnknownBus
+	return nil, errcode.UnknownBus
 }
 func (r *rp2Registry) ReleaseStream(devID string, id core.ResourceID) {}
 
@@ -199,10 +200,10 @@ func (r *rp2Registry) ClaimGPIO(devID string, n int) (core.GPIOHandle, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.lookupGPIO(n); !ok {
-		return nil, core.ErrUnknownPin
+		return nil, errcode.UnknownPin
 	}
 	if owner, inUse := r.usedGPIO[n]; inUse && owner != "" {
-		return nil, core.ErrPinInUse
+		return nil, errcode.PinInUse
 	}
 	r.usedGPIO[n] = devID
 	return r.gpio[n], nil

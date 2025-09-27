@@ -2,9 +2,9 @@ package shtc3dev
 
 import (
 	"context"
-	"errors"
 	"time"
 
+	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
@@ -24,7 +24,7 @@ type builder struct{}
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
 	p, ok := in.Params.(Params)
 	if !ok || p.Bus == "" {
-		return nil, errors.New("invalid_params")
+		return nil, errcode.InvalidParams
 	}
 	own, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
 	if err != nil {
@@ -94,7 +94,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			t0 := time.Now().UnixMilli()
 			tmc, rhx100, err := drv.ReadTemperatureHumidity()
 			if err != nil {
-				d.emitErr(err.Error(), t0)
+				d.emitErr(string(errcode.MapDriverErr(err)), t0)
 				return nil
 			}
 			decic := tmc / 100
@@ -124,11 +124,11 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			return nil
 		})
 		if !ok {
-			return core.EnqueueResult{OK: false, Error: "busy"}, nil
+			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
 		}
 		return core.EnqueueResult{OK: true}, nil
 	default:
-		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
+		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 	}
 }
 

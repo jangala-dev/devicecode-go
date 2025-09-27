@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/errcode"
 	"devicecode-go/types"
 )
 
@@ -69,7 +70,7 @@ func (h *HAL) Run(ctx context.Context) {
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
-				h.replyErr(m, "hal_not_ready")
+				h.replyErr(m, errcode.HALNotReady)
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
@@ -140,6 +141,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 func (h *HAL) handleControl(msg *bus.Message) {
 	// hal/cap/<domain>/<kind>/<name>/control/<verb>
 	if msg.Topic.Len() < 7 {
+		h.replyErr(msg, errcode.InvalidTopic)
 		return
 	}
 	domain, _ := msg.Topic.At(2).(string)
@@ -149,27 +151,32 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 	ownerID, ok := h.capIndex[capKey{domain: domain, kind: kind, name: name}]
 	if !ok {
-		h.replyErr(msg, "unknown_capability")
+		h.replyErr(msg, errcode.UnknownCapability)
 		return
 	}
 	dev := h.dev[ownerID]
 	if dev == nil {
-		h.replyErr(msg, "no_device")
+		h.replyErr(msg, errcode.Error) // defensive fallback
 		return
 	}
 
 	res, err := dev.Control(CapAddr{Domain: domain, Kind: kind, Name: name}, verb, msg.Payload)
 	if err != nil {
-		h.replyErr(msg, err.Error())
+		h.replyFromError(msg, err)
 		return
 	}
-	if msg.CanReply() {
-		if res.OK {
-			h.conn.Reply(msg, types.OKReply{OK: true}, false)
-		} else {
-			h.conn.Reply(msg, types.ErrorReply{OK: false, Error: coalesce(res.Error, "busy")}, false)
-		}
+	if !msg.CanReply() {
+		return
 	}
+	if res.OK {
+		h.replyOK(msg)
+		return
+	}
+	code := res.Error
+	if code == "" {
+		code = errcode.Busy
+	}
+	h.conn.Reply(msg, types.ErrorReply{OK: false, Error: string(code)}, false)
 }
 
 func (h *HAL) handleEvent(ev Event) {
@@ -211,16 +218,6 @@ func (h *HAL) pubHALState(level, status string) {
 		types.HALState{Level: level, Status: status, TSms: nowMs()},
 		true,
 	))
-}
-
-func (h *HAL) replyErr(msg *bus.Message, code string) {
-	if !msg.CanReply() {
-		return
-	}
-	if code == "" {
-		code = "error"
-	}
-	h.conn.Reply(msg, types.ErrorReply{OK: false, Error: code}, false)
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }

@@ -1,9 +1,5 @@
 package core
 
-import (
-	"errors"
-)
-
 // ---- Bus taxonomy ----
 
 type BusClass uint8
@@ -93,14 +89,3 @@ type ResourceRegistry interface {
 	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
 	ReleaseGPIO(devID string, pin int)
 }
-
-// Short error codes
-
-var (
-	ErrUnknownPin = errors.New("unknown_pin")
-	ErrPinInUse   = errors.New("pin_in_use")
-
-	ErrUnknownBus = errors.New("unknown_bus")
-	ErrBusInUse   = errors.New("bus_in_use")
-	ErrTimeout    = errors.New("timeout")
-)

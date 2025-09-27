@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
 )
@@ -118,13 +119,13 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 		case RoleSwitch:
 			p, ok := payload.(types.SwitchSet)
 			if !ok {
-				return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
+				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 			}
 			d.setLogical(p.On)
 		default:
 			p, ok := payload.(types.LEDSet)
 			if !ok {
-				return core.EnqueueResult{OK: false, Error: "invalid_payload"}, nil
+				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 			}
 			d.setLogical(p.Level)
 		}
@@ -138,7 +139,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 		d.emitValueNow()
 		return core.EnqueueResult{OK: true}, nil
 	default:
-		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
+		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 	}
 }
 

@@ -2,8 +2,8 @@ package gpio_dout
 
 import (
 	"context"
-	"errors"
 
+	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 )
 
@@ -49,6 +49,6 @@ func parseParams(v any) (Params, error) {
 	case *Params:
 		return *p, nil
 	default:
-		return Params{}, errors.New("invalid_params_type")
+		return Params{}, errcode.InvalidParams
 	}
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 
+	"devicecode-go/errcode"
 	"devicecode-go/types"
 )
 
@@ -27,7 +28,7 @@ type CapabilitySpec struct {
 // Enqueue-only control outcome returned by devices.
 type EnqueueResult struct {
 	OK    bool
-	Error string // "busy","unsupported","invalid_payload","unknown_pin",...
+	Error errcode.Code // machine-readable short code
 }
 
 // Device is device-centric: controls are non-blocking.

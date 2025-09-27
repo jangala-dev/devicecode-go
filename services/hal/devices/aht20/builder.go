@@ -2,9 +2,9 @@ package aht20dev
 
 import (
 	"context"
-	"errors"
 	"time"
 
+	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
@@ -27,7 +27,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		p.Addr = 0x38
 	}
 	if !ok || p.Bus == "" || p.Addr == 0 {
-		return nil, errors.New("invalid_params")
+		return nil, errcode.InvalidParams
 	}
 	own, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
 	if err != nil {
@@ -96,7 +96,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 
 			start := time.Now().UnixMilli()
 			if err := drv.Read(); err != nil {
-				d.emitErr(err.Error(), start)
+				d.emitErr(string(errcode.MapDriverErr(err)), start)
 				return nil
 			}
 			decic := drv.DeciCelsius()
@@ -127,11 +127,11 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			return nil
 		})
 		if !ok {
-			return core.EnqueueResult{OK: false, Error: "busy"}, nil
+			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
 		}
 		return core.EnqueueResult{OK: true}, nil
 	default:
-		return core.EnqueueResult{OK: false, Error: "unsupported"}, nil
+		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 	}
 }
 
