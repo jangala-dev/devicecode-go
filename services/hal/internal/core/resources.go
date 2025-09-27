@@ -1,6 +1,6 @@
 package core
 
-// ---- Bus taxonomy ----
+// ---- Bus taxonomy (unchanged) ----
 
 type BusClass uint8
 
@@ -11,13 +11,65 @@ const (
 
 type ResourceID string // e.g. "i2c0", "uart0", "gpio25"
 
-// ---- Transactional buses ----
-// This repo standardises on a single *per-bus* worker goroutine that serialises
-// all hardware access. Callers can either:
-//   1) perform a direct synchronous transaction via Tx (blocks the caller), or
-//   2) enqueue a job onto the bus worker with TryEnqueue (non-blocking control).
+// ---- Unified pin-function model (new) ----
 
-// I2CBus is the minimal surface a job needs while running on the worker.
+type PinFunc uint8
+
+const (
+	FuncGPIOIn PinFunc = iota
+	FuncGPIOOut
+	FuncPWM
+	// Extend here (e.g. FuncSPI_MOSI, FuncUART_TX, …) as you expose more functions.
+)
+
+// GPIO (function-specific view)
+type Pull uint8
+
+const (
+	PullNone Pull = iota
+	PullUp
+	PullDown
+)
+
+type GPIOHandle interface {
+	Number() int
+	ConfigureInput(pull Pull) error
+	ConfigureOutput(initial bool) error
+	Set(bool)
+	Get() bool
+	Toggle()
+}
+
+// PWM (function-specific view)
+type PWMRampMode uint8
+
+const (
+	// Linear stepping: evenly spaced absolute steps from current to target.
+	PWMRampLinear PWMRampMode = iota
+	// Future modes could include gamma-corrected, exponential, or trapezoidal.
+)
+
+type PWMHandle interface {
+	Configure(freqHz uint32, top uint16) error
+	Set(level uint16)
+	Enable(on bool)
+	Info() (slice int, channel rune, pin int)
+
+	Ramp(to uint16, durationMs uint32, steps uint16, mode PWMRampMode) bool
+	StopRamp()
+}
+
+// PinHandle narrows to function-specific views; it is invalid to request a view
+// that does not match the claimed function.
+type PinHandle interface {
+	Pin() int
+	AsGPIO() GPIOHandle // only valid if claimed with FuncGPIOIn/FuncGPIOOut
+	AsPWM() PWMHandle   // only valid if claimed with FuncPWM
+}
+
+// ---- Transactional buses ----
+// Single *per-bus* worker goroutine that serialises hardware access.
+
 type I2CBus interface {
 	Tx(addr uint16, w []byte, r []byte) error
 }
@@ -26,12 +78,11 @@ type I2CBus interface {
 // timeoutMS: 0 => provider default for direct Tx (if the provider supports one).
 type I2COwner interface {
 	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
-	// TryEnqueue submits a job to the per-bus worker. It MUST be non-blocking:
-	// returns false if the queue is saturated.
+	// TryEnqueue MUST be non-blocking: returns false if the queue is saturated.
 	TryEnqueue(job func(bus I2CBus) error) bool
 }
 
-// ---- Stream buses (independent RX/TX) ----
+// ---- Stream buses (shape reserved; provider can fill in) ----
 
 type StreamEvent struct {
 	DevID string
@@ -52,29 +103,10 @@ type StreamOwner interface {
 	Stats() StreamStats         // optional telemetry
 }
 
-// ---- GPIO handles ----
-
-type Pull uint8
-
-const (
-	PullNone Pull = iota
-	PullUp
-	PullDown
-)
-
-type GPIOHandle interface {
-	Number() int
-	ConfigureInput(pull Pull) error
-	ConfigureOutput(initial bool) error
-	Set(bool)
-	Get() bool
-	Toggle()
-}
-
-// ---- Unified registry interface ----
+// ---- Unified registry interface (updated) ----
 
 type ResourceRegistry interface {
-	// Optional classification/introspection.
+	// Optional classification/introspection for controller-style resources.
 	ClassOf(id ResourceID) (BusClass, bool)
 
 	// Transactional buses
@@ -85,7 +117,7 @@ type ResourceRegistry interface {
 	ClaimStream(devID string, id ResourceID) (StreamOwner, error)
 	ReleaseStream(devID string, id ResourceID)
 
-	// GPIO
-	ClaimGPIO(devID string, pin int) (GPIOHandle, error)
-	ReleaseGPIO(devID string, pin int)
+	// Unified pin function claims
+	ClaimPin(devID string, pin int, fn PinFunc) (PinHandle, error)
+	ReleasePin(devID string, pin int)
 }

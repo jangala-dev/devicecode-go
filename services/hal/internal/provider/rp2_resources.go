@@ -4,6 +4,7 @@ package provider
 
 import (
 	"sync"
+	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
@@ -15,15 +16,18 @@ import (
 // Ensure the provider satisfies the contracts at compile time.
 var _ core.ResourceRegistry = (*rp2Registry)(nil)
 
-// ---- Concrete GPIO handle ----
+// -----------------------------------------------------------------------------
+// GPIO handle
+// -----------------------------------------------------------------------------
 
-type rp2Pin struct {
+type rp2GPIO struct {
 	p machine.Pin
 	n int
 }
 
-func (r *rp2Pin) Number() int { return r.n }
-func (r *rp2Pin) ConfigureInput(pull core.Pull) error {
+func (r *rp2GPIO) Number() int { return r.n }
+
+func (r *rp2GPIO) ConfigureInput(pull core.Pull) error {
 	var mode machine.PinMode
 	switch pull {
 	case core.PullUp:
@@ -36,14 +40,16 @@ func (r *rp2Pin) ConfigureInput(pull core.Pull) error {
 	r.p.Configure(machine.PinConfig{Mode: mode})
 	return nil
 }
-func (r *rp2Pin) ConfigureOutput(initial bool) error {
+
+func (r *rp2GPIO) ConfigureOutput(initial bool) error {
 	r.p.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	r.p.Set(initial)
 	return nil
 }
-func (r *rp2Pin) Set(b bool) { r.p.Set(b) }
-func (r *rp2Pin) Get() bool  { return r.p.Get() }
-func (r *rp2Pin) Toggle() {
+
+func (r *rp2GPIO) Set(b bool) { r.p.Set(b) }
+func (r *rp2GPIO) Get() bool  { return r.p.Get() }
+func (r *rp2GPIO) Toggle() {
 	if r.p.Get() {
 		r.p.Low()
 	} else {
@@ -51,7 +57,301 @@ func (r *rp2Pin) Toggle() {
 	}
 }
 
-// ---- I²C owner (one worker per bus; serialises hardware access) ----
+// -----------------------------------------------------------------------------
+// PWM internals (RP2040)
+// -----------------------------------------------------------------------------
+
+// Local interface to avoid depending on an unexported concrete type in machine.
+type pwmCtrl interface {
+	Configure(cfg machine.PWMConfig) error
+	Top() uint32
+	Set(channel uint8, value uint32)
+}
+
+// Select controller handle for a given slice number (0..7).
+func pwmGroupBySlice(slice uint8) pwmCtrl {
+	switch slice {
+	case 0:
+		return machine.PWM0
+	case 1:
+		return machine.PWM1
+	case 2:
+		return machine.PWM2
+	case 3:
+		return machine.PWM3
+	case 4:
+		return machine.PWM4
+	case 5:
+		return machine.PWM5
+	case 6:
+		return machine.PWM6
+	default:
+		return machine.PWM7
+	}
+}
+
+// computePeriodNs returns a nanosecond period for the requested frequency.
+func computePeriodNs(freqHz uint32) uint64 {
+	if freqHz == 0 {
+		freqHz = 1
+	}
+	return uint64(1_000_000_000 / uint64(freqHz))
+}
+
+type sliceCfg struct {
+	freqHz uint32
+	users  int
+}
+
+// rp2PWM is the provider's per-pin PWM handle (channel-level).
+type rp2PWM struct {
+	mu sync.Mutex
+
+	pin   int
+	ctrl  pwmCtrl // controller for this pin's slice (PWM0..PWM7)
+	chIdx uint8   // channel within controller: 0 => A, 1 => B
+	slice int     // 0..7
+	ch    rune    // 'A' or 'B'
+
+	enabled bool
+
+	// Logical config (per channel)
+	reqTop uint16 // requested logical resolution (0..reqTop)
+	freqHz uint32 // requested frequency
+
+	// Hardware info (per slice/controller)
+	hwTop uint32 // controller.Top() after Configure
+
+	// Current logical level (0..reqTop)
+	level uint16
+
+	// Ramp state
+	rampCancel chan struct{}
+	rampAlive  bool
+}
+
+// caller holds lock
+func (p *rp2PWM) setHW(logical uint16) {
+	if p.hwTop == 0 || p.reqTop == 0 {
+		return
+	}
+	if logical > p.reqTop {
+		logical = p.reqTop
+	}
+	// Scale from logical [0..reqTop] to hardware [0..hwTop].
+	hw := (uint32(logical) * p.hwTop) / uint32(p.reqTop)
+	p.ctrl.Set(p.chIdx, hw)
+	p.level = logical
+}
+
+func (p *rp2PWM) Configure(freqHz uint32, top uint16) error {
+	if top == 0 {
+		top = 1
+	}
+	if freqHz == 0 {
+		freqHz = 1
+	}
+
+	globalPWM.mu.Lock()
+	defer globalPWM.mu.Unlock()
+
+	sc := globalPWM.slice[p.slice]
+	if sc == nil {
+		sc = &sliceCfg{}
+		globalPWM.slice[p.slice] = sc
+	}
+
+	if sc.users == 0 {
+		// First writer configures the controller period for this slice.
+		period := computePeriodNs(freqHz)
+		if err := p.ctrl.Configure(machine.PWMConfig{Period: period}); err != nil {
+			return err
+		}
+		sc.freqHz = freqHz
+		sc.users = 1
+	} else {
+		// Enforce slice-wide frequency compatibility.
+		if sc.freqHz != freqHz {
+			return errcode.Conflict
+		}
+		sc.users++
+	}
+
+	// Switch pin to PWM function and cache tops.
+	machine.Pin(p.pin).Configure(machine.PinConfig{Mode: machine.PinPWM})
+
+	p.mu.Lock()
+	p.freqHz = freqHz
+	p.reqTop = top
+	p.hwTop = p.ctrl.Top()
+	p.mu.Unlock()
+
+	return nil
+}
+
+func (p *rp2PWM) Set(level uint16) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Cancel any active ramp to avoid contention.
+	if p.rampAlive {
+		close(p.rampCancel)
+		p.rampAlive = false
+	}
+	p.setHW(level)
+}
+
+func (p *rp2PWM) Enable(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Model enable as "drive current level" vs "drive 0".
+	if on {
+		p.setHW(p.level)
+	} else {
+		p.setHW(0)
+	}
+	p.enabled = on
+}
+
+func (p *rp2PWM) Info() (int, rune, int) { return p.slice, p.ch, p.pin }
+
+func (p *rp2PWM) StopRamp() {
+	p.mu.Lock()
+	if p.rampAlive {
+		close(p.rampCancel)
+		p.rampAlive = false
+	}
+	p.mu.Unlock()
+}
+
+func (p *rp2PWM) Ramp(to uint16, durationMs uint32, steps uint16, _ core.PWMRampMode) bool {
+	// Degenerate cases: set immediately.
+	if steps == 0 || durationMs == 0 {
+		p.Set(to)
+		return true
+	}
+
+	p.mu.Lock()
+	// Reject if a ramp is already active or channel not configured yet.
+	if p.rampAlive || p.reqTop == 0 {
+		p.mu.Unlock()
+		return false
+	}
+	// Clamp target to logical range.
+	target := to
+	if target > p.reqTop {
+		target = p.reqTop
+	}
+	start := p.level
+
+	// Mark ramp active and capture needed fields.
+	cancel := make(chan struct{})
+	p.rampCancel = cancel
+	p.rampAlive = true
+	reqTop := p.reqTop
+	p.mu.Unlock()
+
+	// Compute per-step duration in milliseconds (minimum 1ms).
+	stepDurMs := durationMs / uint32(steps)
+	if stepDurMs == 0 {
+		stepDurMs = 1
+	}
+	stepDur := time.Duration(stepDurMs) * time.Millisecond
+
+	// Worker goroutine: integer-only interpolation.
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.rampAlive = false
+			p.mu.Unlock()
+		}()
+
+		s := int32(start)
+		t := int32(target)
+		d := t - s
+		acc := int32(0)
+		st := int32(steps)
+		cur := s
+
+		for i := uint16(1); i < steps; i++ {
+			// Check for cancellation without blocking.
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+
+			// Bresenham-style accumulator:
+			acc += d
+			var inc int32
+			if acc >= 0 {
+				inc = acc / st
+			} else {
+				inc = -((-acc) / st)
+			}
+			if inc != 0 {
+				acc -= inc * st
+				cur += inc
+				if cur < 0 {
+					cur = 0
+				}
+				if cur > int32(reqTop) {
+					cur = int32(reqTop)
+				}
+				p.mu.Lock()
+				p.setHW(uint16(cur)) // scales to hardware top internally
+				p.mu.Unlock()
+			}
+
+			time.Sleep(stepDur)
+		}
+
+		// Final snap to the exact target.
+		p.Set(uint16(t))
+	}()
+
+	return true
+}
+
+// Global PWM policy: per-slice frequency compatibility.
+var globalPWM struct {
+	mu    sync.Mutex
+	slice map[int]*sliceCfg // slice index -> cfg
+}
+
+func init() {
+	globalPWM.slice = make(map[int]*sliceCfg)
+}
+
+// -----------------------------------------------------------------------------
+// PinHandle implementation
+// -----------------------------------------------------------------------------
+
+type rp2PinHandle struct {
+	n    int
+	fn   core.PinFunc
+	gpio *rp2GPIO
+	pwm  *rp2PWM
+}
+
+func (h *rp2PinHandle) Pin() int { return h.n }
+
+func (h *rp2PinHandle) AsGPIO() core.GPIOHandle {
+	if h.fn != core.FuncGPIOIn && h.fn != core.FuncGPIOOut {
+		panic("pin not claimed for GPIO")
+	}
+	return h.gpio
+}
+
+func (h *rp2PinHandle) AsPWM() core.PWMHandle {
+	if h.fn != core.FuncPWM {
+		panic("pin not claimed for PWM")
+	}
+	return h.pwm
+}
+
+// -----------------------------------------------------------------------------
+// I²C owner (one worker per bus)
+// -----------------------------------------------------------------------------
 
 type i2cOwner struct {
 	id   core.ResourceID
@@ -71,7 +371,6 @@ func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 	return o
 }
 
-// thin adapter to satisfy core.I2CBus inside the worker
 type txBus struct{ hw *machine.I2C }
 
 func (b txBus) Tx(addr uint16, w, r []byte) error { return b.hw.Tx(addr, w, r) }
@@ -81,16 +380,14 @@ func (o *i2cOwner) loop() {
 	for {
 		select {
 		case job := <-o.jobs:
-			_ = job(b) // swallow error or add telemetry if desired
+			_ = job(b) // swallow errors or add telemetry if needed
 		case <-o.quit:
 			return
 		}
 	}
 }
 
-// core.I2COwner
 func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, _ int) error {
-	// Direct synchronous transaction (caller blocks).
 	return o.hw.Tx(addr, w, r)
 }
 func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
@@ -102,24 +399,30 @@ func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
 	}
 }
 
-// ---- Unified resource registry (GPIO + I2C owners) ----
+// -----------------------------------------------------------------------------
+// Resource registry (GPIO + PWM + I²C)
+// -----------------------------------------------------------------------------
 
 type rp2Registry struct {
 	mu sync.Mutex
 
-	// GPIO
-	usedGPIO map[int]string  // pin -> devID
-	gpio     map[int]*rp2Pin // pin -> handle
+	// Unified pin ownership.
+	pinOwners map[int]pinOwner // pin -> owner
+	gpioMap   map[int]*rp2GPIO // pin -> GPIO view (cached)
 
 	// I²C
 	i2cOwners map[core.ResourceID]*i2cOwner
 }
 
-// Accept the selected plan here to break the provider<->platform cycle.
+type pinOwner struct {
+	devID string
+	fn    core.PinFunc
+}
+
 func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 	r := &rp2Registry{
-		usedGPIO:  make(map[int]string),
-		gpio:      make(map[int]*rp2Pin),
+		pinOwners: make(map[int]pinOwner),
+		gpioMap:   make(map[int]*rp2GPIO),
 		i2cOwners: make(map[core.ResourceID]*i2cOwner),
 	}
 
@@ -150,14 +453,11 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 	return r
 }
 
-// ---- core.ResourceRegistry implementation ----
-
 func (r *rp2Registry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
 	switch string(id) {
 	case "i2c0", "i2c1":
 		return core.BusTransactional, true
 	}
-	// No other buses exposed yet on this provider.
 	return 0, false
 }
 
@@ -172,47 +472,84 @@ func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner,
 	return o, nil
 }
 func (r *rp2Registry) ReleaseI2C(devID string, id core.ResourceID) {
-	// Nothing to do for now. Owners are long-lived per bus.
+	// Owners are long-lived per bus; nothing to do.
 }
 
-// Stream buses — still stubs
+// Streams — stub
 func (r *rp2Registry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
 	return nil, errcode.UnknownBus
 }
 func (r *rp2Registry) ReleaseStream(devID string, id core.ResourceID) {}
 
-// ---- GPIO lookup/claim ----
-
-func (r *rp2Registry) lookupGPIO(n int) (*rp2Pin, bool) {
+// Unified pin claims
+func (r *rp2Registry) inBoardRange(n int) bool {
 	min, max := boards.SelectedBoard.GPIOMin, boards.SelectedBoard.GPIOMax
-	if n < min || n > max {
-		return nil, false
-	}
-	if p, ok := r.gpio[n]; ok {
-		return p, true
-	}
-	h := &rp2Pin{p: machine.Pin(n), n: n}
-	r.gpio[n] = h
-	return h, true
+	return n >= min && n <= max
 }
 
-func (r *rp2Registry) ClaimGPIO(devID string, n int) (core.GPIOHandle, error) {
+func (r *rp2Registry) lookupGPIO(n int) *rp2GPIO {
+	if g, ok := r.gpioMap[n]; ok {
+		return g
+	}
+	h := &rp2GPIO{p: machine.Pin(n), n: n}
+	r.gpioMap[n] = h
+	return h
+}
+
+func (r *rp2Registry) ClaimPin(devID string, n int, fn core.PinFunc) (core.PinHandle, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.lookupGPIO(n); !ok {
+
+	if !r.inBoardRange(n) {
 		return nil, errcode.UnknownPin
 	}
-	if owner, inUse := r.usedGPIO[n]; inUse && owner != "" {
+	if owner, inUse := r.pinOwners[n]; inUse && owner.devID != "" {
 		return nil, errcode.PinInUse
 	}
-	r.usedGPIO[n] = devID
-	return r.gpio[n], nil
+
+	ph := &rp2PinHandle{n: n, fn: fn}
+
+	switch fn {
+	case core.FuncGPIOIn, core.FuncGPIOOut:
+		ph.gpio = r.lookupGPIO(n)
+
+	case core.FuncPWM:
+		// Determine slice and controller for this pin.
+		sliceNum, err := machine.PWMPeripheral(machine.Pin(n))
+		if err != nil {
+			return nil, errcode.Unsupported
+		}
+		ctrl := pwmGroupBySlice(sliceNum)
+		// Channel within the slice: even pin => A(0), odd pin => B(1).
+		chIdx := uint8(n & 1)
+		chRune := 'A'
+		if chIdx == 1 {
+			chRune = 'B'
+		}
+		ph.pwm = &rp2PWM{
+			pin:   n,
+			ctrl:  ctrl,
+			chIdx: chIdx,
+			slice: int(sliceNum),
+			ch:    chRune,
+		}
+
+	default:
+		return nil, errcode.Unsupported
+	}
+
+	r.pinOwners[n] = pinOwner{devID: devID, fn: fn}
+	return ph, nil
 }
 
-func (r *rp2Registry) ReleaseGPIO(devID string, n int) {
+func (r *rp2Registry) ReleasePin(devID string, n int) {
 	r.mu.Lock()
-	if owner, ok := r.usedGPIO[n]; ok && owner == devID {
-		delete(r.usedGPIO, n)
+	defer r.mu.Unlock()
+	if owner, ok := r.pinOwners[n]; ok && owner.devID == devID {
+		// Safe default: put the pin back to input.
+		if g, ok2 := r.gpioMap[n]; ok2 && g != nil {
+			g.p.Configure(machine.PinConfig{Mode: machine.PinInput})
+		}
+		delete(r.pinOwners, n)
 	}
-	r.mu.Unlock()
 }

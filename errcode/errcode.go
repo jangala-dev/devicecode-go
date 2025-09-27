@@ -16,6 +16,7 @@ const (
 	UnknownCapability Code = "unknown_capability"
 	HALNotReady       Code = "hal_not_ready"
 	InvalidTopic      Code = "invalid_topic"
+	Conflict          Code = "config_conflict"
 
 	UnknownBus Code = "unknown_bus"
 	BusInUse   Code = "bus_in_use"

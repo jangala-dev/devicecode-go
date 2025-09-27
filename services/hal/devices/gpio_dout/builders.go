@@ -20,11 +20,12 @@ func (builderLED) Build(ctx context.Context, in core.BuilderInput) (core.Device,
 	if err != nil {
 		return nil, err
 	}
-	h, err := in.Res.Reg.ClaimGPIO(in.ID, p.Pin)
+	ph, err := in.Res.Reg.ClaimPin(in.ID, p.Pin, core.FuncGPIOOut)
 	if err != nil {
 		return nil, err
 	}
-	return New(RoleLED, in.ID, p, h, in.Res.Pub), nil
+	gpio := ph.AsGPIO()
+	return New(RoleLED, in.ID, p, gpio, in.Res.Pub), nil
 }
 
 func (builderSwitch) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
@@ -35,11 +36,12 @@ func (builderSwitch) Build(ctx context.Context, in core.BuilderInput) (core.Devi
 	if p.Domain == "" {
 		p.Domain = "power"
 	}
-	h, err := in.Res.Reg.ClaimGPIO(in.ID, p.Pin)
+	ph, err := in.Res.Reg.ClaimPin(in.ID, p.Pin, core.FuncGPIOOut)
 	if err != nil {
 		return nil, err
 	}
-	return New(RoleSwitch, in.ID, p, h, in.Res.Pub), nil
+	gpio := ph.AsGPIO()
+	return New(RoleSwitch, in.ID, p, gpio, in.Res.Pub), nil
 }
 
 func parseParams(v any) (Params, error) {

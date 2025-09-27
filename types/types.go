@@ -65,6 +65,36 @@ type SwitchValue struct{ On bool }
 type SwitchSet struct{ On bool }  // control payload
 type SwitchInfo struct{ Pin int } // mirror LEDInfo shape if you like
 
+const (
+	KindPWM Kind = "pwm"
+)
+
+// PWMInfo is published under hal/cap/.../info as Info.Detail.
+type PWMInfo struct {
+	Pin     int    `json:"pin"`
+	Slice   int    `json:"slice,omitempty"`   // optional: provider may fill if known
+	Channel string `json:"channel,omitempty"` // "A" or "B", optional
+	FreqHz  uint32 `json:"freqHz,omitempty"`  // optional: device/provider may fill
+	Top     uint16 `json:"top,omitempty"`     // optional: device/provider may fill
+}
+
+// PWMValue is published under hal/cap/.../value (retained).
+type PWMValue struct {
+	Level uint16 `json:"level"` // 0..Top
+}
+
+// Control payloads
+type PWMSet struct {
+	Level uint16 `json:"level"` // 0..Top
+}
+
+type PWMRamp struct {
+	To         uint16 `json:"to"`         // 0..Top
+	DurationMs uint32 `json:"durationMs"` // total duration
+	Steps      uint16 `json:"steps"`      // number of steps (>0)
+	Mode       uint8  `json:"mode"`       // 0 = linear (maps to core.PWMRampLinear)
+}
+
 // Generic replies
 type OKReply struct {
 	OK bool `json:"ok"`

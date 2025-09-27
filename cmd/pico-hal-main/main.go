@@ -56,10 +56,9 @@ func printTopicWith(prefix string, t bus.Topic) {
 	println()
 }
 
-// print fixed-point helpers without fmt
+// fixed-point helpers (no fmt)
 
 func printDeci(label string, deci int) {
-	// deci: tenths (e.g. 231 => 23.1)
 	sign := ""
 	if deci < 0 {
 		sign = "-"
@@ -76,7 +75,6 @@ func printDeci(label string, deci int) {
 }
 
 func printHundredths(label string, hx100 int) {
-	// hx100: hundredths (e.g. 5034 => 50.34)
 	if hx100 < 0 {
 		hx100 = 0
 	}
@@ -92,7 +90,7 @@ func printHundredths(label string, hx100 int) {
 	println()
 }
 
-// printMem prints a compact snapshot of TinyGo runtime memory stats.
+// TinyGo runtime memory snapshot
 func printMem() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -107,7 +105,7 @@ func printMem() {
 }
 
 func main() {
-	// Give the board a moment to settle (USB, clocks, etc.)
+	// Allow board to settle (USB, clocks, etc.)
 	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
@@ -117,31 +115,30 @@ func main() {
 	uiConn := b.NewConnection("ui")
 
 	println("[main] starting hal.Run …")
-	// hal.Run publishes the compile-time setup (if any) before entering its loop.
 	go hal.Run(ctx, halConn)
 
-	// Allow time for HAL to apply the initial (compile-time) config and publish retained info/state.
+	// Allow HAL to publish initial retained state
 	time.Sleep(250 * time.Millisecond)
 
-	// ---------- LED topics/subscriptions ----------
+	// ---------- PWM topics/subscriptions (onboard) ----------
 	// Using hal/cap/<domain>/<kind>/<name>/...
-	ledKind := string(types.KindLED)
-	tLEDValue := bus.T("hal", "cap", "io", ledKind, "onboard", "value")
-	tLEDCtrlRead := bus.T("hal", "cap", "io", ledKind, "onboard", "control", "read")
-	tLEDCtrlToggle := bus.T("hal", "cap", "io", ledKind, "onboard", "control", "toggle")
+	pwmKind := string(types.KindPWM) // ensure types.KindPWM exists
+	tPWMValue := bus.T("hal", "cap", "io", pwmKind, "onboard", "value")
+	tPWMCtrlSet := bus.T("hal", "cap", "io", pwmKind, "onboard", "control", "set")
+	tPWMCtrlRamp := bus.T("hal", "cap", "io", pwmKind, "onboard", "control", "ramp")
 
-	println("[main] subscribing to io/led/onboard value …")
-	ledSub := uiConn.Subscribe(tLEDValue)
+	println("[main] subscribing to io/pwm/onboard value …")
+	pwmSub := uiConn.Subscribe(tPWMValue)
 
-	println("[main] requesting initial read of io/led/onboard …")
-	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tLEDCtrlRead, nil, false)); err != nil {
-		println("[main] read control request error:", err.Error())
+	// Optional: set an initial level (0)
+	println("[main] setting initial io/pwm/onboard level=0 …")
+	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: 0}, false)); err != nil {
+		println("[main] pwm set control error:", err.Error())
 	} else {
-		printTopicWith("[main] read control reply on", reply.Topic)
+		printTopicWith("[main] pwm set control reply on", reply.Topic)
 	}
 
 	// ---------- SHTC3 topics/subscriptions ----------
-	// Addresses chosen in pico_rich_dev: name "core" for both temperature and humidity.
 	tempKind := string(types.KindTemperature)
 	humidKind := string(types.KindHumidity)
 
@@ -153,7 +150,6 @@ func main() {
 	tempSub := uiConn.Subscribe(tTempValue)
 	humidSub := uiConn.Subscribe(tHumidValue)
 
-	// Kick-off: request an initial sensor read (publishes both temp & humid values)
 	println("[main] requesting initial read of env/temperature/core …")
 	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tTempCtrlRead, nil, false)); err != nil {
 		println("[main] temp read control request error:", err.Error())
@@ -161,23 +157,25 @@ func main() {
 		printTopicWith("[main] temp read control reply on", reply.Topic)
 	}
 
-	println("[main] entering event loop (toggle LED every 500ms; read SHTC3 every 2s; print received values) …")
+	println("[main] entering event loop (ramp PWM every 1s; read SHTC3 every 2s; print received values) …")
 
-	// Use tickers to avoid per-loop timer allocations.
-	ledTicker := time.NewTicker(500 * time.Millisecond)
-	defer ledTicker.Stop()
+	// Tickers (no per-loop allocations)
+	rampTicker := time.NewTicker(2 * time.Second)
+	defer rampTicker.Stop()
 	sensorTicker := time.NewTicker(2 * time.Second)
 	defer sensorTicker.Stop()
 
+	const pwmTop = 4095 // must match pwm_out Top
+	levelUp := true
+
 	for {
 		select {
-		case m := <-ledSub.Channel():
-			// Expect strictly typed types.LEDValue on payload
-			if v, ok := m.Payload.(types.LEDValue); ok {
-				print("[value] io/led/onboard level=")
-				println(uint8(v.Level))
+		case m := <-pwmSub.Channel():
+			if v, ok := m.Payload.(types.PWMValue); ok {
+				print("[value] io/pwm/onboard level=")
+				println(uint16(v.Level))
 			} else {
-				println("[value] io/led/onboard (unexpected payload type)")
+				println("[value] io/pwm/onboard (unexpected payload type)")
 			}
 
 		case m := <-tempSub.Channel():
@@ -194,18 +192,26 @@ func main() {
 				println("[value] env/humidity/core (unexpected payload type)")
 			}
 
-		case <-ledTicker.C:
-			// Toggle the LED; control reply is immediate ok/busy.
-			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tLEDCtrlToggle, nil, false)); err != nil {
-				println("[main] toggle control error:", err.Error())
+		case <-rampTicker.C:
+			// Alternate ramp between 0 and Top over 1s in 32 steps (linear mode=0)
+			var target uint16
+			if levelUp {
+				target = pwmTop
 			} else {
-				printTopicWith("[main] toggle control reply on", reply.Topic)
+				target = 0
+			}
+			levelUp = !levelUp
+
+			payload := types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}
+			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tPWMCtrlRamp, payload, false)); err != nil {
+				println("[main] pwm ramp control error:", err.Error())
+			} else {
+				printTopicWith("[main] pwm ramp control reply on", reply.Topic)
 			}
 			runtime.GC()
 			printMem()
 
 		case <-sensorTicker.C:
-			// Request a sensor reading (publishes both temp & humid values).
 			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tTempCtrlRead, nil, false)); err != nil {
 				println("[main] temp read control error:", err.Error())
 			} else {
