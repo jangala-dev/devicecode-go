@@ -23,7 +23,6 @@ var SelectedPlan = ResourcePlan{
 
 // SelectedSetup lists logical devices for HAL to instantiate on boot.
 // Names are chosen for meaningful public addresses under hal/cap/…
-// (for now, these enables are gpio_led; you can migrate to a switch kind later).
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 		// Gates / enables -> switches (power domain)

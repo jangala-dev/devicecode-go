@@ -8,6 +8,7 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
+	"devicecode-go/x/timex"
 )
 
 type Device struct {
@@ -28,7 +29,7 @@ func (d *Device) ID() string { return d.id }
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{{
 		Domain: d.dom,
-		Kind:   types.KindPWM, // add in your types package
+		Kind:   types.KindPWM,
 		Name:   d.name,
 		Info: types.Info{
 			SchemaVersion: 1,
@@ -42,7 +43,7 @@ func (d *Device) Init(ctx context.Context) error {
 	_ = d.pwm.Configure(d.freq, d.top) // map provider error to degraded in control if needed
 	d.addr = core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name}
 	// emit initial value (0)
-	d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: 0}, TSms: time.Now().UnixMilli()})
+	d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: 0}, TSms: timex.NowMs()})
 	return nil
 }
 

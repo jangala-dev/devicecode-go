@@ -2,11 +2,11 @@ package gpio_dout
 
 import (
 	"context"
-	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
+	"devicecode-go/x/timex"
 )
 
 type Params struct {
@@ -160,7 +160,7 @@ func (d *Device) getLogical() bool {
 }
 
 func (d *Device) emitValueNow() {
-	ts := time.Now().UnixMilli()
+	ts := timex.NowMs()
 	switch d.role {
 	case RoleSwitch:
 		_ = d.pub.Emit(core.Event{

@@ -62,8 +62,8 @@ const (
 )
 
 type SwitchValue struct{ On bool }
-type SwitchSet struct{ On bool }  // control payload
-type SwitchInfo struct{ Pin int } // mirror LEDInfo shape if you like
+type SwitchSet struct{ On bool } // control payload
+type SwitchInfo struct{ Pin int }
 
 const (
 	KindPWM Kind = "pwm"

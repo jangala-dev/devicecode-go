@@ -2,11 +2,11 @@ package core
 
 import (
 	"context"
-	"time"
 
 	"devicecode-go/bus"
 	"devicecode-go/errcode"
 	"devicecode-go/types"
+	"devicecode-go/x/timex"
 )
 
 const eventQueueLen = 16
@@ -131,7 +131,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			// Initial status (retained)
 			h.conn.Publish(h.conn.NewMessage(
 				capStatus(domain, k, name),
-				types.CapabilityStatus{Link: types.LinkDown, TSms: nowMs()},
+				types.CapabilityStatus{Link: types.LinkDown, TSms: timex.NowMs()},
 				true,
 			))
 		}
@@ -215,18 +215,9 @@ func (h *HAL) handleEvent(ev Event) {
 func (h *HAL) pubHALState(level, status string) {
 	h.conn.Publish(h.conn.NewMessage(
 		T("hal", "state"),
-		types.HALState{Level: level, Status: status, TSms: nowMs()},
+		types.HALState{Level: level, Status: status, TSms: timex.NowMs()},
 		true,
 	))
-}
-
-func nowMs() int64 { return time.Now().UnixMilli() }
-
-func coalesce(s, d string) string {
-	if s == "" {
-		return d
-	}
-	return s
 }
 
 // Default domain inference unchanged.

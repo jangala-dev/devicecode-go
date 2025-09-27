@@ -19,7 +19,7 @@ const (
 	FuncGPIOIn PinFunc = iota
 	FuncGPIOOut
 	FuncPWM
-	// Extend here (e.g. FuncSPI_MOSI, FuncUART_TX, …) as you expose more functions.
+	// Extend here (e.g. FuncSPI_MOSI, FuncUART_TX, …) as we expose more functions.
 )
 
 // GPIO (function-specific view)

@@ -6,6 +6,7 @@ import (
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
+	"devicecode-go/x/strx"
 )
 
 func init() { core.RegisterBuilder("pwm_out", builder{}) }
@@ -35,17 +36,10 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		pin:  p.Pin,
 		pwm:  pwm,
 		pub:  in.Res.Pub,
-		dom:  coalesce(p.Domain, "io"),
-		name: coalesce(p.Name, in.ID),
+		dom:  strx.Coalesce(p.Domain, "io"),
+		name: strx.Coalesce(p.Name, in.ID),
 		freq: p.FreqHz,
 		top:  p.Top,
 	}
 	return dev, nil
-}
-
-func coalesce(s, d string) string {
-	if s == "" {
-		return d
-	}
-	return s
 }

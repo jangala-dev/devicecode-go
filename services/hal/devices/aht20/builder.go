@@ -2,12 +2,13 @@ package aht20dev
 
 import (
 	"context"
-	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
+	"devicecode-go/x/mathx"
+	"devicecode-go/x/timex"
 
 	"devicecode-go/drivers/aht20"
 )
@@ -94,26 +95,17 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			b := drvshim.NewI2CFromBus(bus).WithTimeout(50)
 			drv := aht20.New(b)
 
-			start := time.Now().UnixMilli()
+			start := timex.NowMs()
 			if err := drv.Read(); err != nil {
 				d.emitErr(string(errcode.MapDriverErr(err)), start)
 				return nil
 			}
 			decic := drv.DeciCelsius()
-			if decic > 32767 {
-				decic = 32767
-			}
-			if decic < -32768 {
-				decic = -32768
-			}
+			decic = mathx.Clamp(decic, -32768, 32767)
 			rhx100 := drv.DeciRelHumidity() * 10
-			if rhx100 < 0 {
-				rhx100 = 0
-			}
-			if rhx100 > 10000 {
-				rhx100 = 10000
-			}
-			ts := time.Now().UnixMilli()
+			rhx100 = mathx.Clamp(rhx100, 0, 10000)
+			ts := timex.NowMs()
+
 			d.pub.Emit(core.Event{
 				Addr:    d.addrTemp,
 				Payload: types.TemperatureValue{DeciC: int16(decic)},

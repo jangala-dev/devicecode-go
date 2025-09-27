@@ -2,12 +2,13 @@ package shtc3dev
 
 import (
 	"context"
-	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
+	"devicecode-go/x/mathx"
+	"devicecode-go/x/timex"
 
 	"tinygo.org/x/drivers/shtc3"
 )
@@ -90,27 +91,15 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			drv := shtc3.New(drvshim.NewI2CFromBus(bus))
 			_ = drv.WakeUp()
 			defer func() { _ = drv.Sleep() }()
-
-			t0 := time.Now().UnixMilli()
+			t0 := timex.NowMs()
 			tmc, rhx100, err := drv.ReadTemperatureHumidity()
 			if err != nil {
 				d.emitErr(string(errcode.MapDriverErr(err)), t0)
 				return nil
 			}
-			decic := tmc / 100
-			if decic > 32767 {
-				decic = 32767
-			}
-			if decic < -32768 {
-				decic = -32768
-			}
-			if rhx100 < 0 {
-				rhx100 = 0
-			}
-			if rhx100 > 10000 {
-				rhx100 = 10000
-			}
-			ts := time.Now().UnixMilli()
+			decic := mathx.Clamp(tmc/100, -32768, 32767)
+			rhx100 = mathx.Clamp(rhx100, 0, 10000)
+			ts := timex.NowMs()
 			d.pub.Emit(core.Event{
 				Addr:    d.addrTemp,
 				Payload: types.TemperatureValue{DeciC: int16(decic)},

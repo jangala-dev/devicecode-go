@@ -10,6 +10,9 @@ import (
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/provider/boards"
 	"devicecode-go/services/hal/internal/provider/setups"
+	"devicecode-go/x/mathx"
+	"devicecode-go/x/ramp"
+	"devicecode-go/x/timex"
 	"machine"
 )
 
@@ -90,14 +93,6 @@ func pwmGroupBySlice(slice uint8) pwmCtrl {
 	}
 }
 
-// computePeriodNs returns a nanosecond period for the requested frequency.
-func computePeriodNs(freqHz uint32) uint64 {
-	if freqHz == 0 {
-		freqHz = 1
-	}
-	return uint64(1_000_000_000 / uint64(freqHz))
-}
-
 type sliceCfg struct {
 	freqHz uint32
 	users  int
@@ -135,9 +130,7 @@ func (p *rp2PWM) setHW(logical uint16) {
 	if p.hwTop == 0 || p.reqTop == 0 {
 		return
 	}
-	if logical > p.reqTop {
-		logical = p.reqTop
-	}
+	logical = mathx.Min(logical, p.reqTop)
 	// Scale from logical [0..reqTop] to hardware [0..hwTop].
 	hw := (uint32(logical) * p.hwTop) / uint32(p.reqTop)
 	p.ctrl.Set(p.chIdx, hw)
@@ -145,12 +138,8 @@ func (p *rp2PWM) setHW(logical uint16) {
 }
 
 func (p *rp2PWM) Configure(freqHz uint32, top uint16) error {
-	if top == 0 {
-		top = 1
-	}
-	if freqHz == 0 {
-		freqHz = 1
-	}
+	top = mathx.Max(top, 1)
+	freqHz = mathx.Max(freqHz, 1)
 
 	globalPWM.mu.Lock()
 	defer globalPWM.mu.Unlock()
@@ -163,7 +152,7 @@ func (p *rp2PWM) Configure(freqHz uint32, top uint16) error {
 
 	if sc.users == 0 {
 		// First writer configures the controller period for this slice.
-		period := computePeriodNs(freqHz)
+		period := timex.PeriodFromHz(freqHz)
 		if err := p.ctrl.Configure(machine.PWMConfig{Period: period}); err != nil {
 			return err
 		}
@@ -224,91 +213,40 @@ func (p *rp2PWM) StopRamp() {
 }
 
 func (p *rp2PWM) Ramp(to uint16, durationMs uint32, steps uint16, _ core.PWMRampMode) bool {
-	// Degenerate cases: set immediately.
+	// Immediate set when degenerate.
 	if steps == 0 || durationMs == 0 {
 		p.Set(to)
 		return true
 	}
 
 	p.mu.Lock()
-	// Reject if a ramp is already active or channel not configured yet.
 	if p.rampAlive || p.reqTop == 0 {
 		p.mu.Unlock()
 		return false
 	}
-	// Clamp target to logical range.
-	target := to
-	if target > p.reqTop {
-		target = p.reqTop
-	}
+	tgt := mathx.Min(to, p.reqTop)
 	start := p.level
-
-	// Mark ramp active and capture needed fields.
 	cancel := make(chan struct{})
-	p.rampCancel = cancel
-	p.rampAlive = true
-	reqTop := p.reqTop
+	p.rampCancel, p.rampAlive = cancel, true
+	top := p.reqTop
 	p.mu.Unlock()
 
-	// Compute per-step duration in milliseconds (minimum 1ms).
-	stepDurMs := durationMs / uint32(steps)
-	if stepDurMs == 0 {
-		stepDurMs = 1
-	}
-	stepDur := time.Duration(stepDurMs) * time.Millisecond
-
-	// Worker goroutine: integer-only interpolation.
 	go func() {
-		defer func() {
-			p.mu.Lock()
-			p.rampAlive = false
-			p.mu.Unlock()
-		}()
-
-		s := int32(start)
-		t := int32(target)
-		d := t - s
-		acc := int32(0)
-		st := int32(steps)
-		cur := s
-
-		for i := uint16(1); i < steps; i++ {
-			// Check for cancellation without blocking.
+		defer func() { p.mu.Lock(); p.rampAlive = false; p.mu.Unlock() }()
+		tick := func(d time.Duration) bool {
 			select {
 			case <-cancel:
-				return
-			default:
+				return false
+			case <-time.After(d):
+				return true
 			}
-
-			// Bresenham-style accumulator:
-			acc += d
-			var inc int32
-			if acc >= 0 {
-				inc = acc / st
-			} else {
-				inc = -((-acc) / st)
-			}
-			if inc != 0 {
-				acc -= inc * st
-				cur += inc
-				if cur < 0 {
-					cur = 0
-				}
-				if cur > int32(reqTop) {
-					cur = int32(reqTop)
-				}
-				p.mu.Lock()
-				p.setHW(uint16(cur)) // scales to hardware top internally
-				p.mu.Unlock()
-			}
-
-			time.Sleep(stepDur)
 		}
-
-		// Final snap to the exact target.
-		p.Set(uint16(t))
+		ramp.StartLinear(start, tgt, top, durationMs, steps, tick, func(lvl uint16) {
+			p.mu.Lock()
+			p.setHW(lvl)
+			p.mu.Unlock()
+		})
 	}()
-
 	return true
 }
 
