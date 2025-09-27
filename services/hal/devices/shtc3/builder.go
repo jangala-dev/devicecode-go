@@ -45,8 +45,8 @@ type Device struct {
 	i2c core.I2COwner
 	pub core.EventEmitter
 
-	capTemp core.CapID
-	capHum  core.CapID
+	addrTemp core.CapAddr
+	addrHum  core.CapAddr
 }
 
 func (d *Device) ID() string { return d.id }
@@ -58,9 +58,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Kind:   types.KindTemperature,
 			Name:   d.id,
 			Info: types.Info{
-				SchemaVersion: 1,
-				Driver:        "shtc3",
-				Detail:        types.TemperatureInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
+				SchemaVersion: 1, Driver: "shtc3",
+				Detail: types.TemperatureInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
 			},
 		},
 		{
@@ -68,39 +67,27 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Kind:   types.KindHumidity,
 			Name:   d.id,
 			Info: types.Info{
-				SchemaVersion: 1,
-				Driver:        "shtc3",
-				Detail:        types.HumidityInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
+				SchemaVersion: 1, Driver: "shtc3",
+				Detail: types.HumidityInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
 			},
 		},
 	}
 }
 
-func (d *Device) BindCapabilities(ids []core.CapID) {
-	// Expect exactly 2: [temperature, humidity] in Capabilities() order.
-	if len(ids) >= 1 {
-		d.capTemp = ids[0]
-	}
-	if len(ids) >= 2 {
-		d.capHum = ids[1]
-	}
-}
-
+// Init sets up addresses now that ID and bus are known.
 func (d *Device) Init(ctx context.Context) error {
-	// No goroutine. Device is passive; reads happen when commanded.
+	d.addrTemp = core.CapAddr{Domain: "env", Kind: string(types.KindTemperature), Name: d.id}
+	d.addrHum = core.CapAddr{Domain: "env", Kind: string(types.KindHumidity), Name: d.id}
 	return nil
 }
 
 func (d *Device) Close() error { return nil }
 
-func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
+func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
 		ok := d.i2c.TryEnqueue(func(bus core.I2CBus) error {
-			// Construct a driver bound to the worker's bus each time.
 			drv := shtc3.New(drvshim.NewI2CFromBus(bus))
-
-			// Wake, read, sleep in one job to keep the bus time bounded.
 			_ = drv.WakeUp()
 			defer func() { _ = drv.Sleep() }()
 
@@ -110,8 +97,7 @@ func (d *Device) Control(_ core.CapID, method string, payload any) (core.Enqueue
 				d.emitErr(err.Error(), t0)
 				return nil
 			}
-			// shtc3 returns milli°C and hundredths of %RH.
-			decic := tmc / 100 // milli°C -> deci°C
+			decic := tmc / 100
 			if decic > 32767 {
 				decic = 32767
 			}
@@ -126,12 +112,12 @@ func (d *Device) Control(_ core.CapID, method string, payload any) (core.Enqueue
 			}
 			ts := time.Now().UnixMilli()
 			d.pub.Emit(core.Event{
-				CapID:   d.capTemp,
+				Addr:    d.addrTemp,
 				Payload: types.TemperatureValue{DeciC: int16(decic)},
 				TSms:    ts,
 			})
 			d.pub.Emit(core.Event{
-				CapID:   d.capHum,
+				Addr:    d.addrHum,
 				Payload: types.HumidityValue{RHx100: uint16(rhx100)},
 				TSms:    ts,
 			})
@@ -147,14 +133,6 @@ func (d *Device) Control(_ core.CapID, method string, payload any) (core.Enqueue
 }
 
 func (d *Device) emitErr(code string, t0 int64) {
-	d.pub.Emit(core.Event{
-		CapID: d.capTemp,
-		Err:   code,
-		TSms:  t0,
-	})
-	d.pub.Emit(core.Event{
-		CapID: d.capHum,
-		Err:   code,
-		TSms:  t0,
-	})
+	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TSms: t0})
+	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TSms: t0})
 }

@@ -6,41 +6,36 @@ import (
 	"devicecode-go/types"
 )
 
-// ---- Identity ---
+// ---- Addressing ----
 
-// CapID is a compact, system-unique identifier for a single capability.
-// It is assigned by the HAL when applying configuration and remains stable
-// for the lifetime of that configuration.
-type CapID uint32
+type CapAddr struct {
+	Domain string // e.g. "io","power","env"
+	Kind   string // e.g. "led","temperature"
+	Name   string // logical instance
+}
 
 // ---- Capability & device model ----
 
 type CapabilitySpec struct {
-	// Public addressing
-	Domain string     // eg. "io","power","env"; if empty, HAL will infer a default
-	Kind   types.Kind // capability kind (eg. KindLED, KindTemperature)
-	Name   string     // logical instance name (role/location); if empty, HAL uses device ID
-
-	Info  types.Info
-	TTLms int // reserved for cache; 0 = none
+	Domain string     // if empty, HAL will infer
+	Kind   types.Kind // capability kind
+	Name   string     // if empty, HAL uses device ID
+	Info   types.Info
+	TTLms  int // reserved; 0 = none
 }
 
 // Enqueue-only control outcome returned by devices.
 type EnqueueResult struct {
-	OK    bool   // accepted/enqueued
+	OK    bool
 	Error string // "busy","unsupported","invalid_payload","unknown_pin",...
 }
 
-// Device is device-centric: all controls are non-blocking and enqueue work.
-// Values/events are emitted later by the device itself via the HAL emitter.
+// Device is device-centric: controls are non-blocking.
 type Device interface {
 	ID() string
 	Capabilities() []CapabilitySpec
-	// BindCapabilities is called exactly once after HAL assigns CapIDs.
-	// The slice aligns positionally with Capabilities().
-	BindCapabilities(ids []CapID)
 	Init(ctx context.Context) error
-	Control(cap CapID, method string, payload any) (EnqueueResult, error)
+	Control(cap CapAddr, method string, payload any) (EnqueueResult, error)
 	Close() error
 }
 
@@ -54,4 +49,33 @@ type BuilderInput struct {
 
 type Builder interface {
 	Build(ctx context.Context, in BuilderInput) (Device, error)
+}
+
+// ---- Device → HAL telemetry ----
+// If Err != "", HAL publishes only status:degraded (retained).
+// If IsEvent == true, publish non-retained event (optionally tagged) and still set status:up.
+// Otherwise publish retained value and status:up.
+
+type Event struct {
+	Addr     CapAddr
+	Payload  any
+	TSms     int64
+	Err      string
+	IsEvent  bool
+	EventTag string
+}
+
+// ---- Event emission (devices → HAL) ----
+
+type EventEmitter interface {
+	// Emit publishes the event best-effort; it MUST NOT block the device
+	// for long-running operations (in this variant it forwards synchronously).
+	Emit(ev Event) bool
+}
+
+// ---- HAL-injected resources ----
+
+type Resources struct {
+	Reg ResourceRegistry
+	Pub EventEmitter
 }

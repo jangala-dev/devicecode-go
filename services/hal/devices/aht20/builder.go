@@ -50,8 +50,8 @@ type Device struct {
 	i2c core.I2COwner
 	pub core.EventEmitter
 
-	capTemp core.CapID
-	capHum  core.CapID
+	addrTemp core.CapAddr
+	addrHum  core.CapAddr
 }
 
 func (d *Device) ID() string { return d.id }
@@ -63,9 +63,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Kind:   types.KindTemperature,
 			Name:   d.id,
 			Info: types.Info{
-				SchemaVersion: 1,
-				Driver:        "aht20",
-				Detail:        types.TemperatureInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
+				SchemaVersion: 1, Driver: "aht20",
+				Detail: types.TemperatureInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
 			},
 		},
 		{
@@ -73,36 +72,25 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Kind:   types.KindHumidity,
 			Name:   d.id,
 			Info: types.Info{
-				SchemaVersion: 1,
-				Driver:        "aht20",
-				Detail:        types.HumidityInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
+				SchemaVersion: 1, Driver: "aht20",
+				Detail: types.HumidityInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
 			},
 		},
 	}
 }
 
-func (d *Device) BindCapabilities(ids []core.CapID) {
-	// Expect exactly 2: [temperature, humidity] in Capabilities() order.
-	if len(ids) >= 1 {
-		d.capTemp = ids[0]
-	}
-	if len(ids) >= 2 {
-		d.capHum = ids[1]
-	}
-}
-
 func (d *Device) Init(ctx context.Context) error {
-	// No goroutine. Device is passive; reads happen when commanded.
+	d.addrTemp = core.CapAddr{Domain: "env", Kind: string(types.KindTemperature), Name: d.id}
+	d.addrHum = core.CapAddr{Domain: "env", Kind: string(types.KindHumidity), Name: d.id}
 	return nil
 }
 
 func (d *Device) Close() error { return nil }
 
-func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
+func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
 		ok := d.i2c.TryEnqueue(func(bus core.I2CBus) error {
-			// Construct a driver bound to the worker's bus.
 			b := drvshim.NewI2CFromBus(bus).WithTimeout(50)
 			drv := aht20.New(b)
 
@@ -127,12 +115,12 @@ func (d *Device) Control(_ core.CapID, method string, payload any) (core.Enqueue
 			}
 			ts := time.Now().UnixMilli()
 			d.pub.Emit(core.Event{
-				CapID:   d.capTemp,
+				Addr:    d.addrTemp,
 				Payload: types.TemperatureValue{DeciC: int16(decic)},
 				TSms:    ts,
 			})
 			d.pub.Emit(core.Event{
-				CapID:   d.capHum,
+				Addr:    d.addrHum,
 				Payload: types.HumidityValue{RHx100: uint16(rhx100)},
 				TSms:    ts,
 			})
@@ -148,14 +136,6 @@ func (d *Device) Control(_ core.CapID, method string, payload any) (core.Enqueue
 }
 
 func (d *Device) emitErr(code string, t0 int64) {
-	d.pub.Emit(core.Event{
-		CapID: d.capTemp,
-		Err:   code,
-		TSms:  t0,
-	})
-	d.pub.Emit(core.Event{
-		CapID: d.capHum,
-		Err:   code,
-		TSms:  t0,
-	})
+	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TSms: t0})
+	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TSms: t0})
 }

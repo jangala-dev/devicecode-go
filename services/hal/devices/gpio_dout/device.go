@@ -10,10 +10,10 @@ import (
 
 type Params struct {
 	Pin       int
-	ActiveLow bool   // if true, logical ON == electrical LOW
-	Initial   bool   // logical initial state
-	Domain    string // optional override; default chosen by role
-	Name      string // optional override; default: device ID
+	ActiveLow bool
+	Initial   bool
+	Domain    string
+	Name      string
 }
 
 type Role int
@@ -32,8 +32,9 @@ type Device struct {
 	role      Role
 	domain    string
 	name      string
-	capID     core.CapID
 	initial   bool
+	// derived address for the single capability
+	addr core.CapAddr
 }
 
 func New(role Role, id string, p Params, h core.GPIOHandle, pub core.EventEmitter) *Device {
@@ -54,11 +55,16 @@ func New(role Role, id string, p Params, h core.GPIOHandle, pub core.EventEmitte
 	if d.domain == "" {
 		switch role {
 		case RoleSwitch:
-			d.domain = "power" // aligns with defaultDomainFor("switch")
+			d.domain = "power"
 		default:
 			d.domain = "io"
 		}
 	}
+	kind := string(types.KindLED)
+	if role == RoleSwitch {
+		kind = string(types.KindSwitch)
+	}
+	d.addr = core.CapAddr{Domain: d.domain, Kind: kind, Name: d.name}
 	return d
 }
 
@@ -91,14 +97,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	}
 }
 
-func (d *Device) BindCapabilities(ids []core.CapID) {
-	if len(ids) > 0 {
-		d.capID = ids[0]
-	}
-}
-
 func (d *Device) Init(ctx context.Context) error {
-	// apply logical initial -> electrical level
 	level := d.initial
 	if d.activeLow {
 		level = !level
@@ -106,14 +105,13 @@ func (d *Device) Init(ctx context.Context) error {
 	if err := d.pin.ConfigureOutput(level); err != nil {
 		return err
 	}
-	// publish initial retained value
 	d.emitValueNow()
 	return nil
 }
 
 func (d *Device) Close() error { return nil }
 
-func (d *Device) Control(_ core.CapID, method string, payload any) (core.EnqueueResult, error) {
+func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "set":
 		switch d.role {
@@ -165,7 +163,7 @@ func (d *Device) emitValueNow() {
 	switch d.role {
 	case RoleSwitch:
 		_ = d.pub.Emit(core.Event{
-			CapID:   d.capID,
+			Addr:    d.addr,
 			Payload: types.SwitchValue{On: d.getLogical()},
 			TSms:    ts,
 		})
@@ -175,7 +173,7 @@ func (d *Device) emitValueNow() {
 			v = 1
 		}
 		_ = d.pub.Emit(core.Event{
-			CapID:   d.capID,
+			Addr:    d.addr,
 			Payload: types.LEDValue{Level: v},
 			TSms:    ts,
 		})
