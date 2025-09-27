@@ -45,33 +45,27 @@ func (h *HAL) Run(ctx context.Context) {
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
 	defer h.conn.Unsubscribe(h.cfgSub)
 	defer h.conn.Unsubscribe(h.ctrlSub)
-
-	h.pubHALState("idle", "awaiting_config")
-
-	// Wait for initial config
-	var cfg types.HALConfig
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-h.cfgSub.Channel():
-			if v, ok := msg.Payload.(types.HALConfig); ok {
-				cfg = v
-				goto APPLY
-			}
-		}
-	}
-
-APPLY:
-	h.applyConfig(ctx, cfg)
-	h.pubHALState("ready", "")
-
+	ready := false
 	for {
 		select {
 		case <-ctx.Done():
 			h.pubHALState("stopped", "context_cancelled")
 			return
+		case msg := <-h.cfgSub.Channel():
+			if v, ok := msg.Payload.(types.HALConfig); ok {
+				// Existing applyConfig is additive/idempotent for existing devices.
+				h.applyConfig(ctx, v)
+				if !ready {
+					ready = true
+					h.pubHALState("ready", "")
+				}
+			}
 		case m := <-h.ctrlSub.Channel():
+			if !ready {
+				// Reject controls until HAL has a configuration.
+				h.replyErr(m, "hal_not_ready")
+				continue
+			}
 			h.handleControl(m) // strictly non-blocking
 		}
 	}
