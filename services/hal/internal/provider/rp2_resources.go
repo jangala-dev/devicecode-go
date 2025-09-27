@@ -6,8 +6,8 @@ import (
 	"sync"
 
 	"devicecode-go/services/hal/internal/core"
-	"devicecode-go/services/hal/internal/platform/boards"
-	"devicecode-go/services/hal/internal/platform/setups"
+	"devicecode-go/services/hal/internal/provider/boards"
+	"devicecode-go/services/hal/internal/provider/setups"
 	"machine"
 )
 
