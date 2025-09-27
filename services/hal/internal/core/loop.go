@@ -8,6 +8,8 @@ import (
 	"devicecode-go/types"
 )
 
+const eventQueueLen = 16
+
 type capKey struct {
 	domain string
 	kind   string
@@ -26,6 +28,9 @@ type HAL struct {
 
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
+
+	// Single-threaded publication of device events
+	evCh chan Event
 }
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
@@ -34,6 +39,7 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		res:      res,
 		dev:      map[string]Device{},
 		capIndex: map[capKey]string{},
+		evCh:     make(chan Event, eventQueueLen),
 	}
 	// HAL provides the emitter to devices.
 	h.res.Pub = h
@@ -67,6 +73,9 @@ func (h *HAL) Run(ctx context.Context) {
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
+		case ev := <-h.evCh:
+			// All device→HAL telemetry is published from this goroutine.
+			h.handleEvent(ev)
 		}
 	}
 }
@@ -237,9 +246,13 @@ func defaultDomainFor(kind string) string {
 	}
 }
 
-// ---- HAL as EventEmitter (now direct, no queue) ----
+// ---- HAL as EventEmitter (enqueue to single publisher) ----
 
 func (h *HAL) Emit(ev Event) bool {
-	h.handleEvent(ev)
-	return true
+	select {
+	case h.evCh <- ev:
+		return true
+	default:
+		return false
+	}
 }
