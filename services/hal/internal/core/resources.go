@@ -50,7 +50,7 @@ const (
 )
 
 type PWMHandle interface {
-	Configure(freqHz uint32, top uint16) error
+	Configure(freqHz uint64, top uint16) error
 	Set(level uint16)
 	Enable(on bool)
 	Info() (slice int, channel rune, pin int)
@@ -87,7 +87,7 @@ type I2COwner interface {
 type StreamEvent struct {
 	DevID string
 	Data  []byte
-	TSms  int64
+	TS    int64
 }
 
 type StreamStats struct {

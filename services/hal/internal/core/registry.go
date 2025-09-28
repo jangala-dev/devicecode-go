@@ -2,6 +2,7 @@ package core
 
 import (
 	"devicecode-go/types"
+	"devicecode-go/x/fmtx"
 	"sync"
 )
 
@@ -14,7 +15,7 @@ func RegisterBuilder(typ string, b Builder) {
 	regMu.Lock()
 	defer regMu.Unlock()
 	if _, exists := builders[typ]; exists {
-		panic("duplicate device builder: " + typ)
+		panic(fmtx.Sprintf("duplicate device builder: %s", typ))
 	}
 	builders[typ] = b
 }

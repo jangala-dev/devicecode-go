@@ -12,7 +12,6 @@ import (
 	"devicecode-go/services/hal/internal/provider/setups"
 	"devicecode-go/x/mathx"
 	"devicecode-go/x/ramp"
-	"devicecode-go/x/timex"
 	"machine"
 )
 
@@ -94,7 +93,7 @@ func pwmGroupBySlice(slice uint8) pwmCtrl {
 }
 
 type sliceCfg struct {
-	freqHz uint32
+	freqHz uint64
 	users  int
 }
 
@@ -112,7 +111,7 @@ type rp2PWM struct {
 
 	// Logical config (per channel)
 	reqTop uint16 // requested logical resolution (0..reqTop)
-	freqHz uint32 // requested frequency
+	freqHz uint64 // requested frequency
 
 	// Hardware info (per slice/controller)
 	hwTop uint32 // controller.Top() after Configure
@@ -137,7 +136,7 @@ func (p *rp2PWM) setHW(logical uint16) {
 	p.level = logical
 }
 
-func (p *rp2PWM) Configure(freqHz uint32, top uint16) error {
+func (p *rp2PWM) Configure(freqHz uint64, top uint16) error {
 	top = mathx.Max(top, 1)
 	freqHz = mathx.Max(freqHz, 1)
 
@@ -152,7 +151,7 @@ func (p *rp2PWM) Configure(freqHz uint32, top uint16) error {
 
 	if sc.users == 0 {
 		// First writer configures the controller period for this slice.
-		period := timex.PeriodFromHz(freqHz)
+		period := PeriodFromHz(freqHz)
 		if err := p.ctrl.Configure(machine.PWMConfig{Period: period}); err != nil {
 			return err
 		}
@@ -490,4 +489,11 @@ func (r *rp2Registry) ReleasePin(devID string, n int) {
 		}
 		delete(r.pinOwners, n)
 	}
+}
+
+func PeriodFromHz(hz uint64) uint64 {
+	if hz == 0 {
+		return 0 // or panic
+	}
+	return uint64(time.Second) / hz
 }

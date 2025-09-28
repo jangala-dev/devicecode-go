@@ -2,13 +2,13 @@ package aht20dev
 
 import (
 	"context"
+	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
 	"devicecode-go/x/mathx"
-	"devicecode-go/x/timex"
 
 	"devicecode-go/drivers/aht20"
 )
@@ -95,7 +95,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			b := drvshim.NewI2CFromBus(bus).WithTimeout(50)
 			drv := aht20.New(b)
 
-			start := timex.NowMs()
+			start := time.Now().UnixNano()
 			if err := drv.Read(); err != nil {
 				d.emitErr(string(errcode.MapDriverErr(err)), start)
 				return nil
@@ -104,17 +104,16 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			decic = mathx.Clamp(decic, -32768, 32767)
 			rhx100 := drv.DeciRelHumidity() * 10
 			rhx100 = mathx.Clamp(rhx100, 0, 10000)
-			ts := timex.NowMs()
-
+			ts := time.Now().UnixNano()
 			d.pub.Emit(core.Event{
 				Addr:    d.addrTemp,
 				Payload: types.TemperatureValue{DeciC: int16(decic)},
-				TSms:    ts,
+				TS:      ts,
 			})
 			d.pub.Emit(core.Event{
 				Addr:    d.addrHum,
 				Payload: types.HumidityValue{RHx100: uint16(rhx100)},
-				TSms:    ts,
+				TS:      ts,
 			})
 			return nil
 		})
@@ -128,6 +127,6 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 }
 
 func (d *Device) emitErr(code string, t0 int64) {
-	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TSms: t0})
-	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TSms: t0})
+	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TS: t0})
+	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TS: t0})
 }

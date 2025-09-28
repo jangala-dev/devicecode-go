@@ -60,7 +60,7 @@ type Builder interface {
 type Event struct {
 	Addr     CapAddr
 	Payload  any
-	TSms     int64
+	TS       int64
 	Err      string
 	IsEvent  bool
 	EventTag string

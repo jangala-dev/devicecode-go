@@ -2,11 +2,11 @@ package gpio_dout
 
 import (
 	"context"
+	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/timex"
 )
 
 type Params struct {
@@ -160,13 +160,13 @@ func (d *Device) getLogical() bool {
 }
 
 func (d *Device) emitValueNow() {
-	ts := timex.NowMs()
+	ts := time.Now().UnixNano()
 	switch d.role {
 	case RoleSwitch:
 		_ = d.pub.Emit(core.Event{
 			Addr:    d.addr,
 			Payload: types.SwitchValue{On: d.getLogical()},
-			TSms:    ts,
+			TS:      ts,
 		})
 	default:
 		var v uint8
@@ -176,7 +176,7 @@ func (d *Device) emitValueNow() {
 		_ = d.pub.Emit(core.Event{
 			Addr:    d.addr,
 			Payload: types.LEDValue{Level: v},
-			TSms:    ts,
+			TS:      ts,
 		})
 	}
 }

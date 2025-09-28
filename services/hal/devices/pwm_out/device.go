@@ -8,7 +8,6 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/timex"
 )
 
 type Device struct {
@@ -18,7 +17,7 @@ type Device struct {
 	pub  core.EventEmitter
 	dom  string
 	name string
-	freq uint32
+	freq uint64
 	top  uint16
 
 	addr core.CapAddr
@@ -43,7 +42,7 @@ func (d *Device) Init(ctx context.Context) error {
 	_ = d.pwm.Configure(d.freq, d.top) // map provider error to degraded in control if needed
 	d.addr = core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name}
 	// emit initial value (0)
-	d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: 0}, TSms: timex.NowMs()})
+	d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: 0}, TS: time.Now().UnixNano()})
 	return nil
 }
 
@@ -57,7 +56,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			return core.EnqueueResult{OK: false}, nil
 		}
 		d.pwm.Set(p.Level)
-		d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: p.Level}, TSms: time.Now().UnixMilli()})
+		d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: p.Level}, TS: time.Now().UnixNano()})
 		return core.EnqueueResult{OK: true}, nil
 	case "ramp":
 		p, ok := payload.(types.PWMRamp) // e.g. {To uint16, DurationMs uint32, Steps uint16, Mode uint8}

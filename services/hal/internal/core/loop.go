@@ -2,11 +2,12 @@ package core
 
 import (
 	"context"
+	"time"
 
 	"devicecode-go/bus"
 	"devicecode-go/errcode"
 	"devicecode-go/types"
-	"devicecode-go/x/timex"
+	"devicecode-go/x/fmtx"
 )
 
 const eventQueueLen = 16
@@ -89,7 +90,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		}
 		b, ok := lookupBuilder(dc.Type)
 		if !ok {
-			println("[hal] no builder for type:", dc.Type, "id:", dc.ID)
+			fmtx.Printf("[hal] no builder for type: %s id: %s\n", dc.Type, dc.ID)
 			continue
 		}
 		dev, err := b.Build(ctx, BuilderInput{
@@ -99,11 +100,11 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			Res:    h.res,
 		})
 		if err != nil {
-			println("[hal] build failed for:", dc.ID, "err:", err.Error())
+			fmtx.Printf("[hal] build failed for: %s err: %s\n", dc.ID, err.Error())
 			continue
 		}
 		if err := dev.Init(ctx); err != nil {
-			println("[hal] init failed for:", dc.ID)
+			fmtx.Printf("[hal] init failed for: %s\n", dc.ID)
 			continue
 		}
 		h.dev[dev.ID()] = dev
@@ -157,7 +158,7 @@ func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
-		h.pubStatus(d, k, n, ev.TSms, ev.Err)
+		h.pubStatus(d, k, n, ev.TS, ev.Err)
 		return
 	}
 	// 2) Success: event vs value
@@ -171,13 +172,13 @@ func (h *HAL) handleEvent(ev Event) {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 	}
 	// 3) Retained status: up
-	h.pubStatus(d, k, n, ev.TSms, "")
+	h.pubStatus(d, k, n, ev.TS, "")
 }
 
 func (h *HAL) pubHALState(level, status string) {
 	h.conn.Publish(h.conn.NewMessage(
 		T("hal", "state"),
-		types.HALState{Level: level, Status: status, TSms: timex.NowMs()},
+		types.HALState{Level: level, Status: status, TS: time.Now().UnixNano()},
 		true,
 	))
 }
@@ -208,7 +209,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 	// Publish initial status: down (retained).
 	h.conn.Publish(h.conn.NewMessage(
 		capStatus(domain, k, name),
-		types.CapabilityStatus{Link: types.LinkDown, TSms: timex.NowMs()},
+		types.CapabilityStatus{Link: types.LinkDown, TS: time.Now().UnixNano()},
 		true,
 	))
 }
@@ -222,7 +223,7 @@ func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
 	}
 	h.conn.Publish(h.conn.NewMessage(
 		capStatus(domain, kind, name),
-		types.CapabilityStatus{Link: link, TSms: ts, Error: err},
+		types.CapabilityStatus{Link: link, TS: ts, Error: err},
 		true,
 	))
 }

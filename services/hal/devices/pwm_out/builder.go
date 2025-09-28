@@ -13,7 +13,7 @@ func init() { core.RegisterBuilder("pwm_out", builder{}) }
 
 type Params struct {
 	Pin    int
-	FreqHz uint32 // desired frequency
+	FreqHz uint64 // desired frequency
 	Top    uint16 // wrap value
 	Domain string
 	Name   string

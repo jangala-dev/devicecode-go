@@ -5,7 +5,7 @@ package types
 type HALState struct {
 	Level  string `json:"level"`  // e.g. "idle", "ready", "stopped"
 	Status string `json:"status"` // freeform short code
-	TSms   int64  `json:"ts_ms"`
+	TS     int64  `json:"ts_ms"`
 }
 
 const (
@@ -16,7 +16,7 @@ const (
 
 type CapabilityStatus struct {
 	Link  string `json:"link"`
-	TSms  int64  `json:"ts_ms"`
+	TS    int64  `json:"ts_ms"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -74,7 +74,7 @@ type PWMInfo struct {
 	Pin     int    `json:"pin"`
 	Slice   int    `json:"slice,omitempty"`   // optional: provider may fill if known
 	Channel string `json:"channel,omitempty"` // "A" or "B", optional
-	FreqHz  uint32 `json:"freqHz,omitempty"`  // optional: device/provider may fill
+	FreqHz  uint64 `json:"freqHz,omitempty"`  // optional: device/provider may fill
 	Top     uint16 `json:"top,omitempty"`     // optional: device/provider may fill
 }
 
