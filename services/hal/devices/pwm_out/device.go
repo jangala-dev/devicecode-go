@@ -15,6 +15,7 @@ type Device struct {
 	pin  int
 	pwm  core.PWMHandle
 	pub  core.EventEmitter
+	reg  core.ResourceRegistry
 	dom  string
 	name string
 	freq uint64
@@ -46,7 +47,16 @@ func (d *Device) Init(ctx context.Context) error {
 	return nil
 }
 
-func (d *Device) Close() error { return nil }
+// Close stops any active ramp and releases the claimed pin.
+func (d *Device) Close() error {
+	if d.pwm != nil {
+		d.pwm.StopRamp()
+	}
+	if d.reg != nil {
+		d.reg.ReleasePin(d.id, d.pin)
+	}
+	return nil
+}
 
 func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {

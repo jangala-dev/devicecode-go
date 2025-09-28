@@ -30,7 +30,7 @@ func (b gpioBuilder) Build(ctx context.Context, in core.BuilderInput) (core.Devi
 	// Note: Device.New applies sensible defaults:
 	//  - RoleSwitch => domain "power" if empty
 	//  - RoleLED    => domain "io"    if empty
-	return New(b.role, in.ID, p, gpio, in.Res.Pub), nil
+	return New(b.role, in.ID, p, gpio, in.Res.Pub, in.Res.Reg), nil
 }
 
 // Parameter parsing retained as-is.

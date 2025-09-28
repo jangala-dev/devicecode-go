@@ -122,6 +122,10 @@ type rp2PWM struct {
 	// Ramp state
 	rampCancel chan struct{}
 	rampAlive  bool
+
+	// User accounting (slice-level): true once this handle has contributed
+	// to slice users. Prevents double-counting on repeated Configure calls.
+	registered bool
 }
 
 // caller holds lock
@@ -157,12 +161,27 @@ func (p *rp2PWM) Configure(freqHz uint64, top uint16) error {
 		}
 		sc.freqHz = freqHz
 		sc.users = 1
+		p.registered = true
 	} else {
-		// Enforce slice-wide frequency compatibility.
-		if sc.freqHz != freqHz {
+		// Already in use. If this handle has not yet been counted, enforce
+		// frequency compatibility and then count it. If it *has* been counted,
+		// allow reconfiguration only if this is the sole user.
+		if !p.registered {
+			if sc.freqHz != freqHz {
+				return errcode.Conflict
+			}
+			sc.users++
+			p.registered = true
+		} else if sc.users == 1 && sc.freqHz != freqHz {
+			// Sole user may reconfigure the slice frequency.
+			period := PeriodFromHz(freqHz)
+			if err := p.ctrl.Configure(machine.PWMConfig{Period: period}); err != nil {
+				return err
+			}
+			sc.freqHz = freqHz
+		} else if sc.freqHz != freqHz {
 			return errcode.Conflict
 		}
-		sc.users++
 	}
 
 	// Switch pin to PWM function and cache tops.
@@ -324,6 +343,8 @@ func (o *i2cOwner) loop() {
 	}
 }
 
+func (o *i2cOwner) stop() { close(o.quit) }
+
 func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, _ int) error {
 	return o.hw.Tx(addr, w, r)
 }
@@ -346,6 +367,7 @@ type rp2Registry struct {
 	// Unified pin ownership.
 	pinOwners map[int]pinOwner // pin -> owner
 	gpioMap   map[int]*rp2GPIO // pin -> GPIO view (cached)
+	pwmMap    map[int]*rp2PWM  // pin -> PWM view (cached; for reset/release)
 
 	// I²C
 	i2cOwners map[core.ResourceID]*i2cOwner
@@ -360,6 +382,7 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 	r := &rp2Registry{
 		pinOwners: make(map[int]pinOwner),
 		gpioMap:   make(map[int]*rp2GPIO),
+		pwmMap:    make(map[int]*rp2PWM),
 		i2cOwners: make(map[core.ResourceID]*i2cOwner),
 	}
 
@@ -470,6 +493,8 @@ func (r *rp2Registry) ClaimPin(devID string, n int, fn core.PinFunc) (core.PinHa
 			slice: int(sliceNum),
 			ch:    chRune,
 		}
+		// Cache for later cleanup on release.
+		r.pwmMap[n] = ph.pwm
 
 	default:
 		return nil, errcode.Unsupported
@@ -483,10 +508,43 @@ func (r *rp2Registry) ReleasePin(devID string, n int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if owner, ok := r.pinOwners[n]; ok && owner.devID == devID {
-		// Safe default: put the pin back to input.
+		// PWM-specific cleanup (stop ramp, duty=0, slice accounting).
+		if owner.fn == core.FuncPWM {
+			if p, okp := r.pwmMap[n]; okp && p != nil {
+				// Stop any active ramp and drive 0 safely.
+				p.StopRamp()
+				p.mu.Lock()
+				// setHW respects reqTop/hwTop; if never configured, drive via controller.
+				if p.hwTop != 0 && p.reqTop != 0 {
+					p.setHW(0)
+				} else {
+					p.ctrl.Set(p.chIdx, 0)
+				}
+				p.enabled = false
+				p.mu.Unlock()
+
+				// Slice user accounting.
+				globalPWM.mu.Lock()
+				if sc := globalPWM.slice[p.slice]; sc != nil && p.registered && sc.users > 0 {
+					sc.users--
+					if sc.users == 0 {
+						sc.freqHz = 0
+					}
+					p.registered = false
+				}
+				globalPWM.mu.Unlock()
+			}
+		}
+
+		// In all cases, put the pin back to input.
 		if g, ok2 := r.gpioMap[n]; ok2 && g != nil {
 			g.p.Configure(machine.PinConfig{Mode: machine.PinInput})
+		} else {
+			machine.Pin(n).Configure(machine.PinConfig{Mode: machine.PinInput})
 		}
+
+		// Drop cached PWM view if present.
+		delete(r.pwmMap, n)
 		delete(r.pinOwners, n)
 	}
 }
@@ -496,4 +554,15 @@ func PeriodFromHz(hz uint64) uint64 {
 		return 0 // or panic
 	}
 	return uint64(time.Second) / hz
+}
+
+// Close stops background workers (e.g. per-bus I²C goroutines).
+func (r *rp2Registry) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, o := range r.i2cOwners {
+		if o != nil {
+			o.stop()
+		}
+	}
 }

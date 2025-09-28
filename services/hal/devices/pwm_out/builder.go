@@ -36,6 +36,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		pin:  p.Pin,
 		pwm:  pwm,
 		pub:  in.Res.Pub,
+		reg:  in.Res.Reg,
 		dom:  strx.Coalesce(p.Domain, "io"),
 		name: strx.Coalesce(p.Name, in.ID),
 		freq: p.FreqHz,

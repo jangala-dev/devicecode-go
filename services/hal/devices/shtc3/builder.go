@@ -36,6 +36,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		bus: p.Bus,
 		i2c: own,
 		pub: in.Res.Pub,
+		reg: in.Res.Reg,
 	}, nil
 }
 
@@ -45,6 +46,7 @@ type Device struct {
 
 	i2c core.I2COwner
 	pub core.EventEmitter
+	reg core.ResourceRegistry
 
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
@@ -82,7 +84,12 @@ func (d *Device) Init(ctx context.Context) error {
 	return nil
 }
 
-func (d *Device) Close() error { return nil }
+func (d *Device) Close() error {
+	if d.reg != nil {
+		d.reg.ReleaseI2C(d.id, core.ResourceID(d.bus))
+	}
+	return nil
+}
 
 func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {

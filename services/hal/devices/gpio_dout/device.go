@@ -30,6 +30,7 @@ type Device struct {
 	pinN      int
 	activeLow bool
 	pub       core.EventEmitter
+	reg       core.ResourceRegistry
 	role      Role
 	domain    string
 	name      string
@@ -38,13 +39,14 @@ type Device struct {
 	addr core.CapAddr
 }
 
-func New(role Role, id string, p Params, h core.GPIOHandle, pub core.EventEmitter) *Device {
+func New(role Role, id string, p Params, h core.GPIOHandle, pub core.EventEmitter, reg core.ResourceRegistry) *Device {
 	d := &Device{
 		id:        id,
 		pin:       h,
 		pinN:      p.Pin,
 		activeLow: p.ActiveLow,
 		pub:       pub,
+		reg:       reg,
 		role:      role,
 		domain:    p.Domain,
 		name:      p.Name,
@@ -110,7 +112,12 @@ func (d *Device) Init(ctx context.Context) error {
 	return nil
 }
 
-func (d *Device) Close() error { return nil }
+func (d *Device) Close() error {
+	if d.reg != nil {
+		d.reg.ReleasePin(d.id, d.pinN)
+	}
+	return nil
+}
 
 func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {

@@ -10,7 +10,7 @@ import (
 	"devicecode-go/x/fmtx"
 )
 
-const eventQueueLen = 16
+const eventQueueLen = 32
 
 type capKey struct {
 	domain string
@@ -57,6 +57,7 @@ func (h *HAL) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			h.shutdown()
 			h.pubHALState("stopped", "context_cancelled")
 			return
 		case msg := <-h.cfgSub.Channel():
@@ -79,6 +80,18 @@ func (h *HAL) Run(ctx context.Context) {
 			// All device→HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
 		}
+	}
+}
+
+// shutdown attempts a best-effort, orderly release of resources.
+func (h *HAL) shutdown() {
+	// 1) Ask devices to close and relinquish their claims.
+	for _, d := range h.dev {
+		_ = d.Close()
+	}
+	// 2) If the registry supports Close(), stop background workers (e.g. I2C).
+	if c, ok := h.res.Reg.(interface{ Close() }); ok {
+		c.Close()
 	}
 }
 
