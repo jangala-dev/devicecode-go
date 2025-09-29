@@ -8,31 +8,9 @@ import (
 	"devicecode-go/bus"
 	"devicecode-go/services/hal"
 	"devicecode-go/types"
+	"devicecode-go/x/strconvx"
 )
 
-// tiny helpers (no fmt)
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	sign := ""
-	if i < 0 {
-		sign = "-"
-		i = -i
-	}
-	var buf [32]byte
-	b := len(buf)
-	for i > 0 {
-		b--
-		buf[b] = byte('0' + (i % 10))
-		i /= 10
-	}
-	if sign != "" {
-		b--
-		buf[b] = '-'
-	}
-	return string(buf[b:])
-}
 func printTopicWith(prefix string, t bus.Topic) {
 	print(prefix)
 	print(" ")
@@ -68,9 +46,9 @@ func printDeci(label string, deci int) {
 	frac := deci % 10
 	print(label)
 	print(sign)
-	print(itoa(whole))
+	print(strconvx.Itoa(whole))
 	print(".")
-	print(itoa(frac))
+	print(strconvx.Itoa(frac))
 	println()
 }
 
@@ -81,12 +59,12 @@ func printHundredths(label string, hx100 int) {
 	whole := hx100 / 100
 	frac := hx100 % 100
 	print(label)
-	print(itoa(whole))
+	print(strconvx.Itoa(whole))
 	print(".")
 	if frac < 10 {
 		print("0")
 	}
-	print(itoa(frac))
+	print(strconvx.Itoa(frac))
 	println()
 }
 
