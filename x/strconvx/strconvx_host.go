@@ -1,4 +1,4 @@
-//go:build !mcu
+//go:build !rp2040
 
 package strconvx
 
