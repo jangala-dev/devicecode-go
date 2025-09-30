@@ -281,8 +281,8 @@ func (d *Device) startSession(rxSize, txSize int) {
 	go d.txLoop(s)
 	// LinkUp now that session is ready
 	d.res.Pub.Emit(core.Event{
-		Addr: core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
-		TS:   time.Now().UnixNano(),
+		Addr: d.a, TS: time.Now().UnixNano(),
+		IsEvent: true, EventTag: "link_up",
 	})
 }
 

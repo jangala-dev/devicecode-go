@@ -27,19 +27,21 @@ func capEventTagged(domain, kind, name, tag string) bus.Topic {
 
 // capability control
 // hal/cap/<domain>/<kind>/<name>/control/<verb>
-func capCtrl(domain, kind, name, verb string) bus.Topic {
-	return capBase(domain, kind, name).Append("control", verb)
+func parseCapCtrl(t bus.Topic) (CapAddr, string, bool) {
+	if t.Len() < 7 {
+		return CapAddr{}, "", false
+	}
+	d, ok1 := t.At(2).(string)
+	k, ok2 := t.At(3).(string)
+	n, ok3 := t.At(4).(string)
+	v, ok4 := t.At(6).(string)
+	if !(ok1 && ok2 && ok3 && ok4) {
+		return CapAddr{}, "", false
+	}
+	return CapAddr{Domain: d, Kind: k, Name: n}, v, true
 }
 
 // hal/cap/+/+/+/control/+
 func ctrlWildcard() bus.Topic {
 	return T("hal", "cap", "+", "+", "+", "control", "+")
-}
-
-// Serial convenience tags (pure aliases for clarity at call sites)
-func serialRXEvent(domain, name string) bus.Topic {
-	return capEventTagged(domain, "serial", name, "rx")
-}
-func serialTXEvent(domain, name string) bus.Topic {
-	return capEventTagged(domain, "serial", name, "tx")
 }

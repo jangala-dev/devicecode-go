@@ -616,8 +616,10 @@ func (r *rp2Registry) ReleasePin(devID string, n int) {
 
 				// Slice user accounting.
 				globalPWM.mu.Lock()
-				if sc := globalPWM.slice[p.slice]; sc != nil && p.registered && sc.users > 0 {
-					sc.users--
+				if sc := globalPWM.slice[p.slice]; sc != nil && p.registered {
+					if sc.users > 0 {
+						sc.users--
+					}
 					if sc.users == 0 {
 						sc.freqHz = 0
 					}

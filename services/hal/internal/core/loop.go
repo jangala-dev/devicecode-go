@@ -77,7 +77,7 @@ func (h *HAL) Run(ctx context.Context) {
 			}
 			h.handleControl(m) // strictly non-blocking
 		case ev := <-h.evCh:
-			// All device->HAL telemetry is published from this goroutine.
+			// All device→HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
 		}
 	}
@@ -129,27 +129,24 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 
 func (h *HAL) handleControl(msg *bus.Message) {
 	// hal/cap/<domain>/<kind>/<name>/control/<verb>
-	if msg.Topic.Len() < 7 {
+	cap, verb, ok := parseCapCtrl(msg.Topic)
+	if !ok {
 		h.reply(msg, false, errcode.InvalidTopic, nil)
 		return
 	}
-	domain, _ := msg.Topic.At(2).(string)
-	kind, _ := msg.Topic.At(3).(string)
-	name, _ := msg.Topic.At(4).(string)
-	verb, _ := msg.Topic.At(6).(string)
 
-	ownerID, ok := h.capIndex[capKey{domain: domain, kind: kind, name: name}]
+	ownerID, ok := h.capIndex[capKey{domain: cap.Domain, kind: cap.Kind, name: cap.Name}]
 	if !ok {
 		h.reply(msg, false, errcode.UnknownCapability, nil)
 		return
 	}
 	dev := h.dev[ownerID]
 	if dev == nil {
-		h.reply(msg, false, errcode.Error, nil) // defensive fallback
+		h.reply(msg, false, errcode.Error, nil)
 		return
 	}
 
-	res, err := dev.Control(CapAddr{Domain: domain, Kind: kind, Name: name}, verb, msg.Payload)
+	res, err := dev.Control(cap, verb, msg.Payload)
 	if err != nil {
 		h.reply(msg, false, "", err)
 		return
@@ -166,7 +163,7 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
-	// 1) Error -> retained status:degraded; no value/event published.
+	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
 		h.pubStatus(d, k, n, ev.TS, ev.Err)
 		return
@@ -225,7 +222,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 }
 
 // pubStatus publishes a retained status update for a capability.
-// err=="" -> LinkUp; otherwise LinkDegraded and Error is included.
+// err=="" → LinkUp; otherwise LinkDegraded and Error is included.
 func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
 	link := types.LinkUp
 	if err != "" {
