@@ -1,6 +1,10 @@
 package core
 
-import "context"
+import (
+	"context"
+
+	"tinygo.org/x/drivers"
+)
 
 // ---- Bus taxonomy ----
 
@@ -69,28 +73,9 @@ type PinHandle interface {
 	AsPWM() PWMHandle   // only valid if claimed with FuncPWM
 }
 
-// ---- Transactional buses ----
-// Single *per-bus* worker goroutine that serialises hardware access.
-
-type I2CBus interface {
-	Tx(addr uint16, w []byte, r []byte) error
-}
-
-// Closure-free job for the I2C worker. Implementations are reusable objects.
-type I2CJob interface {
-	Run(bus I2CBus) error
-}
-
-// I2COwner exposes both direct Tx and job enqueue.
-// timeoutMS: 0 => provider default for direct Tx (if the provider supports one).
-type I2COwner interface {
-	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
-	// Legacy closure form (retained for compatibility).
-	// TryEnqueue MUST be non-blocking: returns false if the queue is saturated.
-	TryEnqueue(job func(bus I2CBus) error) bool
-	// NEW: closure-free form to avoid per-call heap pressure. Non-blocking.
-	TryEnqueueJob(job I2CJob) bool
-}
+// ---- Transactional buses (I²C) ----
+// Option B: the provider returns a drivers.I2C view that serialises access
+// via a per-bus worker. No job types or owner APIs are exposed here.
 
 // ---- Stream buses (shape reserved; provider can fill in) ----
 
@@ -117,8 +102,9 @@ type ResourceRegistry interface {
 	// Optional classification/introspection for controller-style resources.
 	ClassOf(id ResourceID) (BusClass, bool)
 
-	// Transactional buses
-	ClaimI2C(devID string, id ResourceID) (I2COwner, error)
+	// Transactional buses (I²C): return a drivers.I2C view
+	// that is safe to use concurrently and enforces per-bus serialisation.
+	ClaimI2C(devID string, id ResourceID) (drivers.I2C, error)
 	ReleaseI2C(devID string, id ResourceID)
 
 	// Serial buses

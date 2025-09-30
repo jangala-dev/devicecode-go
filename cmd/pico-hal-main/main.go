@@ -202,7 +202,7 @@ func main() {
 			} else {
 				printTopicWith("[main] pwm ramp control reply on", reply.Topic)
 			}
-			// runtime.GC()
+			runtime.GC()
 			printMem()
 
 		case <-sensorTicker.C:

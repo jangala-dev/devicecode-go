@@ -2,14 +2,15 @@ package shtc3dev
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
-	"devicecode-go/services/hal/internal/drvshim"
 	"devicecode-go/types"
 	"devicecode-go/x/mathx"
 
+	"tinygo.org/x/drivers"
 	"tinygo.org/x/drivers/shtc3"
 )
 
@@ -26,7 +27,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if !ok || p.Bus == "" {
 		return nil, errcode.InvalidParams
 	}
-	own, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
+	bus, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
 	if err != nil {
 		return nil, err
 	}
@@ -34,18 +35,11 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	d := &Device{
 		id:  in.ID,
 		bus: p.Bus,
-		i2c: own,
+		i2c: bus,
 		pub: in.Res.Pub,
 		reg: in.Res.Reg,
 	}
-
-	// Persistent hot-swappable I2C shim and driver instance.
-	d.hot = &drvshim.HotI2C{}
-	d.drv = shtc3.New(d.hot)
-
-	// Reusable, closure-free job object.
-	d.jobRead = &shtc3ReadJob{d: d}
-
+	d.drv = shtc3.New(bus) // drivers.I2C directly
 	return d, nil
 }
 
@@ -53,17 +47,15 @@ type Device struct {
 	id  string
 	bus string
 
-	i2c core.I2COwner
+	i2c drivers.I2C
 	pub core.EventEmitter
 	reg core.ResourceRegistry
 
-	// Persisted bus shim and driver (no per-call allocations).
-	hot     *drvshim.HotI2C
-	drv     shtc3.Device
-	jobRead *shtc3ReadJob
-
+	drv      shtc3.Device
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
+
+	reading atomic.Uint32
 }
 
 func (d *Device) ID() string { return d.id }
@@ -105,19 +97,24 @@ func (d *Device) Close() error {
 	return nil
 }
 
-// Compile-time check.
-var _ core.I2CJob = (*shtc3ReadJob)(nil)
+func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
+	switch method {
+	case "read":
+		if d.reading.Swap(1) == 1 {
+			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
+		}
+		go func() {
+			defer d.reading.Store(0)
+			d.readOnce()
+		}()
+		return core.EnqueueResult{OK: true}, nil
+	default:
+		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
+	}
+}
 
-// Reusable, closure-free job value.
-type shtc3ReadJob struct{ d *Device }
-
-func (j *shtc3ReadJob) Run(bus core.I2CBus) error {
-	d := j.d
-
-	// Bind the hot shim to the worker's per-job bus.
-	d.hot.Bind(bus)
-
-	// Wake, read, sleep within the worker context.
+func (d *Device) readOnce() {
+	// Wake, read, sleep in the same goroutine; driver is blocking.
 	_ = d.drv.WakeUp()
 	defer func() { _ = d.drv.Sleep() }()
 
@@ -125,7 +122,7 @@ func (j *shtc3ReadJob) Run(bus core.I2CBus) error {
 	tmc, rhx100, err := d.drv.ReadTemperatureHumidity()
 	if err != nil {
 		d.emitErr(string(errcode.MapDriverErr(err)), t0)
-		return nil
+		return
 	}
 
 	// Convert: tmc is milli-°C; publish deci-°C. Clamp ranges.
@@ -143,19 +140,6 @@ func (j *shtc3ReadJob) Run(bus core.I2CBus) error {
 		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
 		TS:      ts,
 	})
-	return nil
-}
-
-func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
-	switch method {
-	case "read":
-		if !d.i2c.TryEnqueueJob(d.jobRead) {
-			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
-		}
-		return core.EnqueueResult{OK: true}, nil
-	default:
-		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
-	}
 }
 
 func (d *Device) emitErr(code string, t0 int64) {

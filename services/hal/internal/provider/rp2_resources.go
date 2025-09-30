@@ -16,6 +16,7 @@ import (
 	"machine"
 
 	uartx "github.com/jangala-dev/tinygo-uartx/uartx"
+	"tinygo.org/x/drivers"
 )
 
 // Ensure the provider satisfies the contracts at compile time.
@@ -312,120 +313,90 @@ func (h *rp2PinHandle) AsPWM() core.PWMHandle {
 // I²C owner (one worker per bus)
 // -----------------------------------------------------------------------------
 
+// request posted to the per-bus worker
+type i2cReq struct {
+	addr uint16
+	w, r []byte
+	done chan error // buffered(1); worker replies best-effort
+}
+
+// per-bus owner that hosts a single worker goroutine
 type i2cOwner struct {
 	id   core.ResourceID
 	hw   *machine.I2C
-	jobs chan func(bus core.I2CBus) error // best-effort, non-blocking enqueue
-	jifs chan core.I2CJob
-	reqs chan i2cReq // synchronous Tx requests (prioritised)
+	reqs chan i2cReq
 	quit chan struct{}
-}
-
-type i2cReq struct {
-	do    func(bus core.I2CBus) error // work to execute in worker context
-	reply chan error                  // buffered(1); worker sends completion status
 }
 
 func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 	o := &i2cOwner{
 		id:   id,
 		hw:   hw,
-		jobs: make(chan func(core.I2CBus) error, 16),
-		jifs: make(chan core.I2CJob, 16),
-		reqs: make(chan i2cReq, 8),
+		reqs: make(chan i2cReq, 16),
 		quit: make(chan struct{}),
 	}
 	go o.loop()
 	return o
 }
 
-type txBus struct{ hw *machine.I2C }
-
-func (b txBus) Tx(addr uint16, w, r []byte) error { return b.hw.Tx(addr, w, r) }
-
 func (o *i2cOwner) loop() {
-	b := txBus{hw: o.hw}
-
 	for {
 		select {
-		// Prioritise synchronous Tx to reduce control-path latency.
 		case req := <-o.reqs:
-			err := req.do(b)
-			// Best-effort reply; never block the worker.
+			err := o.hw.Tx(req.addr, req.w, req.r)
+			// best-effort reply; do not block the worker
 			select {
-			case req.reply <- err:
+			case req.done <- err:
 			default:
 			}
-
-		case ji := <-o.jifs:
-			_ = ji.Run(b) // devices map/report their own errors
-
-		case job := <-o.jobs:
-			_ = job(b) // devices map/report their own errors
-
 		case <-o.quit:
 			return
 		}
 	}
 }
 
-func (o *i2cOwner) TryEnqueueJob(job core.I2CJob) bool {
-	select {
-	case o.jifs <- job:
-		return true
-	default:
-		return false
-	}
-}
-
 func (o *i2cOwner) stop() { close(o.quit) }
 
-// Tx is  serialised with queued jobs by routing through the worker.
-// timeoutMS semantics:
-//   - 0 => no timeout for enqueue or completion.
-//   - >0 => overall budget used both to enqueue the request and to wait for completion.
-//     If enqueue times out, Busy is returned; if completion times out, Timeout is returned.
-func (o *i2cOwner) Tx(addr uint16, w, r []byte, timeoutMS int) error {
-	reply := make(chan error, 1)
-	req := i2cReq{
-		do:    func(bus core.I2CBus) error { return bus.Tx(addr, w, r) },
-		reply: reply,
+// driversI2C adapts the owner to tinygo.org/x/drivers.I2C.
+// It posts a request and optionally enforces a per-call timeout.
+type driversI2C struct {
+	o       *i2cOwner
+	timeout time.Duration // 0 => no deadline
+}
+
+// Ensure compile-time conformance with drivers.I2C
+var _ drivers.I2C = (*driversI2C)(nil)
+
+func (d *driversI2C) Tx(addr uint16, w, r []byte) error {
+	req := i2cReq{addr: addr, w: w, r: r, done: make(chan error, 1)}
+
+	if d.timeout <= 0 {
+		// Unbounded enqueue (blocks until space is available)
+		d.o.reqs <- req
+	} else {
+		// Bounded enqueue
+		t := time.NewTimer(d.timeout)
+		select {
+		case d.o.reqs <- req:
+			if !t.Stop() {
+				<-t.C
+			}
+		case <-t.C:
+			return errcode.Busy
+		}
 	}
 
-	// Untimed path: fully blocking enqueue + completion.
-	if timeoutMS <= 0 {
-		o.reqs <- req
-		return <-reply
+	// Completion
+	if d.timeout <= 0 {
+		return <-req.done
 	}
-
-	// Timed path: single overall budget shared by enqueue and completion.
-	t := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+	t := time.NewTimer(d.timeout)
 	defer t.Stop()
-
-	// Enqueue phase (budgeted).
 	select {
-	case o.reqs <- req:
-		// proceed to completion using the SAME timer
-	case <-t.C:
-		return errcode.Busy // cannot place the request within budget
-	}
-
-	// Completion phase (consumes remaining budget on the same timer).
-	select {
-	case err := <-reply:
+	case err := <-req.done:
 		return err
 	case <-t.C:
 		return errcode.Timeout
-	}
-}
-
-// TryEnqueue keeps its non-blocking semantics and shares the worker.
-func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
-	select {
-	case o.jobs <- job:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -522,17 +493,18 @@ func (r *rp2Registry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
 }
 
 // Transactional buses (I2C)
-func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner, error) {
+func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (drivers.I2C, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	o := r.i2cOwners[id]
 	if o == nil {
 		return nil, errcode.UnknownBus
 	}
-	return o, nil
+	return &driversI2C{o: o, timeout: 250 * time.Millisecond}, nil
 }
+
 func (r *rp2Registry) ReleaseI2C(devID string, id core.ResourceID) {
-	// Owners are long-lived per bus; nothing to do.
+	// Owners are long-lived per bus; nothing to do here.
 }
 
 // Serial
