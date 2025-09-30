@@ -35,3 +35,11 @@ func capCtrl(domain, kind, name, verb string) bus.Topic {
 func ctrlWildcard() bus.Topic {
 	return T("hal", "cap", "+", "+", "+", "control", "+")
 }
+
+// Serial convenience tags (pure aliases for clarity at call sites)
+func serialRXEvent(domain, name string) bus.Topic {
+	return capEventTagged(domain, "serial", name, "rx")
+}
+func serialTXEvent(domain, name string) bus.Topic {
+	return capEventTagged(domain, "serial", name, "tx")
+}

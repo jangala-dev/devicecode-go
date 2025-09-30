@@ -5,6 +5,8 @@ package setups
 import (
 	aht20dev "devicecode-go/services/hal/devices/aht20"
 	"devicecode-go/services/hal/devices/gpio_dout"
+	"devicecode-go/services/hal/devices/pwm_out"
+	serialraw "devicecode-go/services/hal/devices/serial_raw"
 
 	"devicecode-go/types"
 )
@@ -12,12 +14,13 @@ import (
 // SelectedPlan wires controllers to pins and sets operating parameters for this setup.
 var SelectedPlan = ResourcePlan{
 	I2C: []I2CPlan{
-		{ID: "i2c0", SDA: 4, SCL: 5, Hz: 400_000},
-		{ID: "i2c1", SDA: 2, SCL: 3, Hz: 400_000},
+		{ID: "i2c0", SDA: 12, SCL: 13, Hz: 400_000},
+		{ID: "i2c1", SDA: 18, SCL: 19, Hz: 400_000},
 	},
 	UART: []UARTPlan{
+		// RP2040 default pins for Pico
 		{ID: "uart0", TX: 0, RX: 1, Baud: 115200},
-		// add more as needed
+		{ID: "uart1", TX: 4, RX: 5, Baud: 115200},
 	},
 }
 
@@ -25,6 +28,26 @@ var SelectedPlan = ResourcePlan{
 // Names are chosen for meaningful public addresses under hal/cap/…
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
+
+		// Raw serial device bound to uart0 (public address hal/cap/io/serial/uart0/…)
+		{ID: "uart0_raw", Type: "serial_raw", Params: serialraw.Params{
+			Bus:    "uart0",
+			Domain: "io",
+			Name:   "uart0",
+			Baud:   115200,
+			RXSize: 512,
+			TXSize: 512,
+		}},
+
+		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
+		{ID: "uart1_raw", Type: "serial_raw", Params: serialraw.Params{
+			Bus:    "uart1",
+			Domain: "io",
+			Name:   "uart1",
+			Baud:   115200,
+			RXSize: 512,
+			TXSize: 512,
+		}},
 		// Gates / enables -> switches (power domain)
 		{ID: "mpcie-usb", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 6, ActiveLow: false, Initial: false}},
 		{ID: "m2", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 7, ActiveLow: false, Initial: false}},
@@ -33,8 +56,18 @@ var SelectedSetup = types.HALConfig{
 		{ID: "fan-5v", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 10, ActiveLow: false, Initial: false}},
 		{ID: "boost-load", Type: "gpio_switch", Params: gpio_dout.Params{Pin: 14, ActiveLow: false, Initial: false}},
 
-		{ID: "onboard", Type: "gpio_led", Params: gpio_dout.Params{Pin: 25, ActiveLow: false, Initial: false}},
+		// On-board LED (name => public address hal/cap/io/led/onboard/…)
+		{ID: "onboard_led", Type: "pwm_out", Params: pwm_out.Params{
+			Pin:    25,
+			FreqHz: 1000,
+			Top:    4095,
+			Domain: "io",
+			Name:   "onboard",
+		}},
+		// {ID: "onboard", Type: "gpio_led", Params: gpio_dout.Params{Pin: 25, ActiveLow: false, Initial: false}},
 
+		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
+		// {ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0"}},
 		{ID: "core", Type: "aht20", Params: aht20dev.Params{Bus: "i2c0"}},
 	},
 }

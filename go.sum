@@ -1,7 +1,7 @@
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
 github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
-github.com/jangala-dev/tinygo-uartx v0.0.0-20250917074613-343ee52ec116 h1:Z3t1FIu0/RREW2kvZ2i1fV8axyVsnT97p20J5YAahHI=
-github.com/jangala-dev/tinygo-uartx v0.0.0-20250917074613-343ee52ec116/go.mod h1:e3HxjGzBZBIsn/oYvWr707ug3IbkglEyivyYVxHRph4=
+github.com/jangala-dev/tinygo-uartx v0.0.0-20250930123130-9c4737eddd11 h1:O4MgJU4r0xFE8ty5QePTGT5giv7PkjyY741pFoljNig=
+github.com/jangala-dev/tinygo-uartx v0.0.0-20250930123130-9c4737eddd11/go.mod h1:e3HxjGzBZBIsn/oYvWr707ug3IbkglEyivyYVxHRph4=
 golang.org/x/exp v0.0.0-20250911091902-df9299821621 h1:2id6c1/gto0kaHYyrixvknJ8tUK/Qs5IsmBtrc+FtgU=
 golang.org/x/exp v0.0.0-20250911091902-df9299821621/go.mod h1:TwQYMMnGpvZyc+JpB/UAuTNIsVJifOlSkrZkhcvpVUk=
 tinygo.org/x/drivers v0.33.0 h1:5r8Ab0IxjWQi7LzYLNWpya6U4nedo9ZtxeMaAzrJTG8=

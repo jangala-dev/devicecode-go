@@ -1,5 +1,7 @@
 package core
 
+import "context"
+
 // ---- Bus taxonomy (unchanged) ----
 
 type BusClass uint8
@@ -84,23 +86,21 @@ type I2COwner interface {
 
 // ---- Stream buses (shape reserved; provider can fill in) ----
 
-type StreamEvent struct {
-	DevID string
-	Data  []byte
-	TS    int64
+// ---- Serial (UART et al.) ----
+// Minimal, provider-agnostic serial data plane.
+type SerialPort interface {
+	// Blocking write of p.
+	Write(p []byte) (int, error)
+	// Blocking read of up to len(p); returns when at least one byte is available or ctx completes.
+	RecvSomeContext(ctx context.Context, p []byte) (int, error)
 }
 
-type StreamStats struct {
-	RxDrops uint32
-	TxDrops uint32
-	RxQLen  uint32
-	TxQLen  uint32
+// Optional configurator; providers may implement one or both.
+type SerialConfigurator interface {
+	SetBaudRate(br uint32) error
 }
-
-type StreamOwner interface {
-	TrySend(p []byte) bool      // non-blocking; false if queue full
-	Events() <-chan StreamEvent // RX (and optional TX echo)
-	Stats() StreamStats         // optional telemetry
+type SerialFormatConfigurator interface {
+	SetFormat(databits, stopbits uint8, parity string) error
 }
 
 // ---- Unified registry interface (updated) ----
@@ -113,9 +113,9 @@ type ResourceRegistry interface {
 	ClaimI2C(devID string, id ResourceID) (I2COwner, error)
 	ReleaseI2C(devID string, id ResourceID)
 
-	// Stream buses
-	ClaimStream(devID string, id ResourceID) (StreamOwner, error)
-	ReleaseStream(devID string, id ResourceID)
+	// Serial buses
+	ClaimSerial(devID string, id ResourceID) (SerialPort, error)
+	ReleaseSerial(devID string, id ResourceID)
 
 	// Unified pin function claims
 	ClaimPin(devID string, pin int, fn PinFunc) (PinHandle, error)

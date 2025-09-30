@@ -3,6 +3,7 @@
 package provider
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"devicecode-go/x/mathx"
 	"devicecode-go/x/ramp"
 	"machine"
+
+	uartx "github.com/jangala-dev/tinygo-uartx/uartx"
 )
 
 // Ensure the provider satisfies the contracts at compile time.
@@ -371,6 +374,10 @@ type rp2Registry struct {
 
 	// I²C
 	i2cOwners map[core.ResourceID]*i2cOwner
+
+	// UART
+	uartPorts  map[core.ResourceID]*rp2SerialPort
+	uartOwners map[core.ResourceID]string // <- NEW: bus id -> devID
 }
 
 type pinOwner struct {
@@ -380,10 +387,12 @@ type pinOwner struct {
 
 func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 	r := &rp2Registry{
-		pinOwners: make(map[int]pinOwner),
-		gpioMap:   make(map[int]*rp2GPIO),
-		pwmMap:    make(map[int]*rp2PWM),
-		i2cOwners: make(map[core.ResourceID]*i2cOwner),
+		pinOwners:  make(map[int]pinOwner),
+		gpioMap:    make(map[int]*rp2GPIO),
+		pwmMap:     make(map[int]*rp2PWM),
+		i2cOwners:  make(map[core.ResourceID]*i2cOwner),
+		uartPorts:  make(map[core.ResourceID]*rp2SerialPort),
+		uartOwners: make(map[core.ResourceID]string),
 	}
 
 	// Instantiate I²C owners from the provided plan (pins and frequency).
@@ -410,6 +419,26 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 		r.i2cOwners[core.ResourceID(p.ID)] = newI2COwner(core.ResourceID(p.ID), hw)
 	}
 
+	// UART setup
+	for _, u := range plan.UART {
+		var hw *uartx.UART
+		switch u.ID {
+		case "uart0":
+			hw = uartx.UART0
+		case "uart1":
+			hw = uartx.UART1
+		default:
+			continue
+		}
+		// Configure pins and baud. Defaults inside uartx will apply if zero.
+		_ = hw.Configure(uartx.UARTConfig{
+			BaudRate: u.Baud,
+			TX:       machine.Pin(u.TX),
+			RX:       machine.Pin(u.RX),
+		})
+		r.uartPorts[core.ResourceID(u.ID)] = &rp2SerialPort{u: hw}
+	}
+
 	return r
 }
 
@@ -417,6 +446,8 @@ func (r *rp2Registry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
 	switch string(id) {
 	case "i2c0", "i2c1":
 		return core.BusTransactional, true
+	case "uart0", "uart1":
+		return core.BusStream, true
 	}
 	return 0, false
 }
@@ -435,11 +466,24 @@ func (r *rp2Registry) ReleaseI2C(devID string, id core.ResourceID) {
 	// Owners are long-lived per bus; nothing to do.
 }
 
-// Streams — stub
-func (r *rp2Registry) ClaimStream(devID string, id core.ResourceID) (core.StreamOwner, error) {
-	return nil, errcode.UnknownBus
+// Serial
+func (r *rp2Registry) ClaimSerial(devID string, id core.ResourceID) (core.SerialPort, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p := r.uartPorts[id]
+	if p == nil {
+		return nil, errcode.UnknownBus
+	}
+	if owner, taken := r.uartOwners[id]; taken && owner != "" && owner != devID {
+		return nil, errcode.Conflict // serial bus already claimed
+	}
+	// Record (or reaffirm) ownership.
+	r.uartOwners[id] = devID
+	return p, nil
 }
-func (r *rp2Registry) ReleaseStream(devID string, id core.ResourceID) {}
+
+func (r *rp2Registry) ReleaseSerial(devID string, id core.ResourceID) {}
 
 // Unified pin claims
 func (r *rp2Registry) inBoardRange(n int) bool {
@@ -565,4 +609,27 @@ func (r *rp2Registry) Close() {
 			o.stop()
 		}
 	}
+}
+
+// ---- rp2SerialPort: adapts uartx to core.SerialPort (+optional configurators) ----
+type rp2SerialPort struct{ u *uartx.UART }
+
+func (p *rp2SerialPort) Write(b []byte) (int, error) { return p.u.Write(b) }
+func (p *rp2SerialPort) RecvSomeContext(ctx context.Context, buf []byte) (int, error) {
+	return p.u.RecvSomeContext(ctx, buf)
+}
+func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
+
+// Parity strings: "none","even","odd"
+func (p *rp2SerialPort) SetFormat(databits, stopbits uint8, parity string) error {
+	var par uartx.UARTParity
+	switch parity {
+	case "even":
+		par = uartx.ParityEven
+	case "odd":
+		par = uartx.ParityOdd
+	default:
+		par = uartx.ParityNone
+	}
+	return p.u.SetFormat(databits, stopbits, par)
 }
