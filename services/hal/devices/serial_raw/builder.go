@@ -53,31 +53,20 @@ func Builder() core.Builder { return builder{} }
 type builder struct{}
 
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
-	p := Params{}
-	if in.Params != nil {
-		if cast, ok := in.Params.(Params); ok {
-			p = cast
-		} else if m, ok2 := in.Params.(map[string]any); ok2 {
-			if v, ok := m["Bus"].(string); ok {
-				p.Bus = v
-			}
-			if v, ok := m["Domain"].(string); ok {
-				p.Domain = v
-			}
-			if v, ok := m["Name"].(string); ok {
-				p.Name = v
-			}
-			if v, ok := m["Baud"].(float64); ok {
-				p.Baud = uint32(v)
-			}
-			if v, ok := m["RXSize"].(float64); ok {
-				p.RXSize = int(v)
-			}
-			if v, ok := m["TXSize"].(float64); ok {
-				p.TXSize = int(v)
-			}
+	// Strongly-typed params only.
+	var p Params
+	switch v := in.Params.(type) {
+	case Params:
+		p = v
+	case *Params:
+		if v == nil {
+			return nil, errcode.InvalidParams
 		}
+		p = *v
+	default:
+		return nil, errcode.InvalidParams
 	}
+
 	if p.Bus == "" {
 		return nil, errcode.InvalidParams
 	}
@@ -105,7 +94,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		a:      core.CapAddr{Domain: domain, Kind: string(types.KindSerial), Name: name},
 		res:    in.Res,
 		params: p,
-		busID:  p.Bus, // use configured bus ID for ClaimSerial
+		busID:  p.Bus,
 	}, nil
 }
 
@@ -310,26 +299,36 @@ func (d *Device) stopSession() {
 
 func (d *Device) rxLoop(s *session) {
 	defer close(s.rxDone)
-	// Larger buffer reduces syscall/driver call frequency; size is internal only.
 	tmp := make([]byte, 256)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// cancellation goroutine
+	go func() {
+		<-s.quit
+		cancel()
+	}()
+
 	for {
+		n, err := d.port.RecvSomeContext(ctx, tmp)
+		if n > 0 {
+			w := s.rxR.WriteFrom(tmp[:n])
+			if w < n {
+				fmtx.Printf("[serial %s] rx overflow: lost=%d\n", d.id, n-w)
+			}
+		}
+		if err != nil {
+			// Return on context cancellation; otherwise brief back-off.
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		// Early-exit if quit is closed and no blocking read is pending.
 		select {
 		case <-s.quit:
 			return
 		default:
-			n, err := d.port.RecvSomeContext(ctx, tmp)
-			if n > 0 {
-				w := s.rxR.WriteFrom(tmp[:n])
-				if w < n {
-					// Silent drop of telemetry: shmring/consumer can expose stats separately.
-					fmtx.Printf("[serial %s] rx overflow: lost=%d\n", d.id, n-w)
-				}
-			}
-			if err != nil {
-				// Back-off to avoid a tight loop on persistent errors.
-				time.Sleep(5 * time.Millisecond)
-			}
 		}
 	}
 }

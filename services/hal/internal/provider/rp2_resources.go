@@ -483,7 +483,13 @@ func (r *rp2Registry) ClaimSerial(devID string, id core.ResourceID) (core.Serial
 	return p, nil
 }
 
-func (r *rp2Registry) ReleaseSerial(devID string, id core.ResourceID) {}
+func (r *rp2Registry) ReleaseSerial(devID string, id core.ResourceID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if owner, ok := r.uartOwners[id]; ok && owner == devID {
+		delete(r.uartOwners, id)
+	}
+}
 
 // Unified pin claims
 func (r *rp2Registry) inBoardRange(n int) bool {
