@@ -77,7 +77,7 @@ func (h *HAL) Run(ctx context.Context) {
 			}
 			h.handleControl(m) // strictly non-blocking
 		case ev := <-h.evCh:
-			// All device→HAL telemetry is published from this goroutine.
+			// All device->HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
 		}
 	}
@@ -166,7 +166,7 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
-	// 1) Error → retained status:degraded; no value/event published.
+	// 1) Error -> retained status:degraded; no value/event published.
 	if ev.Err != "" {
 		h.pubStatus(d, k, n, ev.TS, ev.Err)
 		return
@@ -225,7 +225,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 }
 
 // pubStatus publishes a retained status update for a capability.
-// err=="" → LinkUp; otherwise LinkDegraded and Error is included.
+// err=="" -> LinkUp; otherwise LinkDegraded and Error is included.
 func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
 	link := types.LinkUp
 	if err != "" {

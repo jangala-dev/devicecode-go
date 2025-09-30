@@ -165,7 +165,7 @@ b := bus.NewBusWithOptions(bus.Options{
 
 ## Summary
 
-* Use `NewBus` → `NewConnection` → `Subscribe` / `Publish`.
+* Use `NewBus` -> `NewConnection` -> `Subscribe` / `Publish`.
 * Topics are arrays of tokens; support `+` and `#` wildcards.
 * Retained messages persist per topic and deliver to new subscribers.
 * Request–reply helpers simplify RPC-style interactions.

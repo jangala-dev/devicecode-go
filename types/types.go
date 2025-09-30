@@ -118,7 +118,7 @@ type HALDevice struct {
 // Info structs appear on hal/capability/<kind>/<id>/info (retained).
 type TemperatureInfo struct {
 	Sensor string // e.g. "aht20", "shtc3"
-	Addr   uint16 // I²C address
+	Addr   uint16 // I2C address
 	Bus    string // e.g. "i2c0"
 }
 

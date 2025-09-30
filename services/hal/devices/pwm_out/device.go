@@ -40,9 +40,11 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	_ = d.pwm.Configure(d.freq, d.top) // map provider error to degraded in control if needed
+	if err := d.pwm.Configure(d.freq, d.top); err != nil {
+		d.pub.Emit(core.Event{Addr: core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name}, TS: time.Now().UnixNano(), Err: string(errcode.MapDriverErr(err))})
+		return nil
+	}
 	d.addr = core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name}
-	// emit initial value (0)
 	d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: 0}, TS: time.Now().UnixNano()})
 	return nil
 }
@@ -63,7 +65,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 	case "set":
 		p, ok := payload.(types.PWMSet)
 		if !ok {
-			return core.EnqueueResult{OK: false}, nil
+			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 		}
 		d.pwm.Set(p.Level)
 		d.pub.Emit(core.Event{Addr: d.addr, Payload: types.PWMValue{Level: p.Level}, TS: time.Now().UnixNano()})

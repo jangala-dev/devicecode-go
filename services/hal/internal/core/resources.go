@@ -7,7 +7,7 @@ import "context"
 type BusClass uint8
 
 const (
-	BusTransactional BusClass = iota // I²C, SPI, 1-Wire
+	BusTransactional BusClass = iota // I2C, SPI, 1-Wire
 	BusStream                        // UART, CAN, USB CDC
 )
 

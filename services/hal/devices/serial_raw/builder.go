@@ -206,6 +206,7 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		d.res.Pub.Emit(core.Event{
 			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
 			TS:       time.Now().UnixNano(),
+			Err:      "session_closed",
 			IsEvent:  true,
 			EventTag: "session_closed",
 		})

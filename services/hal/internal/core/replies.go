@@ -14,8 +14,7 @@ func (h *HAL) reply(m *bus.Message, enqOK bool, code errcode.Code, err error) {
 	if err != nil {
 		c := errcode.Of(err)
 		if c == errcode.OK {
-			h.conn.Reply(m, types.OKReply{OK: true}, false)
-			return
+			c = errcode.Error
 		}
 		h.conn.Reply(m, types.ErrorReply{OK: false, Error: string(c)}, false)
 		return

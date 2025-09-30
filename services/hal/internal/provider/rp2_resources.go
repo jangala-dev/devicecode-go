@@ -315,8 +315,14 @@ func (h *rp2PinHandle) AsPWM() core.PWMHandle {
 type i2cOwner struct {
 	id   core.ResourceID
 	hw   *machine.I2C
-	jobs chan func(bus core.I2CBus) error
+	jobs chan func(bus core.I2CBus) error // best-effort, non-blocking enqueue
+	reqs chan i2cReq                      // synchronous Tx requests (prioritised)
 	quit chan struct{}
+}
+
+type i2cReq struct {
+	do    func(bus core.I2CBus) error // work to execute in worker context
+	reply chan error                  // buffered(1); worker sends completion status
 }
 
 func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
@@ -324,6 +330,7 @@ func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 		id:   id,
 		hw:   hw,
 		jobs: make(chan func(core.I2CBus) error, 16),
+		reqs: make(chan i2cReq, 8),
 		quit: make(chan struct{}),
 	}
 	go o.loop()
@@ -336,10 +343,21 @@ func (b txBus) Tx(addr uint16, w, r []byte) error { return b.hw.Tx(addr, w, r) }
 
 func (o *i2cOwner) loop() {
 	b := txBus{hw: o.hw}
+
 	for {
 		select {
+		// Prioritise synchronous Tx to reduce control-path latency.
+		case req := <-o.reqs:
+			err := req.do(b)
+			// Best-effort reply; never block the worker.
+			select {
+			case req.reply <- err:
+			default:
+			}
+
 		case job := <-o.jobs:
-			_ = job(b) // swallow errors or add telemetry if needed
+			_ = job(b) // devices map/report their own errors
+
 		case <-o.quit:
 			return
 		}
@@ -348,9 +366,46 @@ func (o *i2cOwner) loop() {
 
 func (o *i2cOwner) stop() { close(o.quit) }
 
-func (o *i2cOwner) Tx(addr uint16, w []byte, r []byte, _ int) error {
-	return o.hw.Tx(addr, w, r)
+// Tx is now serialised with queued jobs by routing through the worker.
+// timeoutMS semantics:
+//   - 0 => no timeout for enqueue or completion.
+//   - >0 => overall budget used both to enqueue the request and to wait for completion.
+//     If enqueue times out, Busy is returned; if completion times out, Timeout is returned.
+func (o *i2cOwner) Tx(addr uint16, w, r []byte, timeoutMS int) error {
+	reply := make(chan error, 1)
+	req := i2cReq{
+		do:    func(bus core.I2CBus) error { return bus.Tx(addr, w, r) },
+		reply: reply,
+	}
+
+	// Enqueue phase
+	if timeoutMS <= 0 {
+		o.reqs <- req
+	} else {
+		t := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+		defer t.Stop()
+		select {
+		case o.reqs <- req:
+		case <-t.C:
+			return errcode.Busy // cannot place the request
+		}
+	}
+
+	// Completion phase
+	if timeoutMS <= 0 {
+		return <-reply
+	}
+	t := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+	defer t.Stop()
+	select {
+	case err := <-reply:
+		return err
+	case <-t.C:
+		return errcode.Timeout
+	}
 }
+
+// TryEnqueue keeps its non-blocking semantics and shares the worker.
 func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
 	select {
 	case o.jobs <- job:
@@ -361,7 +416,7 @@ func (o *i2cOwner) TryEnqueue(job func(bus core.I2CBus) error) bool {
 }
 
 // -----------------------------------------------------------------------------
-// Resource registry (GPIO + PWM + I²C)
+// Resource registry (GPIO + PWM + I2C)
 // -----------------------------------------------------------------------------
 
 type rp2Registry struct {
@@ -372,7 +427,7 @@ type rp2Registry struct {
 	gpioMap   map[int]*rp2GPIO // pin -> GPIO view (cached)
 	pwmMap    map[int]*rp2PWM  // pin -> PWM view (cached; for reset/release)
 
-	// I²C
+	// I2C
 	i2cOwners map[core.ResourceID]*i2cOwner
 
 	// UART
@@ -395,7 +450,7 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 		uartOwners: make(map[core.ResourceID]string),
 	}
 
-	// Instantiate I²C owners from the provided plan (pins and frequency).
+	// Instantiate I2C owners from the provided plan (pins and frequency).
 	for _, p := range plan.I2C {
 		var hw *machine.I2C
 		switch p.ID {
@@ -452,7 +507,7 @@ func (r *rp2Registry) ClassOf(id core.ResourceID) (core.BusClass, bool) {
 	return 0, false
 }
 
-// Transactional buses (I²C)
+// Transactional buses (I2C)
 func (r *rp2Registry) ClaimI2C(devID string, id core.ResourceID) (core.I2COwner, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -606,7 +661,7 @@ func PeriodFromHz(hz uint64) uint64 {
 	return uint64(time.Second) / hz
 }
 
-// Close stops background workers (e.g. per-bus I²C goroutines).
+// Close stops background workers (e.g. per-bus I2C goroutines).
 func (r *rp2Registry) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
