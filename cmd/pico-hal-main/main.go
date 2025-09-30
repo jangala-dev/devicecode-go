@@ -88,7 +88,7 @@ func main() {
 	ctx := context.Background()
 
 	println("[main] bootstrapping bus …")
-	b := bus.NewBus(4)
+	b := bus.NewBus(4, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 

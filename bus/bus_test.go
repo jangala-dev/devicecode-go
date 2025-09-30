@@ -14,7 +14,7 @@ const (
 )
 
 func TestBasicPubSub(t *testing.T) {
-	b := NewBus(4)
+	b := NewBus(4, "+", "#")
 	conn := b.NewConnection("test")
 
 	sub := conn.Subscribe(T(TopicConfig, TopicGeo))
@@ -33,7 +33,7 @@ func TestBasicPubSub(t *testing.T) {
 }
 
 func TestRetainedMessage(t *testing.T) {
-	b := NewBus(2)
+	b := NewBus(2, "+", "#")
 	conn := b.NewConnection("test")
 
 	msg := conn.NewMessage(T(TopicConfig, TopicGeo), "persist", true)
@@ -56,7 +56,7 @@ func TestRetainedMessage(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestWildcard_SingleLevel(t *testing.T) {
-	b := NewBus(16)
+	b := NewBus(16, "+", "#")
 	c := b.NewConnection("test")
 
 	s1 := c.Subscribe(T("a", "+", "c"))
@@ -86,7 +86,7 @@ func TestWildcard_SingleLevel(t *testing.T) {
 }
 
 func TestWildcard_MultiLevel(t *testing.T) {
-	b := NewBus(16)
+	b := NewBus(16, "+", "#")
 	c := b.NewConnection("test")
 
 	sAHash := c.Subscribe(T("a", "#"))
@@ -114,7 +114,7 @@ func TestWildcard_MultiLevel(t *testing.T) {
 }
 
 func TestWildcard_RetainedDelivery(t *testing.T) {
-	b := NewBus(32)
+	b := NewBus(32, "+", "#")
 	c := b.NewConnection("test")
 
 	c.Publish(b.NewMessage(T("a"), "r0", true))
@@ -136,7 +136,7 @@ func TestWildcard_RetainedDelivery(t *testing.T) {
 }
 
 func TestWildcard_RetainedClear(t *testing.T) {
-	b := NewBus(16)
+	b := NewBus(16, "+", "#")
 	c := b.NewConnection("test")
 
 	c.Publish(b.NewMessage(T("a", "b"), "keep", true))
@@ -153,7 +153,7 @@ func TestWildcard_RetainedClear(t *testing.T) {
 }
 
 func TestWildcard_NoMatchCases(t *testing.T) {
-	b := NewBus(8)
+	b := NewBus(8, "+", "#")
 	c := b.NewConnection("test")
 
 	s := c.Subscribe(T("a", "+", "c"))
@@ -170,7 +170,7 @@ func TestWildcard_NoMatchCases(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestRequestReply_RequestWait(t *testing.T) {
-	b := NewBus(8)
+	b := NewBus(8, "+", "#")
 	reqConn := b.NewConnection("requester")
 	respConn := b.NewConnection("responder")
 
@@ -204,7 +204,7 @@ func TestRequestReply_RequestWait(t *testing.T) {
 }
 
 func TestRequestReply_Timeout(t *testing.T) {
-	b := NewBus(8)
+	b := NewBus(8, "+", "#")
 	reqConn := b.NewConnection("requester")
 
 	req := b.NewMessage(T("service", "noop"), nil, false)
@@ -218,7 +218,7 @@ func TestRequestReply_Timeout(t *testing.T) {
 }
 
 func TestRequestReply_ManualSubscription(t *testing.T) {
-	b := NewBus(8)
+	b := NewBus(8, "+", "#")
 	reqConn := b.NewConnection("requester")
 	respConn := b.NewConnection("responder")
 

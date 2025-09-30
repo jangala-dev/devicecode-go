@@ -214,25 +214,15 @@ type Bus struct {
 	mWild Token
 }
 
-func NewBus(queueLen int) *Bus {
-	return NewBusWithOptions(Options{QueueLen: queueLen, SingleWildcard: "+", MultiWildcard: "#"})
-}
-
-func NewBusWithOptions(o Options) *Bus {
-	if o.QueueLen <= 0 {
-		o.QueueLen = defaultQLen
-	}
-	if o.SingleWildcard == nil {
-		o.SingleWildcard = "+"
-	}
-	if o.MultiWildcard == nil {
-		o.MultiWildcard = "#"
+func NewBus(queueLen int, singleWild, multiWild Token) *Bus {
+	if queueLen <= 0 || singleWild == nil || multiWild == nil {
+		panic("bus: Options must fully specify QueueLen>0 and wildcards")
 	}
 	return &Bus{
 		root:  &node{},
-		qLen:  o.QueueLen,
-		sWild: o.SingleWildcard,
-		mWild: o.MultiWildcard,
+		qLen:  queueLen,
+		sWild: singleWild,
+		mWild: multiWild,
 	}
 }
 

@@ -18,7 +18,7 @@ func main() {
 	time.Sleep(1500 * time.Millisecond)
 
 	ctx := context.Background()
-	b := bus.NewBus(4)
+	b := bus.NewBus(4, "+", "#")
 	halConn := b.NewConnection("hal")
 	ui := b.NewConnection("ui")
 	go hal.Run(ctx, halConn)
