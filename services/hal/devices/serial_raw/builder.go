@@ -102,7 +102,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 
 	return &Device{
 		id:     in.ID,
-		a:      core.CapAddr{Domain: domain, Kind: "serial", Name: name},
+		a:      core.CapAddr{Domain: domain, Kind: string(types.KindSerial), Name: name},
 		res:    in.Res,
 		params: p,
 		busID:  p.Bus, // use configured bus ID for ClaimSerial
@@ -119,7 +119,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	}
 	return []core.CapabilitySpec{{
 		Domain: d.a.Domain,
-		Kind:   types.Kind("serial"),
+		Kind:   types.KindSerial,
 		Name:   d.a.Name,
 		Info:   types.Info{Driver: "serial_raw", Detail: detail},
 	}}
@@ -149,7 +149,7 @@ func (d *Device) Init(ctx context.Context) error {
 
 	// Publish initial LinkDown status while we are inactive.
 	d.res.Pub.Emit(core.Event{
-		Addr: core.CapAddr{Domain: d.a.Domain, Kind: "serial", Name: d.a.Name},
+		Addr: core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
 		TS:   time.Now().UnixNano(),
 		Err:  "initialising",
 	})
@@ -201,7 +201,7 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		d.startSession(req.RXSize, req.TXSize)
 		rep := sessionOpenRep{SessionID: d.sess.id, RXHandle: uint32(d.sess.rxH), TXHandle: uint32(d.sess.txH)}
 		d.res.Pub.Emit(core.Event{
-			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: "serial", Name: d.a.Name},
+			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
 			Payload:  rep,
 			TS:       time.Now().UnixNano(),
 			IsEvent:  true,
@@ -215,7 +215,7 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		}
 		d.stopSession()
 		d.res.Pub.Emit(core.Event{
-			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: "serial", Name: d.a.Name},
+			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
 			TS:       time.Now().UnixNano(),
 			IsEvent:  true,
 			EventTag: "session_closed",
@@ -290,7 +290,7 @@ func (d *Device) startSession(rxSize, txSize int) {
 	go d.txLoop(s)
 	// LinkUp now that session is ready
 	d.res.Pub.Emit(core.Event{
-		Addr: core.CapAddr{Domain: d.a.Domain, Kind: "serial", Name: d.a.Name},
+		Addr: core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
 		TS:   time.Now().UnixNano(),
 	})
 }

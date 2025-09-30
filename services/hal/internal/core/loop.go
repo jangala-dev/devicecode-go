@@ -103,8 +103,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		}
 		b, ok := lookupBuilder(dc.Type)
 		if !ok {
-			fmtx.Printf("[hal] no builder for type: %s id: %s\n", dc.Type, dc.ID)
-			continue
+			panic(fmtx.Sprintf("[hal] no builder for type: %s id: %s\n", dc.Type, dc.ID))
 		}
 		dev, err := b.Build(ctx, BuilderInput{
 			ID:     dc.ID,
@@ -113,12 +112,10 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 			Res:    h.res,
 		})
 		if err != nil {
-			fmtx.Printf("[hal] build failed for: %s err: %s\n", dc.ID, err.Error())
-			continue
+			panic(fmtx.Sprintf("[hal] build failed for: %s err: %s\n", dc.ID, err.Error()))
 		}
 		if err := dev.Init(ctx); err != nil {
-			fmtx.Printf("[hal] init failed for: %s\n", dc.ID)
-			continue
+			panic(fmtx.Sprintf("[hal] init failed for: %s\n", dc.ID))
 		}
 		h.dev[dev.ID()] = dev
 
