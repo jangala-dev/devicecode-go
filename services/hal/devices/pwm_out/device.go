@@ -84,6 +84,6 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 		d.pwm.StopRamp()
 		return core.EnqueueResult{OK: true}, nil
 	default:
-		return core.EnqueueResult{OK: false}, nil
+		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 	}
 }

@@ -82,6 +82,19 @@ func printMem() {
 	)
 }
 
+func reqWaitFixed(ctx context.Context, c *bus.Connection, replyT bus.Topic, replySub *bus.Subscription, t bus.Topic, payload any) (*bus.Message, error) {
+	msg := c.NewMessage(t, payload, false)
+	msg.ReplyTo = replyT // avoid TNoIntern + subscribe
+	c.Publish(msg)
+
+	select {
+	case m := <-replySub.Channel():
+		return m, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func main() {
 	// Allow board to settle (USB, clocks, etc.)
 	time.Sleep(3 * time.Second)
@@ -91,6 +104,9 @@ func main() {
 	b := bus.NewBus(4, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
+
+	replyTopic := bus.T("ui", "_rr") // fixed, interned
+	replySub := uiConn.Subscribe(replyTopic)
 
 	println("[main] starting hal.Run …")
 	go hal.Run(ctx, halConn)
@@ -129,7 +145,7 @@ func main() {
 	humidSub := uiConn.Subscribe(tHumidValue)
 
 	println("[main] requesting initial read of env/temperature/core …")
-	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tTempCtrlRead, nil, false)); err != nil {
+	if reply, err := reqWaitFixed(ctx, uiConn, replyTopic, replySub, tTempCtrlRead, nil); err != nil {
 		println("[main] temp read control request error:", err.Error())
 	} else {
 		printTopicWith("[main] temp read control reply on", reply.Topic)
@@ -186,11 +202,11 @@ func main() {
 			} else {
 				printTopicWith("[main] pwm ramp control reply on", reply.Topic)
 			}
-			runtime.GC()
+			// runtime.GC()
 			printMem()
 
 		case <-sensorTicker.C:
-			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tTempCtrlRead, nil, false)); err != nil {
+			if reply, err := reqWaitFixed(ctx, uiConn, replyTopic, replySub, tTempCtrlRead, nil); err != nil {
 				println("[main] temp read control error:", err.Error())
 			} else {
 				printTopicWith("[main] temp read control reply on", reply.Topic)

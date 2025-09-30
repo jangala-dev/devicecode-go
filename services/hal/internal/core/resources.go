@@ -2,7 +2,7 @@ package core
 
 import "context"
 
-// ---- Bus taxonomy (unchanged) ----
+// ---- Bus taxonomy ----
 
 type BusClass uint8
 
@@ -13,7 +13,7 @@ const (
 
 type ResourceID string // e.g. "i2c0", "uart0", "gpio25"
 
-// ---- Unified pin-function model (new) ----
+// ---- Unified pin-function model ----
 
 type PinFunc uint8
 
@@ -76,12 +76,20 @@ type I2CBus interface {
 	Tx(addr uint16, w []byte, r []byte) error
 }
 
+// Closure-free job for the I2C worker. Implementations are reusable objects.
+type I2CJob interface {
+	Run(bus I2CBus) error
+}
+
 // I2COwner exposes both direct Tx and job enqueue.
 // timeoutMS: 0 => provider default for direct Tx (if the provider supports one).
 type I2COwner interface {
 	Tx(addr uint16, w []byte, r []byte, timeoutMS int) error
+	// Legacy closure form (retained for compatibility).
 	// TryEnqueue MUST be non-blocking: returns false if the queue is saturated.
 	TryEnqueue(job func(bus I2CBus) error) bool
+	// NEW: closure-free form to avoid per-call heap pressure. Non-blocking.
+	TryEnqueueJob(job I2CJob) bool
 }
 
 // ---- Stream buses (shape reserved; provider can fill in) ----
@@ -103,7 +111,7 @@ type SerialFormatConfigurator interface {
 	SetFormat(databits, stopbits uint8, parity string) error
 }
 
-// ---- Unified registry interface (updated) ----
+// ---- Unified registry interface ----
 
 type ResourceRegistry interface {
 	// Optional classification/introspection for controller-style resources.

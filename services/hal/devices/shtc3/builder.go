@@ -17,7 +17,6 @@ func init() { core.RegisterBuilder("shtc3", builder{}) }
 
 type Params struct {
 	Bus string // e.g. "i2c0"
-	// Address is fixed at 0x70 for SHTC3; keep field if variants arise.
 }
 
 type builder struct{}
@@ -31,13 +30,23 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if err != nil {
 		return nil, err
 	}
-	return &Device{
+
+	d := &Device{
 		id:  in.ID,
 		bus: p.Bus,
 		i2c: own,
 		pub: in.Res.Pub,
 		reg: in.Res.Reg,
-	}, nil
+	}
+
+	// Persistent hot-swappable I2C shim and driver instance.
+	d.hot = &drvshim.HotI2C{}
+	d.drv = shtc3.New(d.hot)
+
+	// Reusable, closure-free job object.
+	d.jobRead = &shtc3ReadJob{d: d}
+
+	return d, nil
 }
 
 type Device struct {
@@ -47,6 +56,11 @@ type Device struct {
 	i2c core.I2COwner
 	pub core.EventEmitter
 	reg core.ResourceRegistry
+
+	// Persisted bus shim and driver (no per-call allocations).
+	hot     *drvshim.HotI2C
+	drv     shtc3.Device
+	jobRead *shtc3ReadJob
 
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
@@ -77,7 +91,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	}
 }
 
-// Init sets up addresses now that ID and bus are known.
+// Init sets up addresses without touching the bus.
 func (d *Device) Init(ctx context.Context) error {
 	d.addrTemp = core.CapAddr{Domain: "env", Kind: string(types.KindTemperature), Name: d.id}
 	d.addrHum = core.CapAddr{Domain: "env", Kind: string(types.KindHumidity), Name: d.id}
@@ -91,35 +105,51 @@ func (d *Device) Close() error {
 	return nil
 }
 
+// Compile-time check.
+var _ core.I2CJob = (*shtc3ReadJob)(nil)
+
+// Reusable, closure-free job value.
+type shtc3ReadJob struct{ d *Device }
+
+func (j *shtc3ReadJob) Run(bus core.I2CBus) error {
+	d := j.d
+
+	// Bind the hot shim to the worker's per-job bus.
+	d.hot.Bind(bus)
+
+	// Wake, read, sleep within the worker context.
+	_ = d.drv.WakeUp()
+	defer func() { _ = d.drv.Sleep() }()
+
+	t0 := time.Now().UnixNano()
+	tmc, rhx100, err := d.drv.ReadTemperatureHumidity()
+	if err != nil {
+		d.emitErr(string(errcode.MapDriverErr(err)), t0)
+		return nil
+	}
+
+	// Convert: tmc is milli-°C; publish deci-°C. Clamp ranges.
+	decic := mathx.Clamp(tmc/100, -32768, 32767)
+	rhx100 = mathx.Clamp(rhx100, 0, 10000)
+
+	ts := time.Now().UnixNano()
+	d.pub.Emit(core.Event{
+		Addr:    d.addrTemp,
+		Payload: types.TemperatureValue{DeciC: int16(decic)},
+		TS:      ts,
+	})
+	d.pub.Emit(core.Event{
+		Addr:    d.addrHum,
+		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
+		TS:      ts,
+	})
+	return nil
+}
+
 func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "read":
-		ok := d.i2c.TryEnqueue(func(bus core.I2CBus) error {
-			drv := shtc3.New(drvshim.NewI2CFromBus(bus))
-			_ = drv.WakeUp()
-			defer func() { _ = drv.Sleep() }()
-			t0 := time.Now().UnixNano()
-			tmc, rhx100, err := drv.ReadTemperatureHumidity()
-			if err != nil {
-				d.emitErr(string(errcode.MapDriverErr(err)), t0)
-				return nil
-			}
-			decic := mathx.Clamp(tmc/100, -32768, 32767)
-			rhx100 = mathx.Clamp(rhx100, 0, 10000)
-			ts := time.Now().UnixNano()
-			d.pub.Emit(core.Event{
-				Addr:    d.addrTemp,
-				Payload: types.TemperatureValue{DeciC: int16(decic)},
-				TS:      ts,
-			})
-			d.pub.Emit(core.Event{
-				Addr:    d.addrHum,
-				Payload: types.HumidityValue{RHx100: uint16(rhx100)},
-				TS:      ts,
-			})
-			return nil
-		})
-		if !ok {
+		if !d.i2c.TryEnqueueJob(d.jobRead) {
 			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
 		}
 		return core.EnqueueResult{OK: true}, nil

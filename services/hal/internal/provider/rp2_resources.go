@@ -316,7 +316,8 @@ type i2cOwner struct {
 	id   core.ResourceID
 	hw   *machine.I2C
 	jobs chan func(bus core.I2CBus) error // best-effort, non-blocking enqueue
-	reqs chan i2cReq                      // synchronous Tx requests (prioritised)
+	jifs chan core.I2CJob
+	reqs chan i2cReq // synchronous Tx requests (prioritised)
 	quit chan struct{}
 }
 
@@ -330,6 +331,7 @@ func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 		id:   id,
 		hw:   hw,
 		jobs: make(chan func(core.I2CBus) error, 16),
+		jifs: make(chan core.I2CJob, 16),
 		reqs: make(chan i2cReq, 8),
 		quit: make(chan struct{}),
 	}
@@ -355,6 +357,9 @@ func (o *i2cOwner) loop() {
 			default:
 			}
 
+		case ji := <-o.jifs:
+			_ = ji.Run(b) // devices map/report their own errors
+
 		case job := <-o.jobs:
 			_ = job(b) // devices map/report their own errors
 
@@ -364,9 +369,18 @@ func (o *i2cOwner) loop() {
 	}
 }
 
+func (o *i2cOwner) TryEnqueueJob(job core.I2CJob) bool {
+	select {
+	case o.jifs <- job:
+		return true
+	default:
+		return false
+	}
+}
+
 func (o *i2cOwner) stop() { close(o.quit) }
 
-// Tx is now serialised with queued jobs by routing through the worker.
+// Tx is  serialised with queued jobs by routing through the worker.
 // timeoutMS semantics:
 //   - 0 => no timeout for enqueue or completion.
 //   - >0 => overall budget used both to enqueue the request and to wait for completion.
@@ -378,25 +392,25 @@ func (o *i2cOwner) Tx(addr uint16, w, r []byte, timeoutMS int) error {
 		reply: reply,
 	}
 
-	// Enqueue phase
+	// Untimed path: fully blocking enqueue + completion.
 	if timeoutMS <= 0 {
 		o.reqs <- req
-	} else {
-		t := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
-		defer t.Stop()
-		select {
-		case o.reqs <- req:
-		case <-t.C:
-			return errcode.Busy // cannot place the request
-		}
-	}
-
-	// Completion phase
-	if timeoutMS <= 0 {
 		return <-reply
 	}
+
+	// Timed path: single overall budget shared by enqueue and completion.
 	t := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
 	defer t.Stop()
+
+	// Enqueue phase (budgeted).
+	select {
+	case o.reqs <- req:
+		// proceed to completion using the SAME timer
+	case <-t.C:
+		return errcode.Busy // cannot place the request within budget
+	}
+
+	// Completion phase (consumes remaining budget on the same timer).
 	select {
 	case err := <-reply:
 		return err

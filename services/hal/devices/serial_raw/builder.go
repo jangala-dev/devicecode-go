@@ -204,11 +204,12 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		}
 		d.stopSession()
 		d.res.Pub.Emit(core.Event{
-			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
-			TS:       time.Now().UnixNano(),
-			Err:      "session_closed",
-			IsEvent:  true,
-			EventTag: "session_closed",
+			Addr: d.a, TS: time.Now().UnixNano(),
+			IsEvent: true, EventTag: "session_closed",
+		})
+		d.res.Pub.Emit(core.Event{
+			Addr: d.a, TS: time.Now().UnixNano(),
+			Err: "session_closed",
 		})
 		return core.EnqueueResult{OK: true}, nil
 

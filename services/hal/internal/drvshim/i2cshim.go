@@ -35,3 +35,18 @@ func (s I2C) Tx(addr uint16, w, r []byte) error {
 	}
 	return s.o.Tx(addr, w, r, s.timeoutMS)
 }
+
+// HotI2C implements tinygo's drivers.I2C over a rebindable core.I2CBus.
+// It is not concurrency-safe; call Bind() and then use it from the same goroutine.
+type HotI2C struct {
+	b core.I2CBus
+}
+
+// Bind swaps the underlying worker-context bus used by Tx.
+func (h *HotI2C) Bind(bus core.I2CBus) { h.b = bus }
+
+// Tx forwards to the currently bound worker bus.
+// It must only be called after a successful Bind in the same job.
+func (h *HotI2C) Tx(addr uint16, w, r []byte) error {
+	return h.b.Tx(addr, w, r)
+}
