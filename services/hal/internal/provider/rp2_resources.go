@@ -755,7 +755,6 @@ type edgeSub struct {
 	// qualification state
 	lastTS  int64  // ns
 	lastLvl uint32 // 0/1
-	lvlInit bool
 }
 
 type gpioEdgeStream struct {
@@ -805,16 +804,21 @@ func (r *rp2Registry) SubscribeGPIOEdges(devID string, pin int, sel core.GPIOEdg
 		ch:       make(chan core.GPIOEdgeEvent, buf),
 		lastLvl:  b2u(machine.Pin(pin).Get()),
 		lastTS:   time.Now().UnixNano(),
-		lvlInit:  true,
 	}
-	// Ensure input and attach ISR
+	// Ensure input first
 	p := machine.Pin(pin)
 	p.Configure(machine.PinConfig{Mode: machine.PinInput})
+
+	// Register subscription before enabling interrupts so an immediate IRQ
+	// has a destination with initial state already seeded.
+	r.edge.subscribe(s)
+
+	// Now attach ISR. If this fails, roll back the subscription.
 	flags := mapEdges(sel)
 	if flags != 0 && !installISRForPin(&r.edge, pin, flags) {
+		r.edge.unsubscribe(pin)
 		return nil, errcode.Unsupported
 	}
-	r.edge.subscribe(s)
 	return &gpioEdgeStream{s: s, parent: &r.edge}, nil
 }
 
