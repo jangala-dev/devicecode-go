@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"devicecode-go/errcode"
@@ -446,6 +447,10 @@ type rp2Registry struct {
 	// UART
 	uartPorts  map[core.ResourceID]*rp2SerialPort
 	uartOwners map[core.ResourceID]string // <- NEW: bus id -> devID
+
+	// GPIO edge subscriptions
+	edge onceIRQ // worker + per-pin tables
+
 }
 
 type pinOwner struct {
@@ -461,6 +466,7 @@ func NewResourceRegistry(plan setups.ResourcePlan) *rp2Registry {
 		i2cOwners:  make(map[core.ResourceID]*i2cOwner),
 		uartPorts:  make(map[core.ResourceID]*rp2SerialPort),
 		uartOwners: make(map[core.ResourceID]string),
+		edge:       newOnceIRQ(),
 	}
 
 	// Instantiate I2C owners from the provided plan (pins and frequency).
@@ -627,6 +633,8 @@ func (r *rp2Registry) ReleasePin(devID string, n int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if owner, ok := r.pinOwners[n]; ok && owner.devID == devID {
+		// Tear down any edge subscription before mode reset.
+		r.edge.unsubscribe(n)
 		// PWM-specific cleanup (stop ramp, duty=0, slice accounting).
 		if owner.fn == core.FuncPWM {
 			if p, okp := r.pwmMap[n]; okp && p != nil {
@@ -686,6 +694,7 @@ func (r *rp2Registry) Close() {
 			o.stop()
 		}
 	}
+	r.edge.stop()
 }
 
 // ---- rp2SerialPort: adapts uartx to core.SerialPort (+optional configurators) ----
@@ -709,4 +718,345 @@ func (p *rp2SerialPort) SetFormat(databits, stopbits uint8, parity string) error
 		par = uartx.ParityNone
 	}
 	return p.u.SetFormat(databits, stopbits, par)
+}
+
+// -----------------------------------------------------------------------------
+// GPIO IRQ worker: best-effort edge delivery with debounce and selection
+// -----------------------------------------------------------------------------
+
+// onceIRQ encapsulates a single worker that services all pins.
+type onceIRQ struct {
+	mu      sync.Mutex
+	subs    map[int]*edgeSub // pin -> subscription
+	wake    chan struct{}    // size 1; ISRs perform non-blocking send
+	running bool
+	quit    chan struct{}
+	done    chan struct{}
+
+	// Pending bitset (GPIO 0..29 on RP2040 -> fits in 64 bits).
+	pending atomic.Uint64
+}
+
+func newOnceIRQ() onceIRQ {
+	return onceIRQ{
+		subs: make(map[int]*edgeSub),
+		wake: make(chan struct{}, 1),
+	}
+}
+
+type edgeSub struct {
+	devID    string
+	pin      int
+	edges    core.GPIOEdge
+	debounce time.Duration
+	ch       chan core.GPIOEdgeEvent
+	closed   bool
+
+	// qualification state
+	lastTS  int64  // ns
+	lastLvl uint32 // 0/1
+	lvlInit bool
+}
+
+type gpioEdgeStream struct {
+	s      *edgeSub
+	parent *onceIRQ
+}
+
+func (g *gpioEdgeStream) Events() <-chan core.GPIOEdgeEvent { return g.s.ch }
+func (g *gpioEdgeStream) Close()                            { g.parent.unsubscribe(g.s.pin) }
+func (g *gpioEdgeStream) SetDebounce(d time.Duration) bool {
+	g.parent.mu.Lock()
+	g.s.debounce = d
+	g.parent.mu.Unlock()
+	return true
+}
+func (g *gpioEdgeStream) SetEdges(sel core.GPIOEdge) bool {
+	flags := mapEdges(sel)
+	if !installISRForPin(g.parent, g.s.pin, flags) {
+		return false
+	}
+	g.parent.mu.Lock()
+	g.s.edges = sel
+	g.parent.mu.Unlock()
+	return true
+}
+
+// Subscribe from registry.
+func (r *rp2Registry) SubscribeGPIOEdges(devID string, pin int, sel core.GPIOEdge, debounce time.Duration, buf int) (core.GPIOEdgeStream, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	owner, ok := r.pinOwners[pin]
+	if !ok {
+		return nil, errcode.UnknownPin
+	}
+	if owner.devID != devID || owner.fn != core.FuncGPIOIn {
+		return nil, errcode.Conflict
+	}
+	if buf <= 0 {
+		buf = 8
+	}
+	s := &edgeSub{
+		devID:    devID,
+		pin:      pin,
+		edges:    sel,
+		debounce: debounce,
+		ch:       make(chan core.GPIOEdgeEvent, buf),
+		lastLvl:  b2u(machine.Pin(pin).Get()),
+		lastTS:   time.Now().UnixNano(),
+		lvlInit:  true,
+	}
+	// Ensure input and attach ISR
+	p := machine.Pin(pin)
+	p.Configure(machine.PinConfig{Mode: machine.PinInput})
+	flags := mapEdges(sel)
+	if flags != 0 && !installISRForPin(&r.edge, pin, flags) {
+		return nil, errcode.Unsupported
+	}
+	r.edge.subscribe(s)
+	return &gpioEdgeStream{s: s, parent: &r.edge}, nil
+}
+
+func (r *rp2Registry) UnsubscribeGPIOEdges(devID string, pin int) {
+	r.mu.Lock()
+	if owner, ok := r.pinOwners[pin]; ok && owner.devID == devID {
+		r.edge.unsubscribe(pin)
+	}
+	r.mu.Unlock()
+}
+
+// Internal: add/remove subscription and manage worker lifecycle.
+func (w *onceIRQ) subscribe(s *edgeSub) {
+	w.mu.Lock()
+	w.subs[s.pin] = s
+	if !w.running {
+		w.quit = make(chan struct{})
+		w.done = make(chan struct{}) // NEW: fresh done chan per start
+		go w.loop()
+		w.running = true
+	}
+	w.mu.Unlock()
+}
+
+func (w *onceIRQ) unsubscribe(pin int) {
+	w.mu.Lock()
+	if s := w.subs[pin]; s != nil {
+		s.closed = true
+		if s.ch != nil {
+			close(s.ch)
+			s.ch = nil
+		}
+		delete(w.subs, pin)
+	}
+	disableISRForPin(pin)
+	if w.running && len(w.subs) == 0 {
+		close(w.quit)
+		w.running = false
+	}
+	w.mu.Unlock()
+}
+
+func (w *onceIRQ) stop() {
+	// Signal quit and wait for worker to finish to avoid races.
+	w.mu.Lock()
+	if w.running {
+		close(w.quit)
+	}
+	done := w.done
+	w.mu.Unlock()
+
+	if done != nil {
+		<-done // wait for worker exit (NEW)
+	}
+	// With worker stopped, it is now safe to tear down remaining state.
+	w.mu.Lock()
+	for pin := range w.subs {
+		disableISRForPin(pin)
+	}
+	for _, s := range w.subs {
+		if !s.closed {
+			s.closed = true
+		}
+		if s.ch != nil {
+			close(s.ch)
+			s.ch = nil
+		}
+	}
+	w.subs = make(map[int]*edgeSub)
+	w.running = false
+	w.mu.Unlock()
+}
+
+// Worker: drain wake-ups, snapshot pending pins, qualify, deliver best-effort.
+func (w *onceIRQ) loop() {
+	defer func() {
+		// Signal that the worker has exited.
+		w.mu.Lock()
+		if w.done != nil {
+			close(w.done)
+		}
+		w.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-w.wake:
+			bits := w.pending.Swap(0)
+			if bits == 0 {
+				continue
+			}
+			now := time.Now().UnixNano()
+			for pin := 0; pin <= 29; pin++ {
+				if (bits>>uint(pin))&1 == 0 {
+					continue
+				}
+				// Snapshot subscription state under lock.
+				w.mu.Lock()
+				s := w.subs[pin]
+				if s == nil {
+					w.mu.Unlock()
+					continue
+				}
+				if s.closed {
+					// One-time channel close on observing closed (worker owns closing).
+					if s.ch != nil {
+						close(s.ch)
+						s.ch = nil
+					}
+					w.mu.Unlock()
+					continue
+				}
+				prev := s.lastLvl
+				lastTS := s.lastTS
+				debounce := s.debounce
+				edges := s.edges
+				ch := s.ch // send to this after unlock
+				w.mu.Unlock()
+				lvl := machine.Pin(pin).Get()
+
+				curr := b2u(lvl)
+
+				// Debounce
+				if debounce > 0 && (now-lastTS) < int64(debounce) {
+					w.mu.Lock()
+					if t := w.subs[pin]; t != nil {
+						t.lastLvl, t.lastTS = curr, now
+					}
+					w.mu.Unlock()
+					continue
+				}
+				// Edge qualification
+				rise := prev == 0 && curr == 1
+				fall := prev == 1 && curr == 0
+				if (rise && (edges&core.EdgeRising) == 0) || (fall && (edges&core.EdgeFalling) == 0) {
+					w.mu.Lock()
+					if t := w.subs[pin]; t != nil {
+						t.lastLvl, t.lastTS = curr, now
+					}
+					w.mu.Unlock()
+					continue
+				}
+				ev := core.GPIOEdgeEvent{Pin: pin, Level: lvl, TS: now}
+				// Commit new state and deliver best-effort.
+				w.mu.Lock()
+				if t := w.subs[pin]; t != nil {
+					t.lastLvl, t.lastTS = curr, now
+				}
+				// re-check closed before sending
+				if t := w.subs[pin]; t != nil && !t.closed && ch != nil {
+					w.mu.Unlock()
+					select {
+					case ch <- ev:
+					default:
+						// drop oldest then retry
+						select {
+						case <-ch:
+						default:
+						}
+						select {
+						case ch <- ev:
+						default:
+						}
+					}
+				} else {
+					// closed or gone
+					if t != nil && t.closed && t.ch != nil {
+						close(t.ch)
+						t.ch = nil
+					}
+					w.mu.Unlock()
+				}
+			}
+		case <-w.quit:
+			return
+		}
+	}
+}
+
+// Helpers
+func b2u(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (w *onceIRQ) markPending(pin int) {
+	mask := uint64(1) << uint(pin)
+	for {
+		old := w.pending.Load()
+		if w.pending.CompareAndSwap(old, old|mask) {
+			return
+		}
+	}
+}
+
+func mapEdges(sel core.GPIOEdge) machine.PinChange {
+	switch sel {
+	case core.EdgeRising:
+		return machine.PinRising
+	case core.EdgeFalling:
+		return machine.PinFalling
+	case core.EdgeBoth:
+		return machine.PinRising | machine.PinFalling
+	default:
+		return 0
+	}
+}
+
+// ISR plumbing: single shared handler; owner set per-registry.
+var (
+	isrOwnerMu sync.Mutex
+	isrOwner   *onceIRQ
+)
+
+// Shared ISR callback (no closures).
+func gpioISR(p machine.Pin) {
+	pin := int(p)
+	isrOwnerMu.Lock()
+	owner := isrOwner
+	isrOwnerMu.Unlock()
+	if owner != nil {
+		owner.markPending(pin)
+		select {
+		case owner.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func installISRForPin(owner *onceIRQ, pin int, flags machine.PinChange) bool {
+	isrOwnerMu.Lock()
+	isrOwner = owner
+	isrOwnerMu.Unlock()
+	if flags == 0 {
+		_ = machine.Pin(pin).SetInterrupt(0, nil)
+		return true
+	}
+	_ = machine.Pin(pin).SetInterrupt(flags, gpioISR)
+	return true
+}
+
+func disableISRForPin(pin int) {
+	_ = machine.Pin(pin).SetInterrupt(0, nil)
 }

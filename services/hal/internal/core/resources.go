@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	"tinygo.org/x/drivers"
 )
@@ -44,6 +45,32 @@ type GPIOHandle interface {
 	Set(bool)
 	Get() bool
 	Toggle()
+}
+
+// ---- GPIO edge stream (provider-agnostic) ----
+type GPIOEdge uint8
+
+const (
+	EdgeNone    GPIOEdge = 0
+	EdgeRising  GPIOEdge = 1 << 0
+	EdgeFalling GPIOEdge = 1 << 1
+	EdgeBoth             = EdgeRising | EdgeFalling
+)
+
+// Provider-agnostic edge event; timestamp is from the provider worker.
+type GPIOEdgeEvent struct {
+	Pin   int   // GPIO number
+	Level bool  // logic level after the edge
+	TS    int64 // Unix ns
+}
+
+// Best-effort edge stream bound to a claimed input pin.
+// Delivery must be non-blocking; dropping is permitted.
+type GPIOEdgeStream interface {
+	Events() <-chan GPIOEdgeEvent
+	Close()
+	SetDebounce(d time.Duration) bool
+	SetEdges(sel GPIOEdge) bool
 }
 
 // PWM (function-specific view)
@@ -114,4 +141,8 @@ type ResourceRegistry interface {
 	// Unified pin function claims
 	ClaimPin(devID string, pin int, fn PinFunc) (PinHandle, error)
 	ReleasePin(devID string, pin int)
+
+	// GPIO edge subscriptions (exclusive per claimed input pin).
+	SubscribeGPIOEdges(devID string, pin int, sel GPIOEdge, debounce time.Duration, buf int) (GPIOEdgeStream, error)
+	UnsubscribeGPIOEdges(devID string, pin int)
 }

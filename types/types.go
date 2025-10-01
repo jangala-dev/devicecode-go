@@ -31,6 +31,7 @@ const (
 	KindTemperature Kind = "temperature"
 	KindHumidity    Kind = "humidity"
 	KindSerial      Kind = "serial"
+	KindButton      Kind = "button"
 )
 
 // Info envelope each device/cap exposes (retained)
@@ -39,6 +40,10 @@ type Info struct {
 	Driver        string      `json:"driver"`
 	Detail        interface{} `json:"detail,omitempty"`
 }
+
+type ButtonInfo struct{ Pin int }
+
+type ButtonValue struct{ Pressed bool }
 
 // ---- LED capability params ----
 
