@@ -55,4 +55,14 @@ var SelectedSetup = types.HALConfig{
 			TXSize: 512,
 		}},
 	},
+
+	// Declarative polling schedules applied by HAL after devices are registered.
+	Pollers: []types.PollSpec{
+		// Read the SHTC3 sensor periodically. Due to device-level dedup in HAL,
+		// polling temperature suffices (humidity is emitted by the same read).
+		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 1000, JitterMs: 100},
+
+		// Example: if we wanted an LED "read" (not typical), we could add entries like:
+		// {Domain: "io", Kind: "pwm", Name: "onboard", Verb: "read", IntervalMs: 500, JitterMs: 50},
+	},
 }

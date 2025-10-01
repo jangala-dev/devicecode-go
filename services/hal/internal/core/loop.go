@@ -33,22 +33,38 @@ type HAL struct {
 
 	// Single-threaded publication of device events
 	evCh chan Event
+
+	// Polling
+	pollCh      chan PollReq
+	poll        *Poller
+	lastEmit    map[capKey]int64 // last retained value emission TS (ns) per capability
+	lastDevEmit map[string]int64 // last retained value emission TS (ns) per device
 }
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
 	h := &HAL{
-		conn:     conn,
-		res:      res,
-		dev:      map[string]Device{},
-		capIndex: map[capKey]string{},
-		evCh:     make(chan Event, eventQueueLen),
+		conn:        conn,
+		res:         res,
+		dev:         map[string]Device{},
+		capIndex:    map[capKey]string{},
+		evCh:        make(chan Event, eventQueueLen),
+		pollCh:      make(chan PollReq, 32),
+		lastEmit:    make(map[capKey]int64),
+		lastDevEmit: make(map[string]int64),
 	}
 	// HAL provides the emitter to devices.
 	h.res.Pub = h
+	// Poller delivers schedule ticks into h.pollCh.
+	h.poll = NewPoller(h.pollCh)
 	return h
 }
 
 func (h *HAL) Run(ctx context.Context) {
+	// Start poller with child context; it exits when ctx is cancelled.
+	pctx, cancel := context.WithCancel(ctx)
+	go h.poll.Run(pctx)
+	defer cancel()
+
 	h.cfgSub = h.conn.Subscribe(topicConfigHAL())
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
 	defer h.conn.Unsubscribe(h.cfgSub)
@@ -79,6 +95,36 @@ func (h *HAL) Run(ctx context.Context) {
 		case ev := <-h.evCh:
 			// All device→HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
+		// Scheduled polling ticks are handled here and routed to devices.
+		case pr := <-h.pollCh:
+			if !ready {
+				continue
+			}
+			k := capKey{domain: pr.Domain, kind: pr.Kind, name: pr.Name}
+			now := time.Now().UnixNano()
+
+			// Resolve owner for device-level coalescing.
+			ownerID, ok := h.capIndex[k]
+			if !ok {
+				continue
+			}
+
+			// Coalesce using both capability-level and device-level last emissions.
+			lastCap := h.lastEmit[k]
+			lastDev := h.lastDevEmit[ownerID]
+			lastAny := lastCap
+			if lastDev > lastAny {
+				lastAny = lastDev
+			}
+			if lastAny > 0 && (now-lastAny) < pr.Every.Nanoseconds() {
+				h.poll.BumpAfter(pr.Domain, pr.Kind, pr.Name, pr.Verb, lastAny)
+				continue
+			}
+
+			if dev := h.dev[ownerID]; dev != nil {
+				// Best-effort; devices should return Busy if already active.
+				_, _ = dev.Control(CapAddr{Domain: pr.Domain, Kind: pr.Kind, Name: pr.Name}, pr.Verb, nil)
+			}
 		}
 	}
 }
@@ -123,7 +169,19 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		for _, cs := range dev.Capabilities() {
 			h.registerCap(dev.ID(), cs)
 		}
+	}
 
+	// Apply declarative pollers from config after all capabilities are registered.
+	for i := range cfg.Pollers {
+		ps := cfg.Pollers[i]
+		if ps.IntervalMs == 0 || ps.Verb == "" || ps.Domain == "" || ps.Kind == "" || ps.Name == "" {
+			continue
+		}
+		h.poll.Upsert(
+			ps.Domain, ps.Kind, ps.Name, ps.Verb,
+			time.Duration(ps.IntervalMs)*time.Millisecond,
+			time.Duration(ps.JitterMs)*time.Millisecond,
+		)
 	}
 }
 
@@ -132,6 +190,56 @@ func (h *HAL) handleControl(msg *bus.Message) {
 	cap, verb, ok := parseCapCtrl(msg.Topic)
 	if !ok {
 		h.reply(msg, false, errcode.InvalidTopic, nil)
+		return
+	}
+
+	// HAL-handled verbs for polling (strictly typed payloads).
+	switch verb {
+	case "poll_start":
+		switch v := msg.Payload.(type) {
+		case types.PollStart:
+			if v.Verb == "" || v.IntervalMs == 0 {
+				h.reply(msg, false, errcode.InvalidPayload, nil)
+				return
+			}
+			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
+				time.Duration(v.IntervalMs)*time.Millisecond,
+				time.Duration(v.JitterMs)*time.Millisecond)
+			h.reply(msg, true, "", nil)
+			return
+		case *types.PollStart:
+			if v == nil || v.Verb == "" || v.IntervalMs == 0 {
+				h.reply(msg, false, errcode.InvalidPayload, nil)
+				return
+			}
+			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
+				time.Duration(v.IntervalMs)*time.Millisecond,
+				time.Duration(v.JitterMs)*time.Millisecond)
+			h.reply(msg, true, "", nil)
+			return
+		default:
+			h.reply(msg, false, errcode.InvalidPayload, nil)
+			return
+		}
+	case "poll_stop":
+		verbToStop := "read"
+		switch v := msg.Payload.(type) {
+		case nil:
+			// default
+		case types.PollStop:
+			if v.Verb != "" {
+				verbToStop = v.Verb
+			}
+		case *types.PollStop:
+			if v != nil && v.Verb != "" {
+				verbToStop = v.Verb
+			}
+		default:
+			h.reply(msg, false, errcode.InvalidPayload, nil)
+			return
+		}
+		h.poll.Stop(cap.Domain, cap.Kind, cap.Name, verbToStop)
+		h.reply(msg, true, "", nil)
 		return
 	}
 
@@ -163,6 +271,7 @@ func (h *HAL) handleControl(msg *bus.Message) {
 
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
+	ck := capKey{domain: d, kind: k, name: n}
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
 		h.pubStatus(d, k, n, ev.TS, ev.Err)
@@ -177,6 +286,12 @@ func (h *HAL) handleEvent(ev Event) {
 		}
 	} else {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
+		// Record last successful retained value emission for coalescing (capability-level).
+		h.lastEmit[ck] = ev.TS
+		// Also record device-level emission time for cross-capability coalescing.
+		if ownerID, ok := h.capIndex[ck]; ok {
+			h.lastDevEmit[ownerID] = ev.TS
+		}
 	}
 	// 3) Retained status: up
 	h.pubStatus(d, k, n, ev.TS, "")

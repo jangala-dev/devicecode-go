@@ -147,12 +147,13 @@ type SerialInfo struct {
 
 type HALConfig struct {
 	Devices []HALDevice `json:"devices"`
+	Pollers []PollSpec
 }
 
 type HALDevice struct {
-	ID     string      `json:"id"`     // logical device id, e.g. "led0"
-	Type   string      `json:"type"`   // e.g. "gpio_led"
-	Params interface{} `json:"params"` // device-specific params (JSON-like)
+	ID     string `json:"id"`     // logical device id, e.g. "led0"
+	Type   string `json:"type"`   // e.g. "gpio_led"
+	Params any    `json:"params"` // device-specific params (JSON-like)
 }
 
 // Info structs appear on hal/capability/<kind>/<id>/info (retained).
@@ -179,4 +180,28 @@ type TemperatureValue struct {
 type HumidityValue struct {
 	// Hundredths of %RH (e.g. 5034 => 50.34 %RH). Use uint16 (0..10000).
 	RHx100 uint16
+}
+
+// PollStart is the strictly-typed payload for starting/updating a schedule.
+type PollStart struct {
+	Verb       string // required, e.g. "read"
+	IntervalMs uint32 // required, >0
+	JitterMs   uint16 // optional, uniform [0..JitterMs]
+}
+
+// PollStop is the strictly-typed payload for stopping a schedule.
+// If Verb is empty, it is treated as "read".
+type PollStop struct {
+	Verb string
+}
+
+// PollSpec is a declarative, config-time schedule attached to HALConfig.
+// HAL applies these at startup (and whenever a new config is applied).
+type PollSpec struct {
+	Domain     string // capability domain, e.g. "env"
+	Kind       string // capability kind,   e.g. "temperature"
+	Name       string // capability name,   e.g. "core"
+	Verb       string // control verb to call, typically "read"
+	IntervalMs uint32 // >0
+	JitterMs   uint16 // optional
 }
