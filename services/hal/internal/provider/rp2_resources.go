@@ -255,11 +255,27 @@ func (p *rp2PWM) Ramp(to uint16, durationMs uint32, steps uint16, _ core.PWMRamp
 
 	go func() {
 		defer func() { p.mu.Lock(); p.rampAlive = false; p.mu.Unlock() }()
+		timer := time.NewTimer(0)
+		// Ensure timer is not left running from construction.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		defer timer.Stop()
 		tick := func(d time.Duration) bool {
+			timer.Reset(d)
 			select {
 			case <-cancel:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return false
-			case <-time.After(d):
+			case <-timer.C:
 				return true
 			}
 		}
@@ -374,16 +390,28 @@ func (d *driversI2C) Tx(addr uint16, w, r []byte) error {
 		// Unbounded enqueue (blocks until space is available)
 		d.o.reqs <- req
 	} else {
-		// Bounded enqueue
-		t := time.NewTimer(d.timeout)
+		t := time.NewTimer(0)
+		// Ensure clean state before use.
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		t.Reset(d.timeout)
 		select {
 		case d.o.reqs <- req:
 			if !t.Stop() {
-				<-t.C
+				select {
+				case <-t.C:
+				default:
+				}
 			}
 		case <-t.C:
 			return errcode.Busy
 		}
+		// Reuse 't' for completion wait below.
+		defer t.Stop()
 	}
 
 	// Completion

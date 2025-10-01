@@ -101,16 +101,12 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 func (d *Device) ID() string { return d.id }
 
 func (d *Device) Capabilities() []core.CapabilitySpec {
-	// Provide discoverability for bus and initial baud without requiring new strong types.
-	detail := map[string]any{"bus": d.busID}
-	if d.params.Baud > 0 {
-		detail["baud"] = d.params.Baud
-	}
+	info := types.SerialInfo{Bus: d.busID, Baud: d.params.Baud}
 	return []core.CapabilitySpec{{
 		Domain: d.a.Domain,
 		Kind:   types.KindSerial,
 		Name:   d.a.Name,
-		Info:   types.Info{Driver: "serial_raw", Detail: detail},
+		Info:   types.Info{Driver: "serial_raw", Detail: info},
 	}}
 }
 
@@ -172,14 +168,29 @@ type sessionCloseReq struct {
 func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
 	switch verb {
 	case "session_open":
+		// Strong payload; nil uses defaults.
 		req := sessionOpenReq{RXSize: d.params.RXSize, TXSize: d.params.TXSize}
-		if m, ok := payload.(map[string]any); ok {
-			if v, ok := m["RXSize"].(float64); ok {
-				req.RXSize = int(v)
+		switch v := payload.(type) {
+		case nil:
+			// keep defaults
+		case types.SerialSessionOpen:
+			if v.RXSize != 0 {
+				req.RXSize = v.RXSize
 			}
-			if v, ok := m["TXSize"].(float64); ok {
-				req.TXSize = int(v)
+			if v.TXSize != 0 {
+				req.TXSize = v.TXSize
 			}
+		case *types.SerialSessionOpen:
+			if v != nil {
+				if v.RXSize != 0 {
+					req.RXSize = v.RXSize
+				}
+				if v.TXSize != 0 {
+					req.TXSize = v.TXSize
+				}
+			}
+		default:
+			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 		}
 		if (req.RXSize&(req.RXSize-1)) != 0 || (req.TXSize&(req.TXSize-1)) != 0 {
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
@@ -199,6 +210,13 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		return core.EnqueueResult{OK: true}, nil
 
 	case "session_close":
+		// Accept nil or explicit empty struct.
+		switch payload.(type) {
+		case nil, types.SerialSessionClose, *types.SerialSessionClose:
+			// ok
+		default:
+			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		}
 		if d.sess == nil {
 			return core.EnqueueResult{OK: true}, nil
 		}
@@ -218,11 +236,14 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
 		switch v := payload.(type) {
-		case float64:
-			_ = d.cfgB.SetBaudRate(uint32(v))
+		case types.SerialSetBaud:
+			_ = d.cfgB.SetBaudRate(v.Baud)
 			return core.EnqueueResult{OK: true}, nil
-		case uint32:
-			_ = d.cfgB.SetBaudRate(v)
+		case *types.SerialSetBaud:
+			if v == nil {
+				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+			}
+			_ = d.cfgB.SetBaudRate(v.Baud)
 			return core.EnqueueResult{OK: true}, nil
 		default:
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
@@ -233,27 +254,32 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		if d.cfgF == nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
-		m, ok := payload.(map[string]any)
-		if !ok {
+		var req types.SerialSetFormat
+		switch v := payload.(type) {
+		case types.SerialSetFormat:
+			req = v
+		case *types.SerialSetFormat:
+			if v == nil {
+				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+			}
+			req = *v
+		default:
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 		}
-		var (
-			db, sb uint8
-			par    string
-		)
-		if v, ok := m["databits"].(float64); ok {
-			db = uint8(v)
-		}
-		if v, ok := m["stopbits"].(float64); ok {
-			sb = uint8(v)
-		}
-		if v, ok := m["parity"].(string); ok {
-			par = v
-		}
-		if db == 0 || sb == 0 || par == "" {
+		if req.DataBits == 0 || req.StopBits == 0 {
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
 		}
-		if err := d.cfgF.SetFormat(db, sb, par); err != nil {
+		var par string
+		switch req.Parity {
+		case types.ParityEven:
+			par = "even"
+		case types.ParityOdd:
+			par = "odd"
+		default:
+			par = "none"
+		}
+		if err := d.cfgF.SetFormat(req.DataBits, req.StopBits, par); err != nil {
+
 			return core.EnqueueResult{OK: false, Error: errcode.MapDriverErr(err)}, nil
 		}
 		return core.EnqueueResult{OK: true}, nil

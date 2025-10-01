@@ -18,6 +18,7 @@ func main() {
 	time.Sleep(1500 * time.Millisecond)
 
 	ctx := context.Background()
+
 	b := bus.NewBus(4, "+", "#")
 	halConn := b.NewConnection("hal")
 	ui := b.NewConnection("ui")
@@ -52,6 +53,8 @@ func main() {
 	// Collect handles
 	var u0tx, u1rx shmring.Handle
 	deadline := time.Now().Add(3 * time.Second)
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
 	for (u0tx == 0 || u1rx == 0) && time.Now().Before(deadline) {
 		select {
 		case m := <-subU0Opened.Channel():
@@ -64,8 +67,15 @@ func main() {
 				u1rx = h.rx
 				println("[uart] uart1 RX handle=", uint32(u1rx))
 			}
-		case <-time.After(50 * time.Millisecond):
+		case <-timer.C:
 		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(50 * time.Millisecond)
 	}
 	if u0tx == 0 || u1rx == 0 {
 		println("[uart] FAIL: missing session handles")

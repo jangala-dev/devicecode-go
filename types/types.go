@@ -103,6 +103,41 @@ type ErrorReply struct {
 	Error string `json:"error"`
 }
 
+// ---- Serial capability (control + discovery) ----
+
+// SerialParity is a small enum to avoid string parsing on device side.
+type SerialParity uint8
+
+const (
+	ParityNone SerialParity = iota
+	ParityEven
+	ParityOdd
+)
+
+// Control payloads
+type SerialSessionOpen struct {
+	RXSize int // power of two; 0 => device default
+	TXSize int // power of two; 0 => device default
+}
+
+type SerialSessionClose struct{}
+
+type SerialSetBaud struct {
+	Baud uint32
+}
+
+type SerialSetFormat struct {
+	DataBits uint8
+	StopBits uint8
+	Parity   SerialParity
+}
+
+// Discovery payload for Info.Detail
+type SerialInfo struct {
+	Bus  string
+	Baud uint32 // 0 if unspecified
+}
+
 // ---- Public HAL configuration ----
 
 type HALConfig struct {
