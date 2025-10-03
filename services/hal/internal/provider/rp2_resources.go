@@ -805,9 +805,6 @@ func (r *rp2Registry) SubscribeGPIOEdges(devID string, pin int, sel core.GPIOEdg
 		lastLvl:  b2u(machine.Pin(pin).Get()),
 		lastTS:   time.Now().UnixNano(),
 	}
-	// Ensure input first
-	p := machine.Pin(pin)
-	p.Configure(machine.PinConfig{Mode: machine.PinInput})
 
 	// Register subscription before enabling interrupts so an immediate IRQ
 	// has a destination with initial state already seeded.
