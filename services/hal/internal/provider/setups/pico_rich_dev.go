@@ -3,6 +3,7 @@
 package setups
 
 import (
+	ltc4015dev "devicecode-go/services/hal/devices/ltc4015"
 	"devicecode-go/services/hal/devices/pwm_out"
 	serialraw "devicecode-go/services/hal/devices/serial_raw"
 	shtc3dev "devicecode-go/services/hal/devices/shtc3"
@@ -53,6 +54,12 @@ var SelectedSetup = types.HALConfig{
 			Baud:   115200,
 			RXSize: 512,
 			TXSize: 512,
+		}},
+
+		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
+			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3330, RSNSI_uOhm: 1670, Cells: 6,
+			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9000, VinHi_mV: 11000,
+			BSRHi_uOhmPerCell: 100000,
 		}},
 	},
 

@@ -18,11 +18,12 @@ const (
 	InvalidTopic      Code = "invalid_topic"
 	Conflict          Code = "config_conflict"
 
-	UnknownBus Code = "unknown_bus"
-	BusInUse   Code = "bus_in_use"
-	UnknownPin Code = "unknown_pin"
-	PinInUse   Code = "pin_in_use"
-	Timeout    Code = "timeout"
+	UnknownBus  Code = "unknown_bus"
+	BusInUse    Code = "bus_in_use"
+	UnknownPin  Code = "unknown_pin"
+	PinInUse    Code = "pin_in_use"
+	Timeout     Code = "timeout"
+	Unavailable Code = "unavailable"
 
 	Error Code = "error" // generic fallback
 )

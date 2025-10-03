@@ -32,6 +32,8 @@ const (
 	KindHumidity    Kind = "humidity"
 	KindSerial      Kind = "serial"
 	KindButton      Kind = "button"
+	KindBattery     Kind = "battery"
+	KindCharger     Kind = "charger"
 )
 
 // Info envelope each device/cap exposes (retained)
@@ -205,3 +207,42 @@ type PollSpec struct {
 	IntervalMs uint32 // >0
 	JitterMs   uint16 // optional
 }
+
+type BatteryInfo struct {
+	Cells      uint8
+	Chem       string // "li" | "leadacid" | "auto"
+	RSNSB_uOhm uint32
+	Bus        string
+	Addr       uint16
+}
+
+// Retained value published at hal/cap/power/battery/<name>/value
+type BatteryValue struct {
+	PackMilliV      int32  // total pack voltage (mV)
+	PerCellMilliV   int32  // per-cell voltage (mV)
+	IBatMilliA      int32  // battery current (mA; sign by device convention)
+	TempMilliC      int32  // die temperature (milli-°C)
+	BSR_uOhmPerCell uint32 // battery sense resistance estimate per cell
+}
+
+type ChargerInfo struct {
+	RSNSI_uOhm uint32
+	Bus        string
+	Addr       uint16
+}
+
+// Retained value published at hal/cap/power/charger/<name>/value
+type ChargerValue struct {
+	VIN_mV  int32
+	VSYS_mV int32
+	IIn_mA  int32
+	State   uint16 // raw CHARGER_STATE bits
+	Status  uint16 // raw CHARGE_STATUS bits
+	Sys     uint16 // raw SYSTEM_STATUS bits
+}
+
+// Controls
+type ChargerEnable struct{ On bool }           // verb: "enable"
+type SetInputLimit struct{ MilliA int32 }      // verb: "set_input_limit"
+type SetChargeTarget struct{ MilliA int32 }    // verb: "set_charge_target"
+type SetVinWindow struct{ Lo_mV, Hi_mV int32 } // verb: "set_vin_window"
