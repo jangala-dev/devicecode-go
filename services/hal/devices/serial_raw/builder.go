@@ -80,18 +80,13 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		return nil, errcode.InvalidParams
 	}
 
-	domain := p.Domain
-	if domain == "" {
-		domain = "io"
-	}
-	name := p.Name
-	if name == "" {
-		name = in.ID
+	if p.Domain == "" || p.Name == "" {
+		return nil, errcode.InvalidParams
 	}
 
 	return &Device{
 		id:     in.ID,
-		a:      core.CapAddr{Domain: domain, Kind: string(types.KindSerial), Name: name},
+		a:      core.CapAddr{Domain: p.Domain, Kind: string(types.KindSerial), Name: p.Name},
 		res:    in.Res,
 		params: p,
 		busID:  p.Bus,
@@ -124,12 +119,8 @@ func (d *Device) Init(ctx context.Context) error {
 		d.cfgF = f
 	}
 
-	if d.cfgB != nil {
-		if d.params.Baud > 0 {
-			_ = d.cfgB.SetBaudRate(d.params.Baud)
-		} else {
-			_ = d.cfgB.SetBaudRate(115200) // default only when not explicitly set
-		}
+	if d.cfgB != nil && d.params.Baud > 0 {
+		_ = d.cfgB.SetBaudRate(d.params.Baud)
 	}
 
 	// Publish initial LinkDown status while we are inactive.

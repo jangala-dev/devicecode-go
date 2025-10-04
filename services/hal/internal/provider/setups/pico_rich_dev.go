@@ -3,6 +3,7 @@
 package setups
 
 import (
+	"devicecode-go/services/hal/devices/gpio_dout"
 	ltc4015dev "devicecode-go/services/hal/devices/ltc4015"
 	"devicecode-go/services/hal/devices/pwm_out"
 	serialraw "devicecode-go/services/hal/devices/serial_raw"
@@ -34,7 +35,7 @@ var SelectedSetup = types.HALConfig{
 		}},
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
-		{ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0"}},
+		{ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0", Domain: "env", Name: "core"}},
 
 		// Raw serial device bound to uart0 (public address hal/cap/io/serial/uart0/…)
 		{ID: "uart0_raw", Type: "serial_raw", Params: serialraw.Params{
@@ -60,6 +61,33 @@ var SelectedSetup = types.HALConfig{
 			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3330, RSNSI_uOhm: 1670, Cells: 6,
 			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9000, VinHi_mV: 11000,
 			BSRHi_uOhmPerCell: 100000,
+			DomainBattery:     "power", DomainCharger: "power", Name: "charger0",
+		}},
+
+		// Gates / enables -> switches (power domain)
+		{ID: "mpcie-usb", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 6, ActiveLow: false, Initial: true,
+			Domain: "power", Name: "mpcie-usb",
+		}},
+		{ID: "m2", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 7, ActiveLow: false, Initial: true,
+			Domain: "power", Name: "m2",
+		}},
+		{ID: "mpcie", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 8, ActiveLow: false, Initial: true,
+			Domain: "power", Name: "mpcie",
+		}},
+		{ID: "cm5-5v", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 9, ActiveLow: false, Initial: false,
+			Domain: "power", Name: "cm5-5v",
+		}},
+		{ID: "fan-5v", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 10, ActiveLow: false, Initial: false,
+			Domain: "power", Name: "fan-5v",
+		}},
+		{ID: "boost-load", Type: "gpio_switch", Params: gpio_dout.Params{
+			Pin: 14, ActiveLow: false, Initial: false,
+			Domain: "power", Name: "boost-load",
 		}},
 	},
 

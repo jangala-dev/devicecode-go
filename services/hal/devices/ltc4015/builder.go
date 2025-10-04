@@ -6,7 +6,6 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/strx"
 )
 
 // Params defines wiring and behaviour for one LTC4015 instance.
@@ -19,8 +18,7 @@ type Params struct {
 	Chem        string // "li" | "la" | "auto" | ""(=> "li")
 	SMBAlertPin int    // required: GPIO for SMBALERT# (active-low, OD)
 
-	// Optional naming. Defaults: battery domain "power", charger domain "power";
-	// name defaults to device ID if empty.
+	// Required naming.
 	DomainBattery string
 	DomainCharger string
 	Name          string
@@ -50,6 +48,9 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if p.Bus == "" || p.RSNSB_uOhm == 0 || p.RSNSI_uOhm == 0 || p.SMBAlertPin < 0 {
 		return nil, errcode.InvalidParams
 	}
+	if p.DomainBattery == "" || p.DomainCharger == "" || p.Name == "" {
+		return nil, errcode.InvalidParams
+	}
 
 	// Claim I2C (serialised by provider) and SMBALERT pin for input.
 	i2c, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
@@ -65,9 +66,9 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	// Ensure pull-up; LTC4015 SMBALERT# is open-drain, active-low.
 	_ = gpio.ConfigureInput(core.PullUp)
 
-	name := strx.Coalesce(p.Name, in.ID)
-	domBat := strx.Coalesce(p.DomainBattery, "power")
-	domChg := strx.Coalesce(p.DomainCharger, "power")
+	name := p.Name
+	domBat := p.DomainBattery
+	domChg := p.DomainCharger
 
 	dev := &Device{
 		id:   in.ID,

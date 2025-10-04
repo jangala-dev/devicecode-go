@@ -307,15 +307,12 @@ func (h *HAL) pubHALState(level, status string) {
 
 // registerCap indexes the capability and publishes its info and initial status:down (retained).
 func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
-	k := string(cs.Kind)
+	if cs.Domain == "" || string(cs.Kind) == "" || cs.Name == "" {
+		panic(fmtx.Sprintf("[hal] capability must specify non-empty domain/kind/name: dev=%s", devID))
+	}
 	domain := cs.Domain
-	if domain == "" {
-		domain = defaultDomainFor(k)
-	}
+	k := string(cs.Kind)
 	name := cs.Name
-	if name == "" {
-		name = devID
-	}
 	// Index for control routing.
 	h.capIndex[capKey{domain: domain, kind: k, name: name}] = devID
 	// Publish static info (retained).
@@ -348,20 +345,6 @@ func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
 		types.CapabilityStatus{Link: link, TS: ts, Error: err},
 		true,
 	))
-}
-
-// Default domain inference unchanged.
-func defaultDomainFor(kind string) string {
-	switch kind {
-	case "temperature", "humidity":
-		return "env"
-	case "led", "pwm", "button":
-		return "io"
-	case "switch", "rail", "voltage", "current", "power":
-		return "power"
-	default:
-		return "io"
-	}
 }
 
 // ---- HAL as EventEmitter (enqueue to single publisher) ----

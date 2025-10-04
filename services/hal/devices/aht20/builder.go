@@ -19,8 +19,10 @@ import (
 func init() { core.RegisterBuilder("aht20", builder{}) }
 
 type Params struct {
-	Bus  string // e.g. "i2c0"
-	Addr uint16 // defaults to aht20.Address (0x38) if zero
+	Bus    string // e.g. "i2c0"
+	Addr   uint16 // defaults to aht20.Address (0x38) if zero
+	Domain string // REQUIRED
+	Name   string // REQUIRED
 }
 
 type builder struct{}
@@ -28,6 +30,9 @@ type builder struct{}
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
 	p, ok := in.Params.(Params)
 	if !ok || p.Bus == "" {
+		return nil, errcode.InvalidParams
+	}
+	if p.Domain == "" || p.Name == "" {
 		return nil, errcode.InvalidParams
 	}
 	if p.Addr == 0 {
@@ -45,6 +50,8 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		i2c:  bus,
 		pub:  in.Res.Pub,
 		reg:  in.Res.Reg,
+		dom:  p.Domain,
+		name: p.Name,
 	}
 	d.drv = aht20.New(bus) // drivers.I2C directly
 	return d, nil
@@ -59,7 +66,10 @@ type Device struct {
 	pub core.EventEmitter
 	reg core.ResourceRegistry
 
-	drv      aht20.Device
+	drv  aht20.Device
+	dom  string
+	name string
+
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
 
@@ -71,18 +81,18 @@ func (d *Device) ID() string { return d.id }
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{
 		{
-			Domain: "env",
+			Domain: d.dom,
 			Kind:   types.KindTemperature,
-			Name:   d.id,
+			Name:   d.name,
 			Info: types.Info{
 				SchemaVersion: 1, Driver: "aht20",
 				Detail: types.TemperatureInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
 			},
 		},
 		{
-			Domain: "env",
+			Domain: d.dom,
 			Kind:   types.KindHumidity,
-			Name:   d.id,
+			Name:   d.name,
 			Info: types.Info{
 				SchemaVersion: 1, Driver: "aht20",
 				Detail: types.HumidityInfo{Sensor: "aht20", Addr: d.addr, Bus: d.bus},
@@ -93,8 +103,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 func (d *Device) Init(ctx context.Context) error {
 	// Establish capability addresses; avoid touching the bus here.
-	d.addrTemp = core.CapAddr{Domain: "env", Kind: string(types.KindTemperature), Name: d.id}
-	d.addrHum = core.CapAddr{Domain: "env", Kind: string(types.KindHumidity), Name: d.id}
+	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: string(types.KindTemperature), Name: d.name}
+	d.addrHum = core.CapAddr{Domain: d.dom, Kind: string(types.KindHumidity), Name: d.name}
 	// Provide the address without doing I²C; Configure() will occur on first Read.
 	d.drv.Address = d.addr
 	return nil

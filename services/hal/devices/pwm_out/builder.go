@@ -6,7 +6,6 @@ import (
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
-	"devicecode-go/x/strx"
 )
 
 func init() { core.RegisterBuilder("pwm_out", builder{}) }
@@ -26,6 +25,9 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if !ok || p.Pin < 0 {
 		return nil, errcode.InvalidParams
 	}
+	if p.Domain == "" || p.Name == "" {
+		return nil, errcode.InvalidParams
+	}
 	ph, err := in.Res.Reg.ClaimPin(in.ID, p.Pin, core.FuncPWM)
 	if err != nil {
 		return nil, err
@@ -37,8 +39,8 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		pwm:  pwm,
 		pub:  in.Res.Pub,
 		reg:  in.Res.Reg,
-		dom:  strx.Coalesce(p.Domain, "io"),
-		name: strx.Coalesce(p.Name, in.ID),
+		dom:  p.Domain,
+		name: p.Name,
 		freq: p.FreqHz,
 		top:  p.Top,
 	}

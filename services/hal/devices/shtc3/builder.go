@@ -17,7 +17,9 @@ import (
 func init() { core.RegisterBuilder("shtc3", builder{}) }
 
 type Params struct {
-	Bus string // e.g. "i2c0"
+	Bus    string // e.g. "i2c0"
+	Domain string
+	Name   string
 }
 
 type builder struct{}
@@ -27,17 +29,22 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	if !ok || p.Bus == "" {
 		return nil, errcode.InvalidParams
 	}
+	if p.Domain == "" || p.Name == "" {
+		return nil, errcode.InvalidParams
+	}
 	bus, err := in.Res.Reg.ClaimI2C(in.ID, core.ResourceID(p.Bus))
 	if err != nil {
 		return nil, err
 	}
 
 	d := &Device{
-		id:  in.ID,
-		bus: p.Bus,
-		i2c: bus,
-		pub: in.Res.Pub,
-		reg: in.Res.Reg,
+		id:   in.ID,
+		bus:  p.Bus,
+		i2c:  bus,
+		pub:  in.Res.Pub,
+		reg:  in.Res.Reg,
+		dom:  p.Domain,
+		name: p.Name,
 	}
 	d.drv = shtc3.New(bus) // drivers.I2C directly
 	return d, nil
@@ -51,7 +58,10 @@ type Device struct {
 	pub core.EventEmitter
 	reg core.ResourceRegistry
 
-	drv      shtc3.Device
+	drv  shtc3.Device
+	dom  string
+	name string
+
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
 
@@ -63,18 +73,18 @@ func (d *Device) ID() string { return d.id }
 func (d *Device) Capabilities() []core.CapabilitySpec {
 	return []core.CapabilitySpec{
 		{
-			Domain: "env",
+			Domain: d.dom,
 			Kind:   types.KindTemperature,
-			Name:   d.id,
+			Name:   d.name,
 			Info: types.Info{
 				SchemaVersion: 1, Driver: "shtc3",
 				Detail: types.TemperatureInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
 			},
 		},
 		{
-			Domain: "env",
+			Domain: d.dom,
 			Kind:   types.KindHumidity,
-			Name:   d.id,
+			Name:   d.name,
 			Info: types.Info{
 				SchemaVersion: 1, Driver: "shtc3",
 				Detail: types.HumidityInfo{Sensor: "shtc3", Addr: 0x70, Bus: d.bus},
@@ -85,8 +95,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 // Init sets up addresses without touching the bus.
 func (d *Device) Init(ctx context.Context) error {
-	d.addrTemp = core.CapAddr{Domain: "env", Kind: string(types.KindTemperature), Name: d.id}
-	d.addrHum = core.CapAddr{Domain: "env", Kind: string(types.KindHumidity), Name: d.id}
+	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: string(types.KindTemperature), Name: d.name}
+	d.addrHum = core.CapAddr{Domain: d.dom, Kind: string(types.KindHumidity), Name: d.name}
 	return nil
 }
 

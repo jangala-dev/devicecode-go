@@ -18,9 +18,9 @@ type CapAddr struct {
 // ---- Capability & device model ----
 
 type CapabilitySpec struct {
-	Domain string     // if empty, HAL will infer
-	Kind   types.Kind // capability kind
-	Name   string     // if empty, HAL uses device ID
+	Domain string
+	Kind   types.Kind
+	Name   string
 	Info   types.Info
 	TTLms  int // reserved; 0 = none
 }

@@ -21,6 +21,10 @@ func (b gpioBuilder) Build(ctx context.Context, in core.BuilderInput) (core.Devi
 	if err != nil {
 		return nil, err
 	}
+	// Enforce explicit addressing.
+	if p.Domain == "" || p.Name == "" {
+		return nil, errcode.InvalidParams
+	}
 	ph, err := in.Res.Reg.ClaimPin(in.ID, p.Pin, core.FuncGPIOOut)
 	if err != nil {
 		return nil, err
