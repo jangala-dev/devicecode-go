@@ -8,14 +8,17 @@ type HALState struct {
 	TS     int64  `json:"ts_ms"`
 }
 
+// Link is the link/state reported for a capability.
+type Link string
+
 const (
-	LinkUp       = "up"
-	LinkDown     = "down"
-	LinkDegraded = "degraded"
+	LinkUp       Link = "up"
+	LinkDown     Link = "down"
+	LinkDegraded Link = "degraded"
 )
 
 type CapabilityStatus struct {
-	Link  string `json:"link"`
+	Link  Link   `json:"link"`
 	TS    int64  `json:"ts_ms"`
 	Error string `json:"error,omitempty"`
 }

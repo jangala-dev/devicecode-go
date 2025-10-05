@@ -39,6 +39,12 @@ type HAL struct {
 	poll        *Poller
 	lastEmit    map[capKey]int64 // last retained value emission TS (ns) per capability
 	lastDevEmit map[string]int64 // last retained value emission TS (ns) per device
+
+	// De-chatter: last published status per capability
+	lastStatus map[capKey]struct {
+		link types.Link
+		err  string
+	}
 }
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
@@ -51,6 +57,10 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		pollCh:      make(chan PollReq, 32),
 		lastEmit:    make(map[capKey]int64),
 		lastDevEmit: make(map[string]int64),
+		lastStatus: make(map[capKey]struct {
+			link types.Link
+			err  string
+		}),
 	}
 	// HAL provides the emitter to devices.
 	h.res.Pub = h
@@ -331,6 +341,11 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 		types.CapabilityStatus{Link: types.LinkDown, TS: time.Now().UnixNano()},
 		true,
 	))
+	h.lastStatus[capKey{domain: domain, kind: k, name: name}] =
+		struct {
+			link types.Link
+			err  string
+		}{link: types.LinkDown, err: ""}
 }
 
 // pubStatus publishes a retained status update for a capability.
@@ -340,6 +355,15 @@ func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
 	if err != "" {
 		link = types.LinkDegraded
 	}
+	ck := capKey{domain: domain, kind: kind, name: name}
+	prev := h.lastStatus[ck]
+	if prev.link == link && prev.err == err {
+		return // unchanged → suppress publish
+	}
+	h.lastStatus[ck] = struct {
+		link types.Link
+		err  string
+	}{link: link, err: err}
 	h.conn.Publish(h.conn.NewMessage(
 		capStatus(domain, kind, name),
 		types.CapabilityStatus{Link: link, TS: ts, Error: err},
