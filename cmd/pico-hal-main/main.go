@@ -82,19 +82,6 @@ func printMem() {
 	)
 }
 
-func reqWaitFixed(ctx context.Context, c *bus.Connection, replyT bus.Topic, replySub *bus.Subscription, t bus.Topic, payload any) (*bus.Message, error) {
-	msg := c.NewMessage(t, payload, false)
-	msg.ReplyTo = replyT // avoid TNoIntern + subscribe
-	c.Publish(msg)
-
-	select {
-	case m := <-replySub.Channel():
-		return m, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 func main() {
 	// Allow board to settle (USB, clocks, etc.)
 	time.Sleep(3 * time.Second)
@@ -105,9 +92,6 @@ func main() {
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
-	replyTopic := bus.T("ui", "_rr") // fixed, interned
-	replySub := uiConn.Subscribe(replyTopic)
-
 	println("[main] starting hal.Run …")
 	go hal.Run(ctx, halConn)
 
@@ -117,20 +101,12 @@ func main() {
 	// ---------- PWM topics/subscriptions (onboard) ----------
 	// Using hal/cap/<domain>/<kind>/<name>/...
 	pwmKind := string(types.KindPWM) // ensure types.KindPWM exists
-	tPWMValue := bus.T("hal", "cap", "io", pwmKind, "onboard", "value")
-	tPWMCtrlSet := bus.T("hal", "cap", "io", pwmKind, "onboard", "control", "set")
-	tPWMCtrlRamp := bus.T("hal", "cap", "io", pwmKind, "onboard", "control", "ramp")
-
-	println("[main] subscribing to io/pwm/onboard value …")
-	pwmSub := uiConn.Subscribe(tPWMValue)
+	tPWMCtrlSet := bus.T("hal", "cap", "io", pwmKind, "button-led", "control", "set")
+	tPWMCtrlRamp := bus.T("hal", "cap", "io", pwmKind, "button-led", "control", "ramp")
 
 	// Optional: set an initial level (0)
 	println("[main] setting initial io/pwm/onboard level=0 …")
-	if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: 0}, false)); err != nil {
-		println("[main] pwm set control error:", err.Error())
-	} else {
-		printTopicWith("[main] pwm set control reply on", reply.Topic)
-	}
+	uiConn.Publish(uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: 0}, false))
 
 	// ---------- SHTC3 topics/subscriptions ----------
 	tempKind := string(types.KindTemperature)
@@ -138,39 +114,44 @@ func main() {
 
 	tTempValue := bus.T("hal", "cap", "env", tempKind, "core", "value")
 	tHumidValue := bus.T("hal", "cap", "env", humidKind, "core", "value")
-	tTempCtrlRead := bus.T("hal", "cap", "env", tempKind, "core", "control", "read")
 
 	println("[main] subscribing to env/temperature/core and env/humidity/core values …")
 	tempSub := uiConn.Subscribe(tTempValue)
 	humidSub := uiConn.Subscribe(tHumidValue)
 
-	println("[main] requesting initial read of env/temperature/core …")
-	if reply, err := reqWaitFixed(ctx, uiConn, replyTopic, replySub, tTempCtrlRead, nil); err != nil {
-		println("[main] temp read control request error:", err.Error())
-	} else {
-		printTopicWith("[main] temp read control reply on", reply.Topic)
-	}
-
-	println("[main] entering event loop (ramp PWM every 1s; read SHTC3 every 2s; print received values) …")
-
 	// Tickers (no per-loop allocations)
 	rampTicker := time.NewTicker(2 * time.Second)
 	defer rampTicker.Stop()
-	sensorTicker := time.NewTicker(2 * time.Second)
-	defer sensorTicker.Stop()
 
 	const pwmTop = 4095 // must match pwm_out Top
 	levelUp := true
 
+	// ---------- SHTC3 topics/subscriptions ----------
+	const (
+		domain      = "power"
+		batteryKind = string(types.KindBattery)
+		chargerKind = string(types.KindCharger)
+		name        = "internal"
+	)
+
+	println("[main] subscribing to power/charger/charger0 and env/battery/charger0 values …")
+	valSub := uiConn.Subscribe(bus.T("hal", "cap", "power", "+", name, "value"))
+	stSub := uiConn.Subscribe(bus.T("hal", "cap", "power", "+", name, "status"))
+	evSub := uiConn.Subscribe(bus.T("hal", "cap", "power", "+", name, "event", "+"))
+
+	valCh := valSub.Channel()
+	stCh := stSub.Channel()
+	evCh := evSub.Channel()
+
+	// Track latest currents for ISYS≈IIN−IBAT
+	var lastIIn int32
+	var lastIBat int32
+	var haveIIn, haveIBat bool
+
+	println("[main] entering event loop (ramp PWM every 2s; print SHTC3 and LTC4015 print received values + events) …")
+
 	for {
 		select {
-		case m := <-pwmSub.Channel():
-			if v, ok := m.Payload.(types.PWMValue); ok {
-				print("[value] io/pwm/onboard level=")
-				println(uint16(v.Level))
-			} else {
-				println("[value] io/pwm/onboard (unexpected payload type)")
-			}
 
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
@@ -197,23 +178,153 @@ func main() {
 			levelUp = !levelUp
 
 			payload := types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}
-			if reply, err := uiConn.RequestWait(ctx, uiConn.NewMessage(tPWMCtrlRamp, payload, false)); err != nil {
-				println("[main] pwm ramp control error:", err.Error())
-			} else {
-				printTopicWith("[main] pwm ramp control reply on", reply.Topic)
-			}
+			uiConn.Publish(uiConn.NewMessage(tPWMCtrlRamp, payload, false))
 			runtime.GC()
 			printMem()
 
-		case <-sensorTicker.C:
-			if reply, err := reqWaitFixed(ctx, uiConn, replyTopic, replySub, tTempCtrlRead, nil); err != nil {
-				println("[main] temp read control error:", err.Error())
-			} else {
-				printTopicWith("[main] temp read control reply on", reply.Topic)
+		case m, ok := <-valCh:
+			if !ok {
+				valCh = nil
+				continue
 			}
+			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
+
+		case m, ok := <-stCh:
+			if !ok {
+				stCh = nil
+				continue
+			}
+			printCapStatus(m)
+
+		case m, ok := <-evCh:
+			if !ok {
+				evCh = nil
+				continue
+			}
+			printCapEvent(m)
 
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// ----------- printing helpers -----------
+
+func printCapValue(m *bus.Message, lastIIn *int32, haveIIn *bool, lastIBat *int32, haveIBat *bool) {
+	// hal/cap/<domain>/<kind>/<name>/value
+	dom, _ := m.Topic.At(2).(string)
+	kind, _ := m.Topic.At(3).(string)
+	name, _ := m.Topic.At(4).(string)
+
+	switch v := m.Payload.(type) {
+	case types.BatteryValue:
+		print("[value] ")
+		print(dom)
+		print("/")
+		print(kind)
+		print("/")
+		print(name)
+		print(" | VBAT=")
+		print(int(v.PackMilliV))
+		print("mV per=")
+		print(int(v.PerCellMilliV))
+		print("mV | IBAT=")
+		print(int(v.IBatMilliA))
+		print("mA")
+
+		*lastIBat = v.IBatMilliA
+		*haveIBat = true
+
+		// ISYS ≈ IIN − IBAT (IBAT>0 ⇒ charging)
+		if *haveIIn && *haveIBat {
+			isys := *lastIIn - *lastIBat
+			print(" | ISYS≈")
+			print(int(isys))
+			print("mA")
+		}
+
+		println("")
+
+	case types.ChargerValue:
+		print("[value] ")
+		print(dom)
+		print("/")
+		print(kind)
+		print("/")
+		print(name)
+		print(" | VIN=")
+		print(int(v.VIN_mV))
+		print("mV | VSYS=")
+		print(int(v.VSYS_mV))
+		print("mV | IIN=")
+		print(int(v.IIn_mA))
+		print("mA")
+
+		*lastIIn = v.IIn_mA
+		*haveIIn = true
+
+		if *haveIIn && *haveIBat {
+			isys := *lastIIn - *lastIBat
+			print(" | ISYS≈")
+			print(int(isys))
+			print("mA")
+		}
+
+		println("")
+	default:
+		// ignore others
+	}
+}
+
+func printCapStatus(m *bus.Message) {
+	// hal/cap/<domain>/<kind>/<name>/status
+	dom, _ := m.Topic.At(2).(string)
+	kind, _ := m.Topic.At(3).(string)
+	name, _ := m.Topic.At(4).(string)
+
+	// Battery/charger only
+	if dom != "power" {
+		return
+	}
+	if kind != string(types.KindBattery) && kind != string(types.KindCharger) {
+		return
+	}
+
+	if s, ok := m.Payload.(types.CapabilityStatus); ok {
+		print("[link] ")
+		print(dom)
+		print("/")
+		print(kind)
+		print("/")
+		print(name)
+		print(" | link=")
+		print(string(s.Link))
+		print(" ts=")
+		println(s.TS)
+	}
+}
+
+func printCapEvent(m *bus.Message) {
+	// hal/cap/<domain>/<kind>/<name>/event/<tag>
+	dom, _ := m.Topic.At(2).(string)
+	kind, _ := m.Topic.At(3).(string)
+	name, _ := m.Topic.At(4).(string)
+	tag, _ := m.Topic.At(6).(string)
+
+	if dom != "power" {
+		return
+	}
+	if kind != string(types.KindBattery) && kind != string(types.KindCharger) {
+		return
+	}
+
+	print("[event] ")
+	print(dom)
+	print("/")
+	print(kind)
+	print("/")
+	print(name)
+	print(" | ")
+	println(tag)
 }
