@@ -1,4 +1,4 @@
-//go:build pico && pico_rich_dev
+//go:build pico && pico_bb_proto_1
 
 package setups
 
