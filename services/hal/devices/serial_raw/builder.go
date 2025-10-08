@@ -8,90 +8,105 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/fmtx"
 	"devicecode-go/x/shmring"
 )
+
+// ---- Parameters ----
 
 type Params struct {
 	Bus    string
 	Domain string
 	Name   string
 	Baud   uint32
-	RXSize int // power of two; default 512
-	TXSize int // power of two; default 512
+	RXSize int // power of two; default 512 if zero in SessionOpen
+	TXSize int // power of two; default 512 if zero in SessionOpen
 }
 
+// ---- Device ----
+
 type Device struct {
-	id     string
-	a      core.CapAddr
-	res    core.Resources
-	params Params
+	id  string
+	a   core.CapAddr
+	res core.Resources
 
-	busID string // <- BUS IDENTIFIER TO CLAIM
+	busID string
+	port  core.SerialPort
 
-	port core.SerialPort
 	cfgB core.SerialConfigurator
 	cfgF core.SerialFormatConfigurator
+
+	params Params
 
 	sess  *session
 	snCtr atomic.Uint32
 }
 
 type session struct {
-	id     uint32
-	rxH    shmring.Handle
-	rxR    *shmring.Ring
-	txH    shmring.Handle
-	txR    *shmring.Ring
-	quit   chan struct{}
-	rxDone chan struct{}
-	txDone chan struct{}
+	id uint32
+
+	// Rings (SPSC); handles are exported to clients.
+	rxHandle shmring.Handle
+	rxRing   *shmring.Ring
+	txHandle shmring.Handle
+	txRing   *shmring.Ring
+
+	// Single worker (reactor) for the port.
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
+// ---- Builder registration ----
+
 func Builder() core.Builder { return builder{} }
+
+func init() { core.RegisterBuilder("serial_raw", Builder()) }
 
 type builder struct{}
 
 func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, error) {
-	// Strongly-typed params only.
-	var p Params
-	switch v := in.Params.(type) {
-	case Params:
-		p = v
-	case *Params:
-		if v == nil {
-			return nil, errcode.InvalidParams
-		}
-		p = *v
-	default:
+	p, ok := in.Params.(Params)
+	if !ok {
+		return nil, errcode.InvalidParams
+	}
+	if p.Bus == "" || p.Domain == "" || p.Name == "" {
 		return nil, errcode.InvalidParams
 	}
 
-	if p.Bus == "" {
-		return nil, errcode.InvalidParams
-	}
-	if p.RXSize <= 0 {
-		p.RXSize = 512
-	}
-	if p.TXSize <= 0 {
-		p.TXSize = 512
-	}
-	if (p.RXSize&(p.RXSize-1)) != 0 || (p.TXSize&(p.TXSize-1)) != 0 {
-		return nil, errcode.InvalidParams
+	// Claim the serial bus exclusively.
+	sp, err := in.Res.Reg.ClaimSerial(in.ID, core.ResourceID(p.Bus))
+	if err != nil {
+		return nil, err
 	}
 
-	if p.Domain == "" || p.Name == "" {
-		return nil, errcode.InvalidParams
+	d := &Device{
+		id:    in.ID,
+		a:     core.CapAddr{Domain: p.Domain, Kind: string(types.KindSerial), Name: p.Name},
+		res:   in.Res,
+		busID: p.Bus,
+		port:  sp,
+		params: Params{
+			Bus:    p.Bus,
+			Domain: p.Domain,
+			Name:   p.Name,
+			Baud:   p.Baud,
+			RXSize: p.RXSize,
+			TXSize: p.TXSize,
+		},
 	}
 
-	return &Device{
-		id:     in.ID,
-		a:      core.CapAddr{Domain: p.Domain, Kind: string(types.KindSerial), Name: p.Name},
-		res:    in.Res,
-		params: p,
-		busID:  p.Bus,
-	}, nil
+	// Optional configurators.
+	if c, ok := sp.(core.SerialConfigurator); ok {
+		d.cfgB = c
+	}
+	if f, ok := sp.(core.SerialFormatConfigurator); ok {
+		d.cfgF = f
+	}
+
+	return d, nil
 }
+
+// ---- core.Device ----
 
 func (d *Device) ID() string { return d.id }
 
@@ -106,28 +121,14 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	// Claim configured bus exclusively
-	p, err := d.res.Reg.ClaimSerial(d.id, core.ResourceID(d.busID))
-	if err != nil {
-		return err
-	}
-	d.port = p
-	if c, ok := p.(core.SerialConfigurator); ok {
-		d.cfgB = c
-	}
-	if f, ok := p.(core.SerialFormatConfigurator); ok {
-		d.cfgF = f
-	}
-
+	// Apply initial baud only if explicitly provided.
 	if d.cfgB != nil && d.params.Baud > 0 {
 		_ = d.cfgB.SetBaudRate(d.params.Baud)
 	}
 
-	// Publish initial LinkDown status while we are inactive.
+	// Publish initial degraded status while inactive.
 	d.res.Pub.Emit(core.Event{
-		Addr: core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
-		TS:   time.Now().UnixNano(),
-		Err:  "initialising",
+		Addr: d.a, TS: time.Now().UnixNano(), Err: "initialising",
 	})
 	return nil
 }
@@ -136,72 +137,93 @@ func (d *Device) Close() error {
 	if d.sess != nil {
 		d.stopSession()
 	}
-	// Serial ports are long-lived; provider can manage underlying lifetime.
 	if d.res.Reg != nil {
 		d.res.Reg.ReleaseSerial(d.id, core.ResourceID(d.busID))
 	}
 	return nil
 }
 
-type sessionOpenReq struct {
-	RXSize int
-	TXSize int
-}
-type sessionOpenRep struct {
-	SessionID uint32
-	RXHandle  uint32
-	TXHandle  uint32
-}
-type sessionCloseReq struct {
-	SessionID uint32
-}
+// ---- Controls ----
 
-func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
+func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
 	switch verb {
 	case "session_open":
-		// Strong payload; nil uses defaults.
-		req := sessionOpenReq{RXSize: d.params.RXSize, TXSize: d.params.TXSize}
+		var req types.SerialSessionOpen
 		switch v := payload.(type) {
 		case nil:
-			// keep defaults
+			// default sizes will be applied below
 		case types.SerialSessionOpen:
-			if v.RXSize != 0 {
-				req.RXSize = v.RXSize
-			}
-			if v.TXSize != 0 {
-				req.TXSize = v.TXSize
-			}
-		case *types.SerialSessionOpen:
-			if v != nil {
-				if v.RXSize != 0 {
-					req.RXSize = v.RXSize
-				}
-				if v.TXSize != 0 {
-					req.TXSize = v.TXSize
-				}
-			}
+			req = v
 		default:
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 		}
-		if (req.RXSize&(req.RXSize-1)) != 0 || (req.TXSize&(req.TXSize-1)) != 0 {
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
-		}
+
 		if d.sess != nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Conflict}, nil
 		}
-		d.startSession(req.RXSize, req.TXSize)
-		rep := sessionOpenRep{SessionID: d.sess.id, RXHandle: uint32(d.sess.rxH), TXHandle: uint32(d.sess.txH)}
+
+		rxSize, txSize := req.RXSize, req.TXSize
+		if rxSize == 0 {
+			rxSize = coalescePow2(d.params.RXSize, 512)
+		}
+		if txSize == 0 {
+			txSize = coalescePow2(d.params.TXSize, 512)
+		}
+		if !isPow2(rxSize) || !isPow2(txSize) || rxSize < 2 || txSize < 2 {
+			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
+		}
+
+		d.startSession(rxSize, txSize)
+
+		// --- Device-level hygiene: drain spurious RX before signalling link up ---
+		// Discard any pre-existing or immediately-arriving bytes on the UART RX path.
+		// Uses a short quiet window so this remains bounded and non-blocking.
+		{
+			const quiet = 5 * time.Millisecond     // time with no bytes before we stop
+			const maxTotal = 15 * time.Millisecond // absolute cap as a safeguard
+
+			tmp := make([]byte, 64)
+			tStart := time.Now()
+			tQuiet := time.Now().Add(quiet)
+
+			for {
+				// Non-blocking attempt to pull any pending bytes.
+				if n := d.port.TryRead(tmp); n > 0 {
+					// Extend the quiet window after activity.
+					tQuiet = time.Now().Add(quiet)
+				} else {
+					// No bytes right now. If we have been quiet long enough, or we have
+					// reached the absolute bound, stop draining.
+					now := time.Now()
+					if now.After(tQuiet) || now.Sub(tStart) >= maxTotal {
+						break
+					}
+					// Wait for either a UART RX edge or a very short back-off, then re-check.
+					select {
+					case <-d.port.Readable():
+					case <-time.After(time.Millisecond):
+					}
+				}
+			}
+		}
+		// --- end hygiene ---
+
+		rep := types.SerialSessionOpened{
+			SessionID: d.sess.id,
+			RXHandle:  uint32(d.sess.rxHandle),
+			TXHandle:  uint32(d.sess.txHandle),
+		}
+		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr:     core.CapAddr{Domain: d.a.Domain, Kind: string(types.KindSerial), Name: d.a.Name},
-			Payload:  rep,
-			TS:       time.Now().UnixNano(),
-			IsEvent:  true,
-			EventTag: "session_opened",
+			Addr: d.a, Payload: rep, TS: now, IsEvent: true, EventTag: "session_opened",
 		})
+		d.res.Pub.Emit(core.Event{
+			Addr: d.a, TS: now, IsEvent: true, EventTag: "link_up",
+		})
+
 		return core.EnqueueResult{OK: true}, nil
 
 	case "session_close":
-		// Accept nil or explicit empty struct.
 		switch payload.(type) {
 		case nil, types.SerialSessionClose, *types.SerialSessionClose:
 			// ok
@@ -212,13 +234,12 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 			return core.EnqueueResult{OK: true}, nil
 		}
 		d.stopSession()
+		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: time.Now().UnixNano(),
-			IsEvent: true, EventTag: "session_closed",
+			Addr: d.a, TS: now, IsEvent: true, EventTag: "session_closed",
 		})
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: time.Now().UnixNano(),
-			Err: "session_closed",
+			Addr: d.a, TS: now, Err: "session_closed",
 		})
 		return core.EnqueueResult{OK: true}, nil
 
@@ -226,22 +247,22 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		if d.cfgB == nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
+		var req types.SerialSetBaud
 		switch v := payload.(type) {
 		case types.SerialSetBaud:
-			_ = d.cfgB.SetBaudRate(v.Baud)
-			return core.EnqueueResult{OK: true}, nil
+			req = v
 		case *types.SerialSetBaud:
 			if v == nil {
 				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 			}
-			_ = d.cfgB.SetBaudRate(v.Baud)
-			return core.EnqueueResult{OK: true}, nil
+			req = *v
 		default:
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
 		}
+		_ = d.cfgB.SetBaudRate(req.Baud)
+		return core.EnqueueResult{OK: true}, nil
 
 	case "set_format":
-		// payload: {databits:uint8, stopbits:uint8, parity:"none"|"even"|"odd"}
 		if d.cfgF == nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
@@ -260,17 +281,14 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 		if req.DataBits == 0 || req.StopBits == 0 {
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
 		}
-		var par string
+		par := "none"
 		switch req.Parity {
 		case types.ParityEven:
 			par = "even"
 		case types.ParityOdd:
 			par = "odd"
-		default:
-			par = "none"
 		}
 		if err := d.cfgF.SetFormat(req.DataBits, req.StopBits, par); err != nil {
-
 			return core.EnqueueResult{OK: false, Error: errcode.MapDriverErr(err)}, nil
 		}
 		return core.EnqueueResult{OK: true}, nil
@@ -280,27 +298,26 @@ func (d *Device) Control(cap core.CapAddr, verb string, payload any) (core.Enque
 	}
 }
 
+// ---- Session lifecycle ----
+
 func (d *Device) startSession(rxSize, txSize int) {
-	rxh, rxr := shmring.New(rxSize)
-	txh, txr := shmring.New(txSize)
+	rxh, rxr := shmring.NewRegistered(rxSize)
+	txh, txr := shmring.NewRegistered(txSize)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &session{
-		id:     d.snCtr.Add(1),
-		rxH:    rxh,
-		rxR:    rxr,
-		txH:    txh,
-		txR:    txr,
-		quit:   make(chan struct{}),
-		rxDone: make(chan struct{}),
-		txDone: make(chan struct{}),
+		id:       d.snCtr.Add(1),
+		rxHandle: rxh,
+		rxRing:   rxr,
+		txHandle: txh,
+		txRing:   txr,
+		ctx:      ctx,
+		cancel:   cancel,
+		done:     make(chan struct{}),
 	}
 	d.sess = s
-	go d.rxLoop(s)
-	go d.txLoop(s)
-	// LinkUp now that session is ready
-	d.res.Pub.Emit(core.Event{
-		Addr: d.a, TS: time.Now().UnixNano(),
-		IsEvent: true, EventTag: "link_up",
-	})
+
+	go d.reactor(s)
 }
 
 func (d *Device) stopSession() {
@@ -308,76 +325,104 @@ func (d *Device) stopSession() {
 	if s == nil {
 		return
 	}
-	close(s.quit)
-	<-s.rxDone
-	<-s.txDone
-	shmring.Close(s.rxH)
-	shmring.Close(s.txH)
+	s.cancel()
+	<-s.done
+
+	// Drop registry mappings (rings remain usable by any lingering client only
+	// if it retained the pointer, which it should not; we treat handles as the contract).
+	shmring.Close(s.rxHandle)
+	shmring.Close(s.txHandle)
+
 	d.sess = nil
 }
 
-func (d *Device) rxLoop(s *session) {
-	defer close(s.rxDone)
-	tmp := make([]byte, 256)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// ---- Reactor (single goroutine) ----
 
-	// cancellation goroutine
-	go func() {
-		<-s.quit
-		cancel()
-	}()
+func (d *Device) reactor(s *session) {
+	defer close(s.done)
+
+	u := d.port
+	rxR := s.rxRing // UART -> app
+	txR := s.txRing // app  -> UART
 
 	for {
-		n, err := d.port.RecvSomeContext(ctx, tmp)
-		if n > 0 {
-			w := s.rxR.WriteFrom(tmp[:n])
-			if w < n {
-				fmtx.Printf("[serial %s] rx overflow: lost=%d\n", d.id, n-w)
-			}
-		}
-		if err != nil {
-			// Return on context cancellation; otherwise brief back-off.
-			if ctx.Err() != nil {
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		// Early-exit if quit is closed and no blocking read is pending.
-		select {
-		case <-s.quit:
-			return
-		default:
-		}
-	}
-}
+		made := false
 
-func (d *Device) txLoop(s *session) {
-	defer close(s.txDone)
-	tmp := make([]byte, 256)
-	for {
-		// Block until there is data or quit
-		if s.txR.Available() == 0 {
-			select {
-			case <-s.txR.Readable():
-			case <-s.quit:
-				return
-			}
-		}
-		// Drain available data.
+		// UART RX -> rxRing (use spans; fill p1 completely before p2)
 		for {
-			n := s.txR.ReadInto(tmp)
-			if n == 0 {
+			p1, p2 := rxR.WriteAcquire()
+			if len(p1) == 0 {
 				break
 			}
-			_, _ = d.port.Write(tmp[:n]) // blocking write
+			n1 := u.TryRead(p1)
+			if n1 == 0 {
+				break
+			}
+			if n1 < len(p1) {
+				rxR.WriteCommit(n1)
+				made = true
+				continue
+			}
+			n2 := 0
+			if len(p2) > 0 {
+				n2 = u.TryRead(p2)
+			}
+			rxR.WriteCommit(n1 + n2)
+			made = true
 		}
+
+		// txRing -> UART TX (use spans; drain p1 completely before p2)
+		for {
+			p1, p2 := txR.ReadAcquire()
+			if len(p1) == 0 {
+				break
+			}
+			n1 := u.TryWrite(p1)
+			if n1 == 0 {
+				break
+			}
+			if n1 < len(p1) {
+				txR.ReadRelease(n1)
+				made = true
+				continue
+			}
+			n2 := 0
+			if len(p2) > 0 {
+				n2 = u.TryWrite(p2)
+			}
+			txR.ReadRelease(n1 + n2)
+			made = true
+		}
+
+		if made {
+			continue
+		}
+
+		// Idle: wait for any edge, then re-check.
 		select {
-		case <-s.quit:
+		case <-s.ctx.Done():
 			return
-		default:
+		case <-u.Readable():
+		case <-u.Writable():
+		case <-rxR.Writable():
+		case <-txR.Readable():
 		}
 	}
 }
 
-func init() { core.RegisterBuilder("serial_raw", Builder()) }
+// ---- Helpers ----
+
+func isPow2(n int) bool { return n > 0 && (n&(n-1)) == 0 }
+
+func coalescePow2(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	if !isPow2(v) {
+		return d
+	}
+	if v < 2 {
+		return 2
+	}
+	return v
+}

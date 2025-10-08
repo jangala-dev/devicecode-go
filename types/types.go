@@ -116,18 +116,21 @@ type ErrorReply struct {
 // ---- Serial capability (control + discovery) ----
 
 // SerialParity is a small enum to avoid string parsing on device side.
-type SerialParity uint8
+type Parity uint8
 
 const (
-	ParityNone SerialParity = iota
+	ParityNone Parity = iota
 	ParityEven
 	ParityOdd
 )
 
 // Control payloads
+// Emitted on session_open success as a *tagged* event payload.
+// Keep handles as plain uint32 so the schema is decoupled from shmring internals.
 type SerialSessionOpen struct {
-	RXSize int // power of two; 0 => device default
-	TXSize int // power of two; 0 => device default
+	// Power-of-two sizes (bytes). Device will default if zero.
+	RXSize int `json:"rx_size,omitempty"`
+	TXSize int `json:"tx_size,omitempty"`
 }
 
 type SerialSessionClose struct{}
@@ -137,9 +140,15 @@ type SerialSetBaud struct {
 }
 
 type SerialSetFormat struct {
-	DataBits uint8
-	StopBits uint8
-	Parity   SerialParity
+	DataBits uint8  `json:"data_bits"`
+	StopBits uint8  `json:"stop_bits"`
+	Parity   Parity `json:"parity"`
+}
+
+type SerialSessionOpened struct {
+	SessionID uint32 `json:"session_id"`
+	RXHandle  uint32 `json:"rx_handle"`
+	TXHandle  uint32 `json:"tx_handle"`
 }
 
 // Discovery payload for Info.Detail

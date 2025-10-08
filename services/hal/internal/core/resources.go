@@ -1,7 +1,6 @@
 package core
 
 import (
-	"context"
 	"time"
 
 	"tinygo.org/x/drivers"
@@ -101,25 +100,30 @@ type PinHandle interface {
 }
 
 // ---- Transactional buses (I²C) ----
-// Option B: the provider returns a drivers.I2C view that serialises access
-// via a per-bus worker. No job types or owner APIs are exposed here.
 
 // ---- Stream buses (shape reserved; provider can fill in) ----
 
 // ---- Serial (UART et al.) ----
 // Minimal, provider-agnostic serial data plane.
 type SerialPort interface {
-	// Blocking write of p.
-	Write(p []byte) (int, error)
-	// Blocking read of up to len(p); returns when at least one byte is available or ctx completes.
-	RecvSomeContext(ctx context.Context, p []byte) (int, error)
+	// Non-blocking attempts (return 0 if nothing/nowhere).
+	TryRead(p []byte) int
+	TryWrite(p []byte) int
+
+	// Coalesced readiness notifications (must re-check after wake).
+	Readable() <-chan struct{}
+	Writable() <-chan struct{}
+
+	// Optional but useful for on-the-wire completion.
+	Flush() error
 }
 
-// Optional configurator; providers may implement one or both.
 type SerialConfigurator interface {
 	SetBaudRate(br uint32) error
 }
+
 type SerialFormatConfigurator interface {
+	// parity: "none" | "even" | "odd"
 	SetFormat(databits, stopbits uint8, parity string) error
 }
 

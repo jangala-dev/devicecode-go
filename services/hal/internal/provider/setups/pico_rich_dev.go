@@ -18,7 +18,8 @@ var SelectedPlan = ResourcePlan{
 	},
 	UART: []UARTPlan{
 		// RP2040 default pins for Pico
-		{ID: "uart0", TX: 0, RX: 1, Baud: 115200},
+		{ID: "uart0", TX: 0, RX: 1, Baud: 115_200},
+		{ID: "uart1", TX: 4, RX: 5, Baud: 115_200},
 	},
 }
 
@@ -41,15 +42,25 @@ var SelectedSetup = types.HALConfig{
 			Bus:    "uart0",
 			Domain: "io",
 			Name:   "uart0",
-			Baud:   115200,
+			Baud:   115_200,
+			RXSize: 512,
+			TXSize: 512,
+		}},
+
+		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
+		{ID: "uart1_raw", Type: "serial_raw", Params: serialraw.Params{
+			Bus:    "uart1",
+			Domain: "io",
+			Name:   "uart1",
+			Baud:   115_200,
 			RXSize: 512,
 			TXSize: 512,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
-			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3330, RSNSI_uOhm: 1670, Cells: 6,
-			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9000, VinHi_mV: 11000,
-			BSRHi_uOhmPerCell: 100000,
+			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3_330, RSNSI_uOhm: 1_670, Cells: 6,
+			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9_000, VinHi_mV: 11_000,
+			BSRHi_uOhmPerCell: 100_000,
 			DomainBattery:     "power", DomainCharger: "power", Name: "internal",
 		}},
 
@@ -84,7 +95,7 @@ var SelectedSetup = types.HALConfig{
 	Pollers: []types.PollSpec{
 		// Read the SHTC3 sensor periodically. Due to device-level dedup in HAL,
 		// polling temperature suffices (humidity is emitted by the same read).
-		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 2000, JitterMs: 100},
-		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 2000, JitterMs: 100},
+		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 2_000, JitterMs: 100},
+		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 2_000, JitterMs: 100},
 	},
 }

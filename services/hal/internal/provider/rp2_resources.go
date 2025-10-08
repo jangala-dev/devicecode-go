@@ -3,7 +3,6 @@
 package provider
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -697,13 +696,15 @@ func (r *rp2Registry) Close() {
 	r.edge.stop()
 }
 
-// ---- rp2SerialPort: adapts uartx to core.SerialPort (+optional configurators) ----
+// rp2SerialPort adapts uartx.UART to serialPortX.
 type rp2SerialPort struct{ u *uartx.UART }
 
-func (p *rp2SerialPort) Write(b []byte) (int, error) { return p.u.Write(b) }
-func (p *rp2SerialPort) RecvSomeContext(ctx context.Context, buf []byte) (int, error) {
-	return p.u.RecvSomeContext(ctx, buf)
-}
+func (p *rp2SerialPort) Readable() <-chan struct{} { return p.u.Readable() }
+func (p *rp2SerialPort) Writable() <-chan struct{} { return p.u.Writable() }
+func (p *rp2SerialPort) TryRead(b []byte) int      { return p.u.TryRead(b) }
+func (p *rp2SerialPort) TryWrite(b []byte) int     { return p.u.TryWrite(b) }
+func (p *rp2SerialPort) Flush() error              { return p.u.Flush() }
+
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
 
 // Parity strings: "none","even","odd"
