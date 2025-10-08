@@ -71,6 +71,23 @@ func printHundredths(label string, hx100 int) {
 	println()
 }
 
+// appendHundredths appends a textual representation of a hundredths fixed-point
+// value to dst (e.g., 5724 -> "57.24"). Returns the extended dst.
+func appendHundredths(dst []byte, hx100 int) []byte {
+	if hx100 < 0 {
+		hx100 = 0
+	}
+	whole := hx100 / 100
+	frac := hx100 % 100
+	dst = append(dst, itoa(whole)...)
+	dst = append(dst, '.')
+	if frac < 10 {
+		dst = append(dst, '0')
+	}
+	dst = append(dst, itoa(frac)...)
+	return dst
+}
+
 // ---- TinyGo runtime memory snapshot ----
 func printMem() {
 	var ms runtime.MemStats
@@ -184,6 +201,32 @@ func teleJSON(tdeci int, vbat, vin int32, isys int32) []byte {
 	return buf
 }
 
+// ---- thresholds & timing (VIN/VBAT/TEMP) ----
+
+// Thermal (deci-°C)
+const (
+	TEMP_LIMIT = 780 // 78.0 °C => force rails OFF
+	TEMP_HYST  = 60  // allow ON again at 72.0 °C
+)
+
+// Power thresholds (mV)
+const (
+	// VIN (12 V adapter)
+	PG_ON_VIN = 12000 // debounced ON threshold
+	SAG_VIN   = 10600 // brownout immediate cut
+
+	// VBAT (12 V SLA)
+	PG_ON_VBAT  = 12400 // debounced ON threshold
+	PG_OFF_HYST = 800   // OFF ≈ 11.6 V via hysteresis (12400-800)
+	SAG_VBAT    = 11400 // brownout immediate cut
+)
+
+// Debounce and data freshness
+const (
+	DEBOUNCE_OK = 400 * time.Millisecond
+	STALE_MAX   = 3 * time.Second
+)
+
 func main() {
 	// Allow board to settle (USB, clocks, etc.)
 	time.Sleep(3 * time.Second)
@@ -229,27 +272,7 @@ func main() {
 	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
-	// Switch sequencing helpers
-	seqDown := func() {
-		for i := len(powerOrderUp) - 1; i >= 0; i-- {
-			uiConn.Publish(uiConn.NewMessage(tSwitch(powerOrderUp[i]), types.SwitchSet{On: false}, false))
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
-	seqUp := func() {
-		for _, name := range powerOrderUp {
-			uiConn.Publish(uiConn.NewMessage(tSwitch(name), types.SwitchSet{On: true}, false))
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
-
 	// State (PG + env + power + UART rings)
-	const (
-		pgOnVIN  = 12000 // mV
-		pgOnVBAT = 12400 // mV
-		debounce = 300 * time.Millisecond
-		staleMax = 3 * time.Second
-	)
 	var (
 		// UART TX rings
 		uart0Tx *shmring.Ring // telemetry
@@ -266,24 +289,29 @@ func main() {
 		tsVBAT   int64
 		lastIIn  int32
 		lastIBat int32
+		tsIIn    int64
+		tsIBat   int64
 		haveIIn  bool
 		haveIBat bool
 
-		pgSince  time.Time
-		pgStable bool
-		railsUp  bool
+		// rails & PG tracking
+		pgSince   time.Time
+		pgStable  bool
+		railsUp   bool
+		vbatGood  bool // hysteresis latch for VBAT path
+		ledSteady bool // steady when railsUp
 
-		// LED behavior control
-		ledSteady bool // true when we have applied steady-on for railsUp
+		// thermal latch
+		otActive bool
 	)
 
-	// Single ticker does: LED control, mem stats, PG check, telemetry flush
+	// Single ticker does: LED control, mem stats, PG/TEMP check, telemetry flush
 	rampTicker := time.NewTicker(2 * time.Second)
 	defer rampTicker.Stop()
 	const pwmTop = 4095
 	levelUp := true // for breathe mode only (railsDown)
 
-	logln_([]byte("[main] entering loop (LED/mem/PG on one tick; env/power prints; UART0 telemetry; UART1 logs) …"))
+	logln_([]byte("[main] entering loop (LED/mem/PG/TEMP on one tick; env/power prints; UART0 telemetry; UART1 logs) …"))
 
 	for {
 		select {
@@ -301,9 +329,13 @@ func main() {
 		case <-subSessClosedTele.Channel():
 			uart0Tx = nil
 			logln_([]byte("[uart0] telemetry session closed"))
+			// Auto-reopen
+			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 		case <-subSessClosedLog.Channel():
 			uart1Tx = nil
 			logln_([]byte("[uart1] log session closed"))
+			// Auto-reopen
+			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():
@@ -318,17 +350,13 @@ func main() {
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				printHundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-				// mirror short log to uart1
-				ringWriteLine(uart1Tx, []byte("[value] hum %RH="+strconvx.Itoa(int(v.RHx100/100))+"."+func() string {
-					x := int(v.RHx100 % 100)
-					if x < 10 {
-						return "0" + strconvx.Itoa(x)
-					}
-					return strconvx.Itoa(x)
-				}()))
+				// mirror short log to uart1 (without closure)
+				buf := []byte("[value] hum %RH=")
+				buf = appendHundredths(buf, int(v.RHx100))
+				ringWriteLine(uart1Tx, buf)
 			}
 
-		// ---- LED + mem + PG + telemetry (one ticker) ----
+		// ---- LED + mem + PG/TEMP + telemetry (one ticker) ----
 		case <-rampTicker.C:
 			// LED behavior tied to railsUp:
 			// - railsUp => steady ON (send Set once when it flips up)
@@ -339,7 +367,6 @@ func main() {
 					ledSteady = true
 				}
 			} else {
-				// ensure we re-enter breathe when rails drop
 				ledSteady = false
 				var target uint16
 				if levelUp {
@@ -355,37 +382,83 @@ func main() {
 			runtime.GC()
 			printMem()
 
-			// PG check (VIN or VBAT path). Debounce right here.
+			// Freshness
 			now := time.Now()
-			freshVIN := tsVIN != 0 && now.Sub(time.Unix(0, tsVIN)) <= staleMax
-			freshBAT := tsVBAT != 0 && now.Sub(time.Unix(0, tsVBAT)) <= staleMax
-			pgNow := (freshVIN && lastVIN >= pgOnVIN) || (freshBAT && lastVBAT >= pgOnVBAT)
+			freshVIN := tsVIN != 0 && now.Sub(time.Unix(0, tsVIN)) <= STALE_MAX
+			freshBAT := tsVBAT != 0 && now.Sub(time.Unix(0, tsVBAT)) <= STALE_MAX
+			freshTMP := tsTemp != 0 && now.Sub(time.Unix(0, tsTemp)) <= STALE_MAX
+			freshIIN := tsIIn != 0 && now.Sub(time.Unix(0, tsIIn)) <= STALE_MAX
+			freshIBAT := tsIBat != 0 && now.Sub(time.Unix(0, tsIBat)) <= STALE_MAX
 
-			if pgNow {
+			// ---- Thermal latch with hysteresis ----
+			if freshTMP {
+				if lastTDeci >= TEMP_LIMIT {
+					if !otActive {
+						otActive = true
+						logln_([]byte("[thermal] over-temp → rails DOWN"))
+						if railsUp {
+							seqDown(uiConn)
+							railsUp = false
+						}
+					}
+				} else if lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
+					if otActive {
+						logln_([]byte("[thermal] temp recovered below hysteresis"))
+					}
+					otActive = false
+				}
+			}
+
+			// ---- VBAT hysteresis latch for PG ----
+			if freshBAT {
+				if !vbatGood && lastVBAT >= PG_ON_VBAT {
+					vbatGood = true
+				} else if vbatGood && lastVBAT < (PG_ON_VBAT-PG_OFF_HYST) {
+					vbatGood = false
+				}
+			} else {
+				// If VBAT is stale, don't claim it as good.
+				vbatGood = false
+			}
+
+			// ---- Brownout immediate cut (only if rails are up) ----
+			// We consider supply OK if EITHER source is above its sag threshold.
+			if railsUp {
+				supplyOK := (freshVIN && lastVIN >= SAG_VIN) || (freshBAT && lastVBAT >= SAG_VBAT)
+				// Guard: if both sources are stale, don't cut purely on staleness.
+				bothStale := !freshVIN && !freshBAT
+				if !supplyOK && !bothStale {
+					logln_([]byte("[power] brownout (no source above SAG) → rails DOWN"))
+					seqDown(uiConn)
+					railsUp = false
+					pgStable = false
+					pgSince = time.Time{}
+				}
+			}
+
+			// ---- Power-good decision (debounced) ----
+			// PG candidate is true if EITHER VIN is above PG_ON_VIN OR VBAT latch is good.
+			pgNow := (freshVIN && lastVIN >= PG_ON_VIN) || vbatGood
+
+			if !otActive && pgNow {
 				if pgSince.IsZero() {
 					pgSince = now
-				} else if !pgStable && now.Sub(pgSince) >= debounce {
+				} else if !pgStable && now.Sub(pgSince) >= DEBOUNCE_OK {
 					pgStable = true
 					if !railsUp {
 						logln_([]byte("[power] PG debounced → rails UP"))
-						seqUp()
+						seqUp(uiConn)
 						railsUp = true
-						// LED will switch to steady on next tick (handled above)
 					}
 				}
 			} else {
 				pgStable = false
 				pgSince = time.Time{}
-				if railsUp {
-					logln_([]byte("[power] PG lost → rails DOWN"))
-					seqDown()
-					railsUp = false
-					// LED will resume breathing next tick (handled above)
-				}
+				// We don't force rails down here; brownout block above handles cuts.
 			}
 
-			// Telemetry over UART0 (flat JSON). Use freshest we have; ISYS≈IIN−IBAT when both known.
-			if uart0Tx != nil && tsTemp != 0 {
+			// Telemetry over UART0 (flat JSON). Use freshest we have; ISYS≈IIN−IBAT when both fresh.
+			if uart0Tx != nil && freshTMP {
 				vin := int32(0)
 				vbat := int32(0)
 				if freshVIN {
@@ -395,7 +468,7 @@ func main() {
 					vbat = lastVBAT
 				}
 				isys := int32(0)
-				if haveIIn && haveIBat {
+				if freshIIN && freshIBAT {
 					isys = lastIIn - lastIBat
 				}
 				line := teleJSON(lastTDeci, vbat, vin, isys)
@@ -408,9 +481,15 @@ func main() {
 			case types.BatteryValue:
 				lastVBAT = v.PackMilliV
 				tsVBAT = time.Now().UnixNano()
+				lastIBat = v.IBatMilliA
+				tsIBat = tsVBAT
+				haveIBat = true
 			case types.ChargerValue:
 				lastVIN = v.VIN_mV
 				tsVIN = time.Now().UnixNano()
+				lastIIn = v.IIn_mA
+				tsIIn = tsVIN
+				haveIIn = true
 			}
 			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
 			// mirror the one-line value summary to uart1 (compact, best-effort)
@@ -425,6 +504,21 @@ func main() {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// ----------- power rail sequencing (no closures) -----------
+
+func seqDown(uiConn *bus.Connection) {
+	for i := len(powerOrderUp) - 1; i >= 0; i-- {
+		uiConn.Publish(uiConn.NewMessage(tSwitch(powerOrderUp[i]), types.SwitchSet{On: false}, false))
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+func seqUp(uiConn *bus.Connection) {
+	for _, name := range powerOrderUp {
+		uiConn.Publish(uiConn.NewMessage(tSwitch(name), types.SwitchSet{On: true}, false))
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
