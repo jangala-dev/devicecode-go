@@ -43,8 +43,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart0",
 			Baud:   115_200,
-			RXSize: 512,
-			TXSize: 512,
+			RXSize: 128,
+			TXSize: 128,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -53,8 +53,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 512,
-			TXSize: 512,
+			RXSize: 128,
+			TXSize: 128,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
@@ -95,7 +95,7 @@ var SelectedSetup = types.HALConfig{
 	Pollers: []types.PollSpec{
 		// Read the SHTC3 sensor periodically. Due to device-level dedup in HAL,
 		// polling temperature suffices (humidity is emitted by the same read).
-		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 2_000, JitterMs: 100},
-		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 2_000, JitterMs: 100},
+		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
+		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
 	},
 }

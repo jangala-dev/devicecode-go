@@ -11,17 +11,6 @@ import (
 	"devicecode-go/types"
 )
 
-var SelectedPlan = ResourcePlan{
-	I2C: []I2CPlan{
-		{ID: "i2c0", SDA: 12, SCL: 13, Hz: 400_000},
-		{ID: "i2c1", SDA: 18, SCL: 19, Hz: 400_000},
-	},
-	UART: []UARTPlan{
-		// RP2040 default pins for Pico
-		{ID: "uart0", TX: 0, RX: 1, Baud: 115200},
-	},
-}
-
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 		// On-board LED (name => public address hal/cap/io/led/onboard/…)
@@ -41,15 +30,25 @@ var SelectedSetup = types.HALConfig{
 			Bus:    "uart0",
 			Domain: "io",
 			Name:   "uart0",
-			Baud:   115200,
-			RXSize: 512,
-			TXSize: 512,
+			Baud:   115_200,
+			RXSize: 128,
+			TXSize: 128,
+		}},
+
+		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
+		{ID: "uart1_raw", Type: "serial_raw", Params: serialraw.Params{
+			Bus:    "uart1",
+			Domain: "io",
+			Name:   "uart1",
+			Baud:   115_200,
+			RXSize: 128,
+			TXSize: 128,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
-			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3330, RSNSI_uOhm: 1670, Cells: 6,
-			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9000, VinHi_mV: 11000,
-			BSRHi_uOhmPerCell: 100000,
+			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3_330, RSNSI_uOhm: 1_670, Cells: 6,
+			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9_000, VinHi_mV: 11_000,
+			BSRHi_uOhmPerCell: 100_000,
 			DomainBattery:     "power", DomainCharger: "power", Name: "internal",
 		}},
 
@@ -84,7 +83,7 @@ var SelectedSetup = types.HALConfig{
 	Pollers: []types.PollSpec{
 		// Read the AHT20 sensor periodically. Due to device-level dedup in HAL,
 		// polling temperature suffices (humidity is emitted by the same read).
-		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 2000, JitterMs: 100},
-		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 2000, JitterMs: 100},
+		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
+		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
 	},
 }
