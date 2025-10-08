@@ -15,11 +15,13 @@ var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 		// On-board LED (name => public address hal/cap/io/led/onboard/…)
 		{ID: "button_led", Type: "pwm_out", Params: pwm_out.Params{
-			Pin:    11,
-			FreqHz: 1000,
-			Top:    4095,
-			Domain: "io",
-			Name:   "button-led",
+			Pin:       11,
+			FreqHz:    1000,
+			Top:       4095,
+			ActiveLow: true,
+			Initial:   4095,
+			Domain:    "io",
+			Name:      "button-led",
 		}},
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)

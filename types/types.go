@@ -80,11 +80,13 @@ const ()
 
 // PWMInfo is published under hal/cap/.../info as Info.Detail.
 type PWMInfo struct {
-	Pin     int    `json:"pin"`
-	Slice   int    `json:"slice,omitempty"`   // optional: provider may fill if known
-	Channel string `json:"channel,omitempty"` // "A" or "B", optional
-	FreqHz  uint64 `json:"freqHz,omitempty"`  // optional: device/provider may fill
-	Top     uint16 `json:"top,omitempty"`     // optional: device/provider may fill
+	Pin       int    `json:"pin"`
+	Slice     int    `json:"slice,omitempty"`   // optional: provider may fill if known
+	Channel   string `json:"channel,omitempty"` // "A" or "B", optional
+	FreqHz    uint64 `json:"freqHz,omitempty"`  // optional: device/provider may fill
+	Top       uint16 `json:"top,omitempty"`     // optional: device/provider may fill
+	ActiveLow bool
+	Initial   uint16
 }
 
 // PWMValue is published under hal/cap/.../value (retained).

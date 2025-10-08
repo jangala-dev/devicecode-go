@@ -1,4 +1,3 @@
-// services/hal/devices/pwm_out/builder.go
 package pwm_out
 
 import (
@@ -11,11 +10,13 @@ import (
 func init() { core.RegisterBuilder("pwm_out", builder{}) }
 
 type Params struct {
-	Pin    int
-	FreqHz uint64 // desired frequency
-	Top    uint16 // wrap value
-	Domain string
-	Name   string
+	Pin       int
+	FreqHz    uint64 // desired frequency
+	Top       uint16 // wrap value (max logical level)
+	Domain    string
+	Name      string
+	ActiveLow bool
+	Initial   uint16 // initial *logical* level
 }
 
 type builder struct{}
@@ -33,16 +34,19 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		return nil, err
 	}
 	pwm := ph.AsPWM()
+
 	dev := &Device{
-		id:   in.ID,
-		pin:  p.Pin,
-		pwm:  pwm,
-		pub:  in.Res.Pub,
-		reg:  in.Res.Reg,
-		dom:  p.Domain,
-		name: p.Name,
-		freq: p.FreqHz,
-		top:  p.Top,
+		id:        in.ID,
+		pin:       p.Pin,
+		pwm:       pwm,
+		pub:       in.Res.Pub,
+		reg:       in.Res.Reg,
+		dom:       p.Domain,
+		name:      p.Name,
+		freq:      p.FreqHz,
+		top:       p.Top,
+		activeLow: p.ActiveLow,
+		initial:   p.Initial,
 	}
 	return dev, nil
 }
