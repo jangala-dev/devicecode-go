@@ -11,6 +11,18 @@ import (
 	"devicecode-go/types"
 )
 
+var SelectedPlan = ResourcePlan{
+	I2C: []I2CPlan{
+		{ID: "i2c0", SDA: 12, SCL: 13, Hz: 400_000},
+		{ID: "i2c1", SDA: 18, SCL: 19, Hz: 400_000},
+	},
+	UART: []UARTPlan{
+		// RP2040 default pins for Pico
+		{ID: "uart0", TX: 0, RX: 1, Baud: 115_200},
+		{ID: "uart1", TX: 4, RX: 5, Baud: 115_200},
+	},
+}
+
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 		// On-board LED (name => public address hal/cap/io/led/onboard/…)
