@@ -8,7 +8,6 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/mathx"
 
 	"tinygo.org/x/drivers"
 	"tinygo.org/x/drivers/shtc3"
@@ -135,9 +134,21 @@ func (d *Device) readOnce() {
 		return
 	}
 
-	// Convert: tmc is milli-°C; publish deci-°C. Clamp ranges.
-	decic := mathx.Clamp(tmc/100, -32768, 32767)
-	rhx100 = mathx.Clamp(rhx100, 0, 10000)
+	// Convert to deci-°C and %RH×100
+	decic := int32(tmc / 100) // milli-°C → deci-°C
+	rh := int32(rhx100)       // already ×100
+
+	const (
+		tMin = -375 // −37.5 °C
+		tMax = 1175 // 117.5 °C
+		hMin = 0
+		hMax = 10000
+	)
+
+	if decic < tMin || decic > tMax || rh < hMin || rh > hMax {
+		d.emitErr("invalid_sample", t0)
+		return
+	}
 
 	ts := time.Now().UnixNano()
 	d.pub.Emit(core.Event{
@@ -147,7 +158,7 @@ func (d *Device) readOnce() {
 	})
 	d.pub.Emit(core.Event{
 		Addr:    d.addrHum,
-		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
+		Payload: types.HumidityValue{RHx100: uint16(rh)},
 		TS:      ts,
 	})
 }
