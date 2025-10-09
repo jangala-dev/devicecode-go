@@ -254,7 +254,7 @@ const (
 
 func main() {
 	// Allow board to settle (USB, clocks, etc.)
-	time.Sleep(3 * time.Second)
+	// time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
@@ -400,7 +400,7 @@ func main() {
 			runtime.GC()
 			printMem()
 
-			// Freshness
+			// ---- Freshness
 			now := time.Now()
 			freshVIN := tsVIN != 0 && now.Sub(time.Unix(0, tsVIN)) <= STALE_MAX
 			freshBAT := tsVBAT != 0 && now.Sub(time.Unix(0, tsVBAT)) <= STALE_MAX
@@ -408,7 +408,7 @@ func main() {
 			freshIIN := tsIIn != 0 && now.Sub(time.Unix(0, tsIIn)) <= STALE_MAX
 			freshIBAT := tsIBat != 0 && now.Sub(time.Unix(0, tsIBat)) <= STALE_MAX
 
-			// ---- Thermal latch with hysteresis ----
+			// ---- Temperature: over-limit latch (as before)
 			if freshTMP {
 				if lastTDeci >= TEMP_LIMIT {
 					if !otActive {
@@ -427,7 +427,16 @@ func main() {
 				}
 			}
 
-			// ---- VBAT hysteresis latch for PG ----
+			// ---- Temperature: STALE ⇒ immediate rails down
+			if !freshTMP && railsUp {
+				log.Println("[thermal] temperature stale → rails DOWN")
+				seqDown(uiConn)
+				railsUp = false
+				pgStable = false
+				pgSince = time.Time{}
+			}
+
+			// ---- VBAT hysteresis latch for PG
 			if freshBAT {
 				if !vbatGood && lastVBAT >= PG_ON_VBAT {
 					vbatGood = true
@@ -435,16 +444,16 @@ func main() {
 					vbatGood = false
 				}
 			} else {
-				// If VBAT is stale, don't claim it as good.
-				vbatGood = false
+				vbatGood = false // stale VBAT cannot count as good
 			}
 
-			// ---- Brownout immediate cut (only if rails are up) ----
+			// ---- Brownout immediate cut (only if rails are up)
+			// A source is OK only if it is fresh AND above SAG.
 			if railsUp {
-				supplyOK := (freshVIN && lastVIN >= SAG_VIN) || (freshBAT && lastVBAT >= SAG_VBAT)
-				bothStale := !freshVIN && !freshBAT
-				if !supplyOK && !bothStale {
-					log.Println("[power] brownout (no source above SAG) → rails DOWN")
+				vinOK := freshVIN && lastVIN >= SAG_VIN
+				vbatOK := freshBAT && lastVBAT >= SAG_VBAT
+				if !(vinOK || vbatOK) {
+					log.Println("[power] brownout or stale on all sources → rails DOWN")
 					seqDown(uiConn)
 					railsUp = false
 					pgStable = false
@@ -452,16 +461,20 @@ func main() {
 				}
 			}
 
-			// ---- Power-good decision (debounced) ----
-			pgNow := (freshVIN && lastVIN >= PG_ON_VIN) || vbatGood
+			// ---- Power-good decision (debounced turn-on)
+			// 1) Supply PG: VIN fresh ≥ PG_ON_VIN OR VBAT hysteresis latch is set.
+			pgPG := (freshVIN && lastVIN >= PG_ON_VIN) || vbatGood
 
-			if !otActive && pgNow {
+			// 2) Temperature gate to *turn on*: must be fresh AND below (LIMIT - HYST).
+			tempOK := freshTMP && lastTDeci <= (TEMP_LIMIT-TEMP_HYST)
+
+			if pgPG && tempOK {
 				if pgSince.IsZero() {
 					pgSince = now
 				} else if !pgStable && now.Sub(pgSince) >= DEBOUNCE_OK {
 					pgStable = true
 					if !railsUp {
-						log.Println("[power] PG debounced → rails UP")
+						log.Println("[power] PG debounced + Temp OK → rails UP")
 						seqUp(uiConn)
 						railsUp = true
 					}
