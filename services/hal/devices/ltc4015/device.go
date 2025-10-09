@@ -258,14 +258,8 @@ func (d *Device) worker(ctx context.Context) {
 		evCh = d.es.Events()
 	}
 
-	// Fallback polling if we couldn't subscribe to edges (or as a safety net).
-	var pollTicker *time.Ticker
-	var tick <-chan time.Time
-	if d.es == nil {
-		pollTicker = time.NewTicker(20 * time.Millisecond)
-		defer pollTicker.Stop()
-		tick = pollTicker.C
-	}
+	liveness := time.NewTicker(100 * time.Millisecond)
+	defer liveness.Stop()
 
 	defer close(d.done)
 
@@ -311,10 +305,14 @@ func (d *Device) worker(ctx context.Context) {
 			// Timer fired to revisit a still-asserted ALERT#.
 			d.serviceSMBAlertWhileLow()
 
-		case <-tick:
-			// Fallback poll: check line level and service if asserted.
-			if !d.gpio.Get() {
-				d.serviceSMBAlertWhileLow()
+		case <-liveness.C: // THIS IS NOT A PERFECT CHECK FOR LIVENESS - IT WILL FAIL IF WE PURPOSEFULLY SET MEAS SYS OFF
+			if ok, err := d.dev.MeasSystemValid(); err == nil && !ok {
+				d.configureDevice()
+				// Queue a sample to reseed retained values.
+				select {
+				case d.reqCh <- request{op: opSampleAll}:
+				default:
+				}
 			}
 		}
 	}
