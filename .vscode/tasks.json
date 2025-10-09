@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run OpenOCD",
+      "type": "shell",
+      "command": "openocd -f ${workspaceFolder}/debug/openocd.cfg",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": [
+          {
+            "regexp": ".",
+            "file": 1,
+            "location": 2,
+            "message": 3
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          // Start checking output as soon as OpenOCD starts
+          "beginsPattern": ".",
+          // Adjust this line if your OpenOCD prints a different “ready” message
+          "endsPattern": "for telnet connections"
+        }
+      }
+    },
+    {
+      "label": "TinyGo Build",
+      "type": "shell",
+      "command": "tinygo build -o ${workspaceFolder}/build/devicecode.elf -stack-size=3KB -serial=none -target=pico -tags pico_bb_proto_1 -scheduler=tasks",
+      "problemMatcher": [],
+      "dependsOn": ["Run OpenOCD"]
+    },
+    {
+        "label": "Stop OpenOCD",
+        "type": "process",
+        "command": "pkill",
+        "args": ["-f", "openocd"],
+        "problemMatcher": []
+    }
+  ]
+}

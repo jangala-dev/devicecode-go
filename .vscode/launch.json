@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Microcontroller with TinyGo",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "external",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceFolder}/build/devicecode.elf",
+            "preLaunchTask": "TinyGo Build",
+            "configFiles": [
+                "${workspaceFolder}/debug/openocd.cfg"
+            ],
+            "gdbTarget": "localhost:3060",
+            "interface": "swd",
+            "postLaunchCommands": [
+                "monitor reset"
+            ],
+            "postDebugTask": "Stop OpenOCD"
+        }
+    ]
+}
