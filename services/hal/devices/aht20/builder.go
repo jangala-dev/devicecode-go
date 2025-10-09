@@ -9,7 +9,6 @@ import (
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
-	"devicecode-go/x/mathx"
 
 	"devicecode-go/drivers/aht20"
 
@@ -148,13 +147,26 @@ func (d *Device) readOnce() {
 		return
 	}
 
-	// Fixed-point conversions with bounds.
-	decic := d.drv.DeciCelsius()
-	decic = int32(mathx.Clamp(int(decic), -32768, 32767))
-	rhx100 := d.drv.DeciRelHumidity() * 10
-	rhx100 = int32(mathx.Clamp(int(rhx100), 0, 10000))
+	// Fixed-point conversions with sensor-specific bounds (AHT20: −40..125 °C; 0..100 %RH)
+	decic := int32(d.drv.DeciCelsius())           // deci-°C
+	rhx100 := int32(d.drv.DeciRelHumidity() * 10) // %RH ×100
+
+	const (
+		tMin = -375 // −37.5 °C
+		tMax = 825  // 82.5 °C
+		hMin = 0
+		hMax = 10000
+	)
+
+	// Hard-range validation: if outside, treat as a failed sample.
+	if decic < tMin || decic > tMax || rhx100 < hMin || rhx100 > hMax {
+		d.emitErr("invalid_sample", start)
+		return
+	}
 
 	ts := time.Now().UnixNano()
+
+	// Publish retained values
 	d.pub.Emit(core.Event{
 		Addr:    d.addrTemp,
 		Payload: types.TemperatureValue{DeciC: int16(decic)},
