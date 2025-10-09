@@ -254,11 +254,11 @@ const (
 
 func main() {
 	// Allow board to settle (USB, clocks, etc.)
-	// time.Sleep(3 * time.Second)
+	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
-	b := bus.NewBus(2, "+", "#")
+	b := bus.NewBus(4, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
@@ -408,7 +408,7 @@ func main() {
 			freshIIN := tsIIn != 0 && now.Sub(time.Unix(0, tsIIn)) <= STALE_MAX
 			freshIBAT := tsIBat != 0 && now.Sub(time.Unix(0, tsIBat)) <= STALE_MAX
 
-			// ---- Temperature: over-limit latch (as before)
+			// ---- Temperature: over-limit latch
 			if freshTMP {
 				if lastTDeci >= TEMP_LIMIT {
 					if !otActive {
