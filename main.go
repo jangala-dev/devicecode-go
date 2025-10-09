@@ -12,131 +12,171 @@ import (
 	"devicecode-go/x/strconvx"
 )
 
-func printTopicWith(prefix string, t bus.Topic) {
-	print(prefix)
-	print(" ")
-	for i := 0; i < t.Len(); i++ {
-		if i > 0 {
-			print("/")
-		}
-		switch v := t.At(i).(type) {
-		case string:
-			print(v)
-		case int:
-			print(v)
-		case int32:
-			print(int(v))
-		case int64:
-			print(int(v))
-		default:
-			print("?")
-		}
-	}
-	println()
+// -----------------------------------------------------------------------------
+// Logger: mirrors every message to USB console and (optionally) uart1.
+// No append; emits parts directly. Supports strings, []byte, ints and bools.
+// -----------------------------------------------------------------------------
+
+type Logger struct {
+	uart1 *shmring.Ring
 }
 
-// ---- fixed-point helpers (no fmt) ----
+var nl = [...]byte{'\n'}
 
-func itoa(i int) []byte { return []byte(strconvx.Itoa(i)) }
+func (l *Logger) SetUART1(r *shmring.Ring) { l.uart1 = r }
 
-func printDeci(label string, deci int) {
-	sign := ""
+func (l *Logger) writeString(s string) {
+	// console
+	if s != "" {
+		print(s)
+	}
+	// uart1 (best effort)
+	if l.uart1 != nil && s != "" {
+		_ = l.uart1.TryWriteFrom([]byte(s))
+	}
+}
+
+func (l *Logger) writeBytes(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	print(string(b))
+	if l.uart1 != nil {
+		_ = l.uart1.TryWriteFrom(b)
+	}
+}
+
+func (l *Logger) writePart(v any) {
+	switch x := v.(type) {
+	case string:
+		l.writeString(x)
+	case []byte:
+		l.writeBytes(x)
+	case int:
+		l.writeString(strconvx.Itoa(x))
+	case int32:
+		l.writeString(strconvx.Itoa(int(x)))
+	case int64:
+		l.writeString(strconvx.Itoa(int(x)))
+	case uint:
+		l.writeString(strconvx.Itoa(int(x)))
+	case uint32:
+		l.writeString(strconvx.Itoa(int(x)))
+	case uint64:
+		l.writeString(strconvx.Itoa(int(x)))
+	case bool:
+		if x {
+			l.writeString("true")
+		} else {
+			l.writeString("false")
+		}
+	default:
+		// unknown: print a '?'
+		l.writeString("?")
+	}
+}
+
+func (l *Logger) Print(parts ...any) {
+	for i := range parts {
+		l.writePart(parts[i])
+	}
+}
+
+func (l *Logger) newline() {
+	print("\n")
+	if l.uart1 != nil {
+		_ = l.uart1.TryWriteFrom(nl[:])
+	}
+}
+
+func (l *Logger) Println(parts ...any) { l.Print(parts...); l.newline() }
+
+// Fixed-point helpers (no buffers, no append)
+func (l *Logger) Deci(label string, deci int) {
 	if deci < 0 {
-		sign = "-"
+		l.Print(label, "-")
 		deci = -deci
+	} else {
+		l.Print(label)
 	}
 	whole := deci / 10
 	frac := deci % 10
-	print(label)
-	print(sign)
-	print(strconvx.Itoa(whole))
-	print(".")
-	print(strconvx.Itoa(frac))
-	println()
+	l.Println(strconvx.Itoa(whole), ".", strconvx.Itoa(frac))
 }
 
-func printHundredths(label string, hx100 int) {
+func (l *Logger) Hundredths(label string, hx100 int) {
 	if hx100 < 0 {
 		hx100 = 0
 	}
 	whole := hx100 / 100
 	frac := hx100 % 100
-	print(label)
-	print(strconvx.Itoa(whole))
-	print(".")
 	if frac < 10 {
-		print("0")
+		l.Println(label, strconvx.Itoa(whole), ".0", strconvx.Itoa(frac))
+	} else {
+		l.Println(label, strconvx.Itoa(whole), ".", strconvx.Itoa(frac))
 	}
-	print(strconvx.Itoa(frac))
-	println()
 }
 
-// appendHundredths appends a textual representation of a hundredths fixed-point
-// value to dst (e.g., 5724 -> "57.24"). Returns the extended dst.
-func appendHundredths(dst []byte, hx100 int) []byte {
-	if hx100 < 0 {
-		hx100 = 0
+var log Logger
+
+// -----------------------------------------------------------------------------
+// Topic printer (uses Logger)
+// -----------------------------------------------------------------------------
+
+func printTopicWith(prefix string, t bus.Topic) {
+	log.Print(prefix, " ")
+	for i := 0; i < t.Len(); i++ {
+		if i > 0 {
+			log.Print("/")
+		}
+		switch v := t.At(i).(type) {
+		case string:
+			log.Print(v)
+		case int:
+			log.Print(v)
+		case int32:
+			log.Print(int(v))
+		case int64:
+			log.Print(int(v))
+		default:
+			log.Print("?")
+		}
 	}
-	whole := hx100 / 100
-	frac := hx100 % 100
-	dst = append(dst, itoa(whole)...)
-	dst = append(dst, '.')
-	if frac < 10 {
-		dst = append(dst, '0')
-	}
-	dst = append(dst, itoa(frac)...)
-	return dst
+	log.Println()
 }
 
 // ---- TinyGo runtime memory snapshot ----
 func printMem() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	println(
-		"[mem]",
-		"alloc:", uint32(ms.Alloc),
-		"heapSys:", uint32(ms.HeapSys),
-		"mallocs:", uint32(ms.Mallocs),
-		"frees:", uint32(ms.Frees),
+	log.Println(
+		"[mem] ",
+		"alloc:", int(ms.Alloc), " ",
+		"heapSys:", int(ms.HeapSys), " ",
+		"mallocs:", int(ms.Mallocs), " ",
+		"frees:", int(ms.Frees),
 	)
 }
 
-// ---- shmring helpers ----
-var nl = [...]byte{'\n'}
+// -----------------------------------------------------------------------------
+// UART helpers
+// -----------------------------------------------------------------------------
 
-func ringWriteAll(r *shmring.Ring, b []byte) {
-	if r == nil || len(b) == 0 {
-		return
-	}
-	_ = r.TryWriteFrom(b) // best-effort (non-blocking, may drop)
-}
-func ringWriteLine(r *shmring.Ring, b []byte) {
+// Telemetry JSON to a specific ring (UART0), no buffer construction.
+func writeTelemetryJSON(r *shmring.Ring, tdeci int, vbat, vin, isys int32) {
 	if r == nil {
 		return
 	}
-	if r.Space() >= len(b)+1 {
-		_ = r.TryWriteFrom(b)
-		_ = r.TryWriteFrom(nl[:])
-	}
-}
-
-// ---- minimal logger (console + UART1) ----
-var uart1Tx *shmring.Ring
-
-func log_(b []byte) {
-	// console
-	print(string(b))
-	// uart1
-	ringWriteAll(uart1Tx, b)
-}
-func logln_(b []byte) {
-	// console
-	println(string(b))
-	// uart1
-	if uart1Tx != nil {
-		_ = uart1Tx.TryWriteFrom(b)
-		_ = uart1Tx.TryWriteFrom(nl[:])
-	}
+	// {"t_deci":<d>,"vbat_mV":<d>,"vin_mV":<d>,"isys_mA":<d>}
+	_ = r.TryWriteFrom([]byte(`{"t_deci":`))
+	_ = r.TryWriteFrom([]byte(strconvx.Itoa(tdeci)))
+	_ = r.TryWriteFrom([]byte(`,"vbat_mV":`))
+	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(vbat))))
+	_ = r.TryWriteFrom([]byte(`,"vin_mV":`))
+	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(vin))))
+	_ = r.TryWriteFrom([]byte(`,"isys_mA":`))
+	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(isys))))
+	_ = r.TryWriteFrom([]byte("}\n"))
 }
 
 // ---- bus helpers ----
@@ -186,21 +226,6 @@ func tSessClosed(name string) bus.Topic {
 	return bus.T("hal", "cap", "io", "serial", name, "event", "session_closed")
 }
 
-// ---- telemetry JSON (flat, tiny, no fmt/json) ----
-// {"t_deci":650,"vbat_mV":12400,"vin_mV":12000,"isys_mA":123}
-func teleJSON(tdeci int, vbat, vin int32, isys int32) []byte {
-	buf := []byte(`{"t_deci":`)
-	buf = append(buf, itoa(tdeci)...)
-	buf = append(buf, []byte(`,"vbat_mV":`)...)
-	buf = append(buf, itoa(int(vbat))...)
-	buf = append(buf, []byte(`,"vin_mV":`)...)
-	buf = append(buf, itoa(int(vin))...)
-	buf = append(buf, []byte(`,"isys_mA":`)...)
-	buf = append(buf, itoa(int(isys))...)
-	buf = append(buf, '}')
-	return buf
-}
-
 // ---- thresholds & timing (VIN/VBAT/TEMP) ----
 
 // Thermal (deci-°C)
@@ -232,23 +257,23 @@ func main() {
 	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
-	logln_([]byte("[main] bootstrapping bus …"))
+	log.Println("[main] bootstrapping bus …")
 	b := bus.NewBus(2, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
-	logln_([]byte("[main] starting hal.Run …"))
+	log.Println("[main] starting hal.Run …")
 	go hal.Run(ctx, halConn)
 
 	// Allow HAL to publish initial retained state
 	time.Sleep(250 * time.Millisecond)
 
 	// Set initial LED level (off)
-	logln_([]byte("[main] set button-led=0"))
+	log.Println("[main] set button-led=0")
 	uiConn.Publish(uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: 0}, false))
 
 	// Subscriptions (env + power)
-	logln_([]byte("[main] subscribing env + power …"))
+	log.Println("[main] subscribing env + power …")
 	tempSub := uiConn.Subscribe(tTempValue)
 	humidSub := uiConn.Subscribe(tHumValue)
 	valSub := uiConn.Subscribe(valTopic)
@@ -275,8 +300,7 @@ func main() {
 	// State (PG + env + power + UART rings)
 	var (
 		// UART TX rings
-		uart0Tx *shmring.Ring // telemetry
-		// uart1Tx declared global (logger)
+		uart0Tx *shmring.Ring // telemetry (JSON to UART0)
 
 		// env
 		lastTDeci int
@@ -311,7 +335,7 @@ func main() {
 	const pwmTop = 4095
 	levelUp := true // for breathe mode only (railsDown)
 
-	logln_([]byte("[main] entering loop (LED/mem/PG/TEMP on one tick; env/power prints; UART0 telemetry; UART1 logs) …"))
+	log.Println("[main] entering loop (LED/mem/PG/TEMP tick; env/power prints; UART0 telemetry; UART1 logs) …")
 
 	for {
 		select {
@@ -319,21 +343,21 @@ func main() {
 		case m := <-subSessOpenTele.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
 				uart0Tx = shmring.Get(shmring.Handle(ev.TXHandle))
-				logln_([]byte("[uart0] telemetry session opened"))
+				log.Println("[uart0] telemetry session opened")
 			}
 		case m := <-subSessOpenLog.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				uart1Tx = shmring.Get(shmring.Handle(ev.TXHandle))
-				logln_([]byte("[uart1] log session opened"))
+				log.SetUART1(shmring.Get(shmring.Handle(ev.TXHandle)))
+				log.Println("[uart1] log session opened")
 			}
 		case <-subSessClosedTele.Channel():
 			uart0Tx = nil
-			logln_([]byte("[uart0] telemetry session closed"))
+			log.Println("[uart0] telemetry session closed")
 			// Auto-reopen
 			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 		case <-subSessClosedLog.Channel():
-			uart1Tx = nil
-			logln_([]byte("[uart1] log session closed"))
+			log.SetUART1(nil)
+			log.Println("[uart1] log session closed")
 			// Auto-reopen
 			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
@@ -342,23 +366,17 @@ func main() {
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
 				lastTDeci = int(v.DeciC)
 				tsTemp = time.Now().UnixNano()
-				printDeci("[value] env/temperature/core °C=", lastTDeci)
-				// mirror to uart1
-				ringWriteLine(uart1Tx, []byte("[value] temp °C="+strconvx.Itoa(lastTDeci/10)+"."+strconvx.Itoa(lastTDeci%10)))
+				log.Deci("[value] env/temperature/core °C=", lastTDeci)
 			}
 
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
-				printHundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-				// mirror short log to uart1 (without closure)
-				buf := []byte("[value] hum %RH=")
-				buf = appendHundredths(buf, int(v.RHx100))
-				ringWriteLine(uart1Tx, buf)
+				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 			}
 
 		// ---- LED + mem + PG/TEMP + telemetry (one ticker) ----
 		case <-rampTicker.C:
-			// LED behavior tied to railsUp:
+			// LED behaviour tied to railsUp:
 			// - railsUp => steady ON (send Set once when it flips up)
 			// - railsDown => breathe (alternate ramp up/down each tick)
 			if railsUp {
@@ -395,7 +413,7 @@ func main() {
 				if lastTDeci >= TEMP_LIMIT {
 					if !otActive {
 						otActive = true
-						logln_([]byte("[thermal] over-temp → rails DOWN"))
+						log.Println("[thermal] over-temp → rails DOWN")
 						if railsUp {
 							seqDown(uiConn)
 							railsUp = false
@@ -403,7 +421,7 @@ func main() {
 					}
 				} else if lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
 					if otActive {
-						logln_([]byte("[thermal] temp recovered below hysteresis"))
+						log.Println("[thermal] temp recovered below hysteresis")
 					}
 					otActive = false
 				}
@@ -422,13 +440,11 @@ func main() {
 			}
 
 			// ---- Brownout immediate cut (only if rails are up) ----
-			// We consider supply OK if EITHER source is above its sag threshold.
 			if railsUp {
 				supplyOK := (freshVIN && lastVIN >= SAG_VIN) || (freshBAT && lastVBAT >= SAG_VBAT)
-				// Guard: if both sources are stale, don't cut purely on staleness.
 				bothStale := !freshVIN && !freshBAT
 				if !supplyOK && !bothStale {
-					logln_([]byte("[power] brownout (no source above SAG) → rails DOWN"))
+					log.Println("[power] brownout (no source above SAG) → rails DOWN")
 					seqDown(uiConn)
 					railsUp = false
 					pgStable = false
@@ -437,7 +453,6 @@ func main() {
 			}
 
 			// ---- Power-good decision (debounced) ----
-			// PG candidate is true if EITHER VIN is above PG_ON_VIN OR VBAT latch is good.
 			pgNow := (freshVIN && lastVIN >= PG_ON_VIN) || vbatGood
 
 			if !otActive && pgNow {
@@ -446,7 +461,7 @@ func main() {
 				} else if !pgStable && now.Sub(pgSince) >= DEBOUNCE_OK {
 					pgStable = true
 					if !railsUp {
-						logln_([]byte("[power] PG debounced → rails UP"))
+						log.Println("[power] PG debounced → rails UP")
 						seqUp(uiConn)
 						railsUp = true
 					}
@@ -454,10 +469,9 @@ func main() {
 			} else {
 				pgStable = false
 				pgSince = time.Time{}
-				// We don't force rails down here; brownout block above handles cuts.
 			}
 
-			// Telemetry over UART0 (flat JSON). Use freshest we have; ISYS≈IIN−IBAT when both fresh.
+			// Telemetry over UART0 (flat JSON).
 			if uart0Tx != nil && freshTMP {
 				vin := int32(0)
 				vbat := int32(0)
@@ -471,8 +485,7 @@ func main() {
 				if freshIIN && freshIBAT {
 					isys = lastIIn - lastIBat
 				}
-				line := teleJSON(lastTDeci, vbat, vin, isys)
-				ringWriteLine(uart0Tx, line)
+				writeTelemetryJSON(uart0Tx, lastTDeci, vbat, vin, isys)
 			}
 
 		// ---- Power values / status / events ----
@@ -492,8 +505,7 @@ func main() {
 				haveIIn = true
 			}
 			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
-			// mirror the one-line value summary to uart1 (compact, best-effort)
-			ringWriteAll(uart1Tx, []byte("[value] power\n"))
+			log.Println("[value] power")
 
 		case m := <-stCh:
 			printCapStatus(m)
@@ -507,7 +519,7 @@ func main() {
 	}
 }
 
-// ----------- power rail sequencing (no closures) -----------
+// ----------- power rail sequencing -----------
 
 func seqDown(uiConn *bus.Connection) {
 	for i := len(powerOrderUp) - 1; i >= 0; i-- {
@@ -522,7 +534,7 @@ func seqUp(uiConn *bus.Connection) {
 	}
 }
 
-// ----------- printing helpers -----------
+// ----------- printing helpers (all via Logger) -----------
 
 func printCapValue(m *bus.Message, lastIIn *int32, haveIIn *bool, lastIBat *int32, haveIBat *bool) {
 	// hal/cap/<domain>/<kind>/<name>/value
@@ -532,59 +544,26 @@ func printCapValue(m *bus.Message, lastIIn *int32, haveIIn *bool, lastIBat *int3
 
 	switch v := m.Payload.(type) {
 	case types.BatteryValue:
-		print("[value] ")
-		print(dom)
-		print("/")
-		print(kind)
-		print("/")
-		print(name)
-		print(" | VBAT=")
-		print(int(v.PackMilliV))
-		print("mV per=")
-		print(int(v.PerCellMilliV))
-		print("mV | IBAT=")
-		print(int(v.IBatMilliA))
-		print("mA")
-
+		log.Print("[value] ", dom, "/", kind, "/", name,
+			" | VBAT=", int(v.PackMilliV), "mV per=", int(v.PerCellMilliV), "mV | IBAT=", int(v.IBatMilliA), "mA")
 		*lastIBat = v.IBatMilliA
 		*haveIBat = true
-
-		// ISYS ≈ IIN − IBAT (IBAT>0 ⇒ charging)
 		if *haveIIn && *haveIBat {
 			isys := *lastIIn - *lastIBat
-			print(" | ISYS≈")
-			print(int(isys))
-			print("mA")
+			log.Print(" | ISYS≈", int(isys), "mA")
 		}
-
-		println("")
+		log.Println()
 
 	case types.ChargerValue:
-		print("[value] ")
-		print(dom)
-		print("/")
-		print(kind)
-		print("/")
-		print(name)
-		print(" | VIN=")
-		print(int(v.VIN_mV))
-		print("mV | VSYS=")
-		print(int(v.VSYS_mV))
-		print("mV | IIN=")
-		print(int(v.IIn_mA))
-		print("mA")
-
+		log.Print("[value] ", dom, "/", kind, "/", name,
+			" | VIN=", int(v.VIN_mV), "mV | VSYS=", int(v.VSYS_mV), "mV | IIN=", int(v.IIn_mA), "mA")
 		*lastIIn = v.IIn_mA
 		*haveIIn = true
-
 		if *haveIIn && *haveIBat {
 			isys := *lastIIn - *lastIBat
-			print(" | ISYS≈")
-			print(int(isys))
-			print("mA")
+			log.Print(" | ISYS≈", int(isys), "mA")
 		}
-
-		println("")
+		log.Println()
 	default:
 		// ignore others
 	}
@@ -604,17 +583,12 @@ func printCapStatus(m *bus.Message) {
 		return
 	}
 
-	if s, ok := m.Payload.(types.CapabilityStatus); ok {
-		print("[link] ")
-		print(dom)
-		print("/")
-		print(kind)
-		print("/")
-		print(name)
-		print(" | link=")
-		print(string(s.Link))
-		print(" ts=")
-		println(s.TS)
+	if sVal, ok := m.Payload.(types.CapabilityStatus); ok {
+		log.Println(
+			"[link] ", dom, "/", kind, "/", name,
+			" | link=", string(sVal.Link),
+			" ts=", int(sVal.TS),
+		)
 	}
 }
 
@@ -632,12 +606,5 @@ func printCapEvent(m *bus.Message) {
 		return
 	}
 
-	print("[event] ")
-	print(dom)
-	print("/")
-	print(kind)
-	print("/")
-	print(name)
-	print(" | ")
-	println(tag)
+	log.Println("[event] ", dom, "/", kind, "/", name, " | ", tag)
 }
