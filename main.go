@@ -14,7 +14,7 @@ import (
 
 // ---- thresholds & timing (VIN/VBAT/TEMP) ----
 
-const HAL_TIMEOUT = 3 //second
+const HAL_TIMEOUT = 5 // second
 
 // Thermal (deci-°C)
 const (
@@ -83,7 +83,6 @@ func tSessClosed(name string) bus.Topic {
 }
 
 func main() {
-	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
@@ -99,7 +98,7 @@ func main() {
 	// Wait for retained hal/state=ready (or time out)
 	if !waitHALReady(ctx, halConn, HAL_TIMEOUT*time.Second) {
 		for {
-			log.Println("[main] HAL not ready within timeout; continuing anyway")
+			log.Println("[main] HAL not ready within timeout")
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -145,8 +144,6 @@ func main() {
 		tsVBAT   int64
 		lastIIn  int32
 		lastIBat int32
-		tsIIn    int64
-		tsIBat   int64
 		haveIIn  bool
 		haveIBat bool
 
@@ -161,13 +158,13 @@ func main() {
 		otActive bool
 	)
 
-	// Single ticker does: LED control, mem stats, PG/TEMP check, telemetry flush
+	// Single ticker does: LED control, mem stats, PG/TEMP check
 	rampTicker := time.NewTicker(2 * time.Second)
 	defer rampTicker.Stop()
 	const pwmTop = 4095
 	levelUp := true // for breathe mode only (railsDown)
 
-	log.Println("[main] entering loop (LED/mem/PG/TEMP tick; env/power prints; UART0 telemetry; UART1 logs) …")
+	log.Println("[main] entering loop (LED/mem/PG/TEMP tick; env/power prints; UART0 streaming JSON; UART1 logs) …")
 
 	for {
 		select {
@@ -199,14 +196,32 @@ func main() {
 				lastTDeci = int(v.DeciC)
 				tsTemp = time.Now().UnixNano()
 				log.Deci("[value] env/temperature/core °C=", lastTDeci)
+
+				// JSON: {"env/temperature/core": <deciC>}
+				if uart0Tx != nil {
+					var w jsonw
+					w.r = uart0Tx
+					w.begin()
+					w.kvInt("env/temperature/core", int(v.DeciC))
+					w.end()
+				}
 			}
 
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
+
+				// JSON: {"env/humidity/core": <RHx100>}
+				if uart0Tx != nil {
+					var w jsonw
+					w.r = uart0Tx
+					w.begin()
+					w.kvInt("env/humidity/core", int(v.RHx100))
+					w.end()
+				}
 			}
 
-		// ---- LED + mem + PG/TEMP + telemetry (one ticker) ----
+		// ---- LED + mem + PG/TEMP (one ticker) ----
 		case <-rampTicker.C:
 			// LED behaviour tied to railsUp:
 			// - railsUp => steady ON (send Set once when it flips up)
@@ -232,20 +247,29 @@ func main() {
 			runtime.GC()
 			printMem()
 
+			// JSON memory snapshot: { "sys/mem/mallocs":..,}
+			if uart0Tx != nil {
+				var ms runtime.MemStats
+				runtime.ReadMemStats(&ms)
+				var w jsonw
+				w.r = uart0Tx
+				w.begin()
+				w.kvInt("sys/mem/alloc", int(ms.Alloc))
+				w.end()
+			}
+
 			// ---- Freshness
 			now := time.Now()
 			freshVIN := tsVIN != 0 && now.Sub(time.Unix(0, tsVIN)) <= STALE_MAX
 			freshBAT := tsVBAT != 0 && now.Sub(time.Unix(0, tsVBAT)) <= STALE_MAX
 			freshTMP := tsTemp != 0 && now.Sub(time.Unix(0, tsTemp)) <= STALE_MAX
-			freshIIN := tsIIn != 0 && now.Sub(time.Unix(0, tsIIn)) <= STALE_MAX
-			freshIBAT := tsIBat != 0 && now.Sub(time.Unix(0, tsIBat)) <= STALE_MAX
 
 			// ---- Temperature: over-limit latch
 			if freshTMP {
 				if lastTDeci >= TEMP_LIMIT {
 					if !otActive {
 						otActive = true
-						log.Println("[thermal] over-temp -> rails DOWN")
+						log.Println("[thermal] over-temp → rails DOWN")
 						if railsUp {
 							seqDown(uiConn)
 							railsUp = false
@@ -261,7 +285,7 @@ func main() {
 
 			// ---- Temperature: STALE ⇒ immediate rails down
 			if !freshTMP && railsUp {
-				log.Println("[thermal] temperature stale -> rails DOWN")
+				log.Println("[thermal] temperature stale → rails DOWN")
 				seqDown(uiConn)
 				railsUp = false
 				pgStable = false
@@ -285,7 +309,7 @@ func main() {
 				vinOK := freshVIN && lastVIN >= SAG_VIN
 				vbatOK := freshBAT && lastVBAT >= SAG_VBAT
 				if !(vinOK || vbatOK) {
-					log.Println("[power] brownout or stale on all sources -> rails DOWN")
+					log.Println("[power] brownout or stale on all sources → rails DOWN")
 					seqDown(uiConn)
 					railsUp = false
 					pgStable = false
@@ -306,7 +330,7 @@ func main() {
 				} else if !pgStable && now.Sub(pgSince) >= DEBOUNCE_OK {
 					pgStable = true
 					if !railsUp {
-						log.Println("[power] PG debounced + Temp OK -> rails UP")
+						log.Println("[power] PG debounced + Temp OK → rails UP")
 						seqUp(uiConn)
 						railsUp = true
 					}
@@ -316,23 +340,6 @@ func main() {
 				pgSince = time.Time{}
 			}
 
-			// Telemetry over UART0 (flat JSON).
-			if uart0Tx != nil && freshTMP {
-				vin := int32(0)
-				vbat := int32(0)
-				if freshVIN {
-					vin = lastVIN
-				}
-				if freshBAT {
-					vbat = lastVBAT
-				}
-				isys := int32(0)
-				if freshIIN && freshIBAT {
-					isys = lastIIn - lastIBat
-				}
-				writeTelemetryJSON(uart0Tx, lastTDeci, vbat, vin, isys)
-			}
-
 		// ---- Power values / status / events ----
 		case m := <-valCh:
 			switch v := m.Payload.(type) {
@@ -340,23 +347,56 @@ func main() {
 				lastVBAT = v.PackMilliV
 				tsVBAT = time.Now().UnixNano()
 				lastIBat = v.IBatMilliA
-				tsIBat = tsVBAT
 				haveIBat = true
+
+				// JSON: {"power/battery/internal/VBAT":..,"power/battery/internal/IBAT":..}
+				if uart0Tx != nil {
+					var w jsonw
+					w.r = uart0Tx
+					w.begin()
+					w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
+					w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
+					w.end()
+				}
+
 			case types.ChargerValue:
 				lastVIN = v.VIN_mV
 				tsVIN = time.Now().UnixNano()
 				lastIIn = v.IIn_mA
-				tsIIn = tsVIN
 				haveIIn = true
+
+				// JSON: {"power/charger/internal/VIN":..,"power/charger/internal/VSYS":..,"power/charger/internal/IIN":..}
+				if uart0Tx != nil {
+					var w jsonw
+					w.r = uart0Tx
+					w.begin()
+					w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
+					w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
+					w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
+					w.end()
+				}
 			}
 			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
-			// log.Println("[value] power")
 
 		case m := <-stCh:
 			printCapStatus(m)
 
 		case m := <-evCh:
 			printCapEvent(m)
+
+			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
+			if uart0Tx != nil {
+				dom, _ := m.Topic.At(2).(string)
+				kind, _ := m.Topic.At(3).(string)
+				name, _ := m.Topic.At(4).(string)
+				tag, _ := m.Topic.At(6).(string)
+
+				var w jsonw
+				w.r = uart0Tx
+				w.begin()
+				w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
+				w.end()
+			}
 
 		case <-ctx.Done():
 			return
@@ -453,7 +493,7 @@ func printCapStatus(m *bus.Message) {
 		log.Println(
 			"[link] ", dom, "/", kind, "/", name,
 			" | link=", string(sVal.Link),
-			" ts=", int(sVal.TS),
+			" ts=", strconvx.Itoa64(sVal.TS), // note: cast to int for Logger's Itoa
 		)
 	}
 }
@@ -473,6 +513,55 @@ func printCapEvent(m *bus.Message) {
 	}
 
 	log.Println("[event] ", dom, "/", kind, "/", name, " | ", tag)
+}
+
+// -----------------------------------------------------------------------------
+// Minimal streaming JSON writer for shmring (no buffers/allocs)
+// -----------------------------------------------------------------------------
+
+type jsonw struct {
+	r     *shmring.Ring
+	first bool
+}
+
+func (w *jsonw) begin() {
+	w.first = true
+	_ = w.r.TryWriteFrom([]byte("{"))
+}
+func (w *jsonw) end() {
+	_ = w.r.TryWriteFrom([]byte("}\n"))
+}
+func (w *jsonw) comma() {
+	if !w.first {
+		_ = w.r.TryWriteFrom([]byte(","))
+	} else {
+		w.first = false
+	}
+}
+func (w *jsonw) key(k string) {
+	_ = w.r.TryWriteFrom([]byte(`"`))
+	_ = w.r.TryWriteFrom([]byte(k))
+	_ = w.r.TryWriteFrom([]byte(`":`))
+}
+func (w *jsonw) kvInt(k string, v int) {
+	w.comma()
+	w.key(k)
+	_ = w.r.TryWriteFrom([]byte(strconvx.Itoa(v)))
+}
+func (w *jsonw) kvStr(k, s string) {
+	w.comma()
+	w.key(k)
+	_ = w.r.TryWriteFrom([]byte(`"`))
+	// very small escape: replace \ and "
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' {
+			_ = w.r.TryWriteFrom([]byte{'\\', c})
+		} else {
+			_ = w.r.TryWriteFrom([]byte{c})
+		}
+	}
+	_ = w.r.TryWriteFrom([]byte(`"`))
 }
 
 // -----------------------------------------------------------------------------
@@ -520,13 +609,13 @@ func (l *Logger) writePart(v any) {
 	case int32:
 		l.writeString(strconvx.Itoa(int(x)))
 	case int64:
-		l.writeString(strconvx.Itoa(int(x)))
+		l.writeString(strconvx.Itoa64(x))
 	case uint:
 		l.writeString(strconvx.Itoa(int(x)))
 	case uint32:
 		l.writeString(strconvx.Itoa(int(x)))
 	case uint64:
-		l.writeString(strconvx.Itoa(int(x)))
+		l.writeString(strconvx.Itoa64(int64(x)))
 	case bool:
 		if x {
 			l.writeString("true")
@@ -582,32 +671,6 @@ func (l *Logger) Hundredths(label string, hx100 int) {
 
 var log Logger
 
-// -----------------------------------------------------------------------------
-// Topic printer (uses Logger)
-// -----------------------------------------------------------------------------
-
-func printTopicWith(prefix string, t bus.Topic) {
-	log.Print(prefix, " ")
-	for i := 0; i < t.Len(); i++ {
-		if i > 0 {
-			log.Print("/")
-		}
-		switch v := t.At(i).(type) {
-		case string:
-			log.Print(v)
-		case int:
-			log.Print(v)
-		case int32:
-			log.Print(int(v))
-		case int64:
-			log.Print(int(v))
-		default:
-			log.Print("?")
-		}
-	}
-	log.Println()
-}
-
 // ---- TinyGo runtime memory snapshot ----
 func printMem() {
 	var ms runtime.MemStats
@@ -619,33 +682,4 @@ func printMem() {
 		"mallocs:", int(ms.Mallocs), " ",
 		"frees:", int(ms.Frees),
 	)
-}
-
-// -----------------------------------------------------------------------------
-// UART helpers
-// -----------------------------------------------------------------------------
-
-// Telemetry JSON to a specific ring (UART0), no buffer construction.
-func writeTelemetryJSON(r *shmring.Ring, tdeci int, vbat, vin, isys int32) {
-	if r == nil {
-		return
-	}
-	// {"t_deci":<d>,"vbat_mV":<d>,"vin_mV":<d>,"isys_mA":<d>}
-	_ = r.TryWriteFrom([]byte(`{"t_deci":`))
-	_ = r.TryWriteFrom([]byte(strconvx.Itoa(tdeci)))
-	_ = r.TryWriteFrom([]byte(`,"vbat_mV":`))
-	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(vbat))))
-	_ = r.TryWriteFrom([]byte(`,"vin_mV":`))
-	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(vin))))
-	_ = r.TryWriteFrom([]byte(`,"isys_mA":`))
-	_ = r.TryWriteFrom([]byte(strconvx.Itoa(int(isys))))
-	_ = r.TryWriteFrom([]byte("}\n"))
-}
-
-// ---- bus helpers ----
-func reqOKTO(c *bus.Connection, t bus.Topic, payload any, to time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), to)
-	defer cancel()
-	_, err := c.RequestWait(ctx, c.NewMessage(t, payload, false))
-	return err == nil
 }

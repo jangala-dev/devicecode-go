@@ -8,6 +8,10 @@ package strconvx
 
 func Itoa(i int) string { return FormatInt(int64(i), 10) }
 
+// 64-bit convenience wrappers (avoid narrowing on 32-bit MCUs).
+func Itoa64(i int64) string  { return FormatInt(i, 10) }
+func Utoa64(u uint64) string { return FormatUint(u, 10) }
+
 func Atoi(s string) (int, error) {
 	v, err := ParseInt(s, 10, 0)
 	return int(v), err
