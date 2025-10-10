@@ -518,7 +518,7 @@ func main() {
 				haveIIn = true
 			}
 			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
-			log.Println("[value] power")
+			// log.Println("[value] power")
 
 		case m := <-stCh:
 			printCapStatus(m)
