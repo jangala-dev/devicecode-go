@@ -69,7 +69,15 @@ func tSwitch(name string) bus.Topic {
 	return bus.T("hal", "cap", "power", string(types.KindSwitch), name, "control", "set")
 }
 
-var powerOrderUp = [...]string{"mpcie-usb", "m2", "mpcie", "cm5", "fan", "boost-load"}
+var powerSeq = []RailStep{
+	{Name: "mpcie-usb", GapBefore: 200 * time.Millisecond},
+	{Name: "m2", GapBefore: 200 * time.Millisecond},
+	{Name: "mpcie", GapBefore: 200 * time.Millisecond},
+	{Name: "cm5", GapBefore: 200 * time.Millisecond},
+	{Name: "fan", GapBefore: 200 * time.Millisecond},
+	// Larger gap specifically before boost:
+	{Name: "boost-load", GapBefore: 500 * time.Millisecond},
+}
 
 // UART sessions
 func tSessOpen(name string) bus.Topic {
@@ -83,6 +91,7 @@ func tSessClosed(name string) bus.Topic {
 }
 
 func main() {
+	time.Sleep(3 * time.Second)
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
@@ -427,16 +436,36 @@ func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool 
 
 // ----------- power rail sequencing -----------
 
-func seqDown(uiConn *bus.Connection) {
-	for i := len(powerOrderUp) - 1; i >= 0; i-- {
-		uiConn.Publish(uiConn.NewMessage(tSwitch(powerOrderUp[i]), types.SwitchSet{On: false}, false))
-		time.Sleep(200 * time.Millisecond)
+type RailStep struct {
+	Name      string
+	GapBefore time.Duration // delay inserted before operating this rail
+}
+
+// ---- sequencing helpers ----
+
+// seqUp powers rails in order, inserting each step's configured pre-gap.
+// The first step has no initial delay (keeps behaviour intuitive).
+func seqUp(uiConn *bus.Connection) {
+	first := true
+	for _, s := range powerSeq {
+		if !first && s.GapBefore > 0 {
+			time.Sleep(s.GapBefore)
+		}
+		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: true}, false))
+		first = false
 	}
 }
-func seqUp(uiConn *bus.Connection) {
-	for _, name := range powerOrderUp {
-		uiConn.Publish(uiConn.NewMessage(tSwitch(name), types.SwitchSet{On: true}, false))
-		time.Sleep(200 * time.Millisecond)
+
+// seqDown powers rails off in reverse order with the same pre-gap policy.
+func seqDown(uiConn *bus.Connection) {
+	first := true
+	for i := len(powerSeq) - 1; i >= 0; i-- {
+		s := powerSeq[i]
+		if !first && s.GapBefore > 0 {
+			time.Sleep(s.GapBefore)
+		}
+		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: false}, false))
+		first = false
 	}
 }
 
@@ -529,7 +558,7 @@ func (w *jsonw) begin() {
 	_ = w.r.TryWriteFrom([]byte("{"))
 }
 func (w *jsonw) end() {
-	_ = w.r.TryWriteFrom([]byte("}\n"))
+	_ = w.r.TryWriteFrom([]byte("}\r\n"))
 }
 func (w *jsonw) comma() {
 	if !w.first {
@@ -573,7 +602,7 @@ type Logger struct {
 	uart1 *shmring.Ring
 }
 
-var nl = [...]byte{'\n'}
+var nl = [...]byte{'\r', '\n'}
 
 func (l *Logger) SetUART1(r *shmring.Ring) { l.uart1 = r }
 
@@ -635,7 +664,7 @@ func (l *Logger) Print(parts ...any) {
 }
 
 func (l *Logger) newline() {
-	print("\n")
+	print("\r\n")
 	if l.uart1 != nil {
 		_ = l.uart1.TryWriteFrom(nl[:])
 	}
