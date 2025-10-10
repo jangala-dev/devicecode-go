@@ -451,6 +451,7 @@ func seqUp(uiConn *bus.Connection) {
 		if !first && s.GapBefore > 0 {
 			time.Sleep(s.GapBefore)
 		}
+		log.Println("[event] ", "powering rail UP: ", s.Name)
 		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: true}, false))
 		first = false
 	}
@@ -464,6 +465,7 @@ func seqDown(uiConn *bus.Connection) {
 		if !first && s.GapBefore > 0 {
 			time.Sleep(s.GapBefore)
 		}
+		log.Println("[event] ", "powering rail down: ", s.Name)
 		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: false}, false))
 		first = false
 	}
@@ -598,22 +600,28 @@ func (w *jsonw) kvStr(k, s string) {
 // No append; emits parts directly. Supports strings, []byte, ints and bools.
 // -----------------------------------------------------------------------------
 
+// ---- Logger with hh.hh prefix per line -------------------------------------
+
 type Logger struct {
-	uart1 *shmring.Ring
+	target    *shmring.Ring
+	t0        time.Time
+	lineStart bool
 }
 
 var nl = [...]byte{'\r', '\n'}
 
-func (l *Logger) SetUART1(r *shmring.Ring) { l.uart1 = r }
+// Anchor the time origin; also mark that the next write starts a new line.
+func (l *Logger) SetStart(t time.Time) { l.t0, l.lineStart = t, true }
+
+func (l *Logger) SetUART1(r *shmring.Ring) { l.target = r }
 
 func (l *Logger) writeString(s string) {
-	// console
+	l.writePrefixIfLineStart()
 	if s != "" {
 		print(s)
-	}
-	// uart1 (best effort)
-	if l.uart1 != nil && s != "" {
-		_ = l.uart1.TryWriteFrom([]byte(s))
+		if l.target != nil {
+			_ = l.target.TryWriteFrom([]byte(s))
+		}
 	}
 }
 
@@ -621,10 +629,86 @@ func (l *Logger) writeBytes(b []byte) {
 	if len(b) == 0 {
 		return
 	}
+	l.writePrefixIfLineStart()
 	print(string(b))
-	if l.uart1 != nil {
-		_ = l.uart1.TryWriteFrom(b)
+	if l.target != nil {
+		_ = l.target.TryWriteFrom(b)
 	}
+}
+
+// Called at the first output of each line; emits "sss.mmm ".
+func (l *Logger) writePrefixIfLineStart() {
+	if !l.lineStart {
+		return
+	}
+	l.lineStart = false
+
+	if l.t0.IsZero() {
+		l.t0 = time.Now()
+	}
+	el := time.Since(l.t0)
+	secs := int(el / time.Second)
+	ms := int((el % time.Second) / time.Millisecond) // 0..999
+
+	// Console (no allocations)
+	print(strconvx.Itoa(secs))
+	print(".")
+	if ms < 100 {
+		print("0")
+	}
+	if ms < 10 {
+		print("0")
+	}
+	print(strconvx.Itoa(ms))
+	print(" ")
+
+	// UART1: build once, single write
+	if l.target != nil {
+		var buf [20]byte
+		n := 0
+		n += writeDec(buf[:], n, secs)
+		buf[n] = '.'
+		n++
+		n += writeDecPad3(buf[:], n, ms) // zero-padded to 3 digits
+		buf[n] = ' '
+		n++
+		_ = l.target.TryWriteFrom(buf[:n])
+	}
+}
+
+// Writes v (0..999) as exactly three digits into dst at off. Returns 3.
+func writeDecPad3(dst []byte, off int, v int) int {
+	if v < 0 {
+		v = 0
+	} else if v > 999 {
+		v = 999
+	}
+	dst[off+0] = byte('0' + (v/100)%10)
+	dst[off+1] = byte('0' + (v/10)%10)
+	dst[off+2] = byte('0' + v%10)
+	return 3
+}
+
+// Decimal writer: appends v into dst at off, returns bytes written.
+// Avoids fmt/strconv allocations; v >= 0.
+func writeDec(dst []byte, off int, v int) int {
+	if v == 0 {
+		dst[off] = '0'
+		return 1
+	}
+	var tmp [10]byte
+	j := 0
+	for v > 0 {
+		tmp[j] = byte('0' + v%10)
+		v /= 10
+		j++
+	}
+	i := off
+	for k := j - 1; k >= 0; k-- {
+		dst[i] = tmp[k]
+		i++
+	}
+	return i - off
 }
 
 func (l *Logger) writePart(v any) {
@@ -652,7 +736,6 @@ func (l *Logger) writePart(v any) {
 			l.writeString("false")
 		}
 	default:
-		// unknown: print a '?'
 		l.writeString("?")
 	}
 }
@@ -665,20 +748,23 @@ func (l *Logger) Print(parts ...any) {
 
 func (l *Logger) newline() {
 	print("\r\n")
-	if l.uart1 != nil {
-		_ = l.uart1.TryWriteFrom(nl[:])
+	if l.target != nil {
+		_ = l.target.TryWriteFrom(nl[:])
 	}
+	l.lineStart = true
 }
 
 func (l *Logger) Println(parts ...any) { l.Print(parts...); l.newline() }
 
-// Fixed-point helpers (no buffers, no append)
+// Fixed-point helpers
 func (l *Logger) Deci(label string, deci int) {
+	l.writePrefixIfLineStart()
 	if deci < 0 {
-		l.Print(label, "-")
+		l.writeString(label)
+		l.writeString("-")
 		deci = -deci
 	} else {
-		l.Print(label)
+		l.writeString(label)
 	}
 	whole := deci / 10
 	frac := deci % 10
@@ -686,6 +772,7 @@ func (l *Logger) Deci(label string, deci int) {
 }
 
 func (l *Logger) Hundredths(label string, hx100 int) {
+	l.writePrefixIfLineStart()
 	if hx100 < 0 {
 		hx100 = 0
 	}
@@ -698,7 +785,8 @@ func (l *Logger) Hundredths(label string, hx100 int) {
 	}
 }
 
-var log Logger
+// Global instance; ensure first line is prefixed.
+var log = Logger{lineStart: true}
 
 // ---- TinyGo runtime memory snapshot ----
 func printMem() {
