@@ -564,7 +564,7 @@ func (d *Device) serviceSMBAlertWhileLow() {
 func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 	now := time.Now().UnixNano()
 
-	// Limit alerts: VIN window and BSR.
+	// ---- Limit alerts: VIN window and BSR ----
 	if vinBits := ev.Limit & (ltc4015.VINLo | ltc4015.VINHi); vinBits != 0 {
 		// Re-resolve state and re-arm opposite edge.
 		mv, _ := d.dev.VinMilliV()
@@ -584,50 +584,75 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 			d.setVinEdgeMask(d.dev, ltc4015.VINLo|ltc4015.VINHi)
 		}
 	}
-
 	if ev.Limit.Has(ltc4015.BSRHi) {
 		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: "bsr_high", TS: now})
 	}
 
-	// Charger state faults/events → tagged events (non-retained).
+	// ---- Charger state: faults and phase edges (events), then re-arm + clear ----
 	if ev.ChgState != 0 {
-		tag := ""
-		switch {
-		case ev.ChgState.Has(ltc4015.BatMissingFault):
-			tag = "bat_missing"
-		case ev.ChgState.Has(ltc4015.BatShortFault):
-			tag = "bat_short"
-		case ev.ChgState.Has(ltc4015.MaxChargeTimeFault):
-			tag = "max_charge_time_fault"
-		case ev.ChgState.Has(ltc4015.AbsorbCharge):
-			tag = "absorb"
-		case ev.ChgState.Has(ltc4015.EqualizeCharge):
-			tag = "equalize"
-		case ev.ChgState.Has(ltc4015.CCCVCharge):
-			tag = "cccv"
-		case ev.ChgState.Has(ltc4015.Precharge):
-			tag = "precharge"
+		s := ev.ChgState
+		// Emit a tag for each asserted bit we care about.
+		if s.Has(ltc4015.BatMissingFault) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_missing", TS: now})
 		}
-		if tag != "" {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: tag, TS: now})
+		if s.Has(ltc4015.BatShortFault) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_short", TS: now})
+		}
+		if s.Has(ltc4015.MaxChargeTimeFault) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "max_charge_time_fault", TS: now})
+		}
+		if s.Has(ltc4015.AbsorbCharge) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "absorb", TS: now})
+		}
+		if s.Has(ltc4015.EqualizeCharge) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "equalize", TS: now})
+		}
+		if s.Has(ltc4015.CCCVCharge) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cccv", TS: now})
+		}
+		if s.Has(ltc4015.Precharge) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "precharge", TS: now})
+		}
+
+		// Re-arm charger-state edges: enable only bits that are NOT currently asserted.
+		// Include both faults and phases you want edge notifications for.
+		en := ltc4015.BatMissingFault |
+			ltc4015.BatShortFault |
+			ltc4015.MaxChargeTimeFault |
+			ltc4015.AbsorbCharge |
+			ltc4015.EqualizeCharge |
+			ltc4015.CCCVCharge |
+			ltc4015.Precharge
+
+		if cur, err := d.dev.ChargerState(); err == nil {
+			en &^= cur
+			if err := d.dev.EnableChargerStateAlertsMask(en); err != nil {
+				d.evtErrChg("enable_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
+			}
+			if err := d.dev.ClearChargerStateAlerts(); err != nil {
+				d.evtErrChg("clear_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
+			}
+		} else {
+			d.evtErrChg("read_charger_state_failed", string(errcode.MapDriverErr(err)))
 		}
 	}
 
-	// Charge status edges: report and re-mask to “next edges”.
+	// ---- Charge status edges: events, then re-arm + clear ----
 	if ev.ChgStatus != 0 {
-		if ev.ChgStatus.Has(ltc4015.IinLimitActive) {
+		s := ev.ChgStatus
+		if s.Has(ltc4015.IinLimitActive) {
 			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "iin_limited", TS: now})
 		}
-		if ev.ChgStatus.Has(ltc4015.VinUvclActive) {
+		if s.Has(ltc4015.VinUvclActive) {
 			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "uvcl_active", TS: now})
 		}
-		if ev.ChgStatus.Has(ltc4015.ConstCurrent) {
+		if s.Has(ltc4015.ConstCurrent) {
 			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cc_phase", TS: now})
 		}
-		if ev.ChgStatus.Has(ltc4015.ConstVoltage) {
+		if s.Has(ltc4015.ConstVoltage) {
 			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cv_phase", TS: now})
 		}
-		// Re-arm: enable only edges not currently asserted.
+
 		en := baseStatusMask()
 		if cur, err := d.dev.ChargeStatus(); err == nil {
 			en &^= cur
@@ -642,7 +667,7 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 		}
 	}
 
-	// After a batch, emit a retained snapshot for consumers.
+	// ---- Snapshot after handling a batch ----
 	d.sampleAndPublish()
 }
 
