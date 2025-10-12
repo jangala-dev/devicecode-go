@@ -560,7 +560,7 @@ func (w *jsonw) begin() {
 	_ = w.r.TryWriteFrom([]byte("{"))
 }
 func (w *jsonw) end() {
-	_ = w.r.TryWriteFrom([]byte("}\r\n"))
+	_ = w.r.TryWriteFrom([]byte("}\n"))
 }
 func (w *jsonw) comma() {
 	if !w.first {
@@ -608,7 +608,7 @@ type Logger struct {
 	lineStart bool
 }
 
-var nl = [...]byte{'\r', '\n'}
+var nl = [...]byte{'\n'}
 
 // Anchor the time origin; also mark that the next write starts a new line.
 func (l *Logger) SetStart(t time.Time) { l.t0, l.lineStart = t, true }
@@ -747,7 +747,7 @@ func (l *Logger) Print(parts ...any) {
 }
 
 func (l *Logger) newline() {
-	print("\r\n")
+	print("\n")
 	if l.target != nil {
 		_ = l.target.TryWriteFrom(nl[:])
 	}
