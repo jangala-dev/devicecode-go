@@ -384,6 +384,21 @@ func main() {
 					w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
 					w.end()
 				}
+
+			case types.TemperatureValue:
+				lastTDeci = int(v.DeciC)
+				tsTemp = time.Now().UnixNano()
+				log.Deci("[value] power/temperature/internal °C=", lastTDeci)
+
+				// JSON: {"power/temperature/internal": <deciC>}
+				if uart0Tx != nil {
+					var w jsonw
+					w.r = uart0Tx
+					w.begin()
+					w.kvInt("power/temperature/internal", int(v.DeciC))
+					w.end()
+				}
+
 			}
 			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
 
