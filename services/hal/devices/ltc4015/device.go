@@ -87,7 +87,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 	// Static info payloads (retained by HAL at registration).
 	bi := types.BatteryInfo{
 		Cells:      d.params.Cells,
-		Chem:       chemStr(d.params.Chem),
+		Chem:       d.params.Chem,
 		RSNSB_uOhm: d.params.RSNSB_uOhm,
 		Bus:        d.params.Bus,
 		Addr:       addrOrDefault(d.params.Addr),
@@ -348,7 +348,7 @@ func (d *Device) configureDevice() {
 
 	// Chemistry selection
 	switch d.params.Chem {
-	case "la", "lead", "leadacid":
+	case "leadacid":
 		cfg.Chem = ltc4015.ChemLeadAcid
 	case "auto", "detect":
 		cfg.Chem = ltc4015.ChemUnknown
@@ -519,19 +519,14 @@ func (d *Device) sampleAndPublish() {
 	}
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: cv, TS: ts})
 
-	if ratio, err := d.dev.NTCRatio(); err == nil {
-		deciC, ok := ntcDeciCFromRatio(ratio, d.params.NTCBiasOhm)
-		if ok {
-			_ = d.res.Pub.Emit(core.Event{
-				Addr:    d.aTmp,
-				Payload: types.TemperatureValue{DeciC: deciC},
-				TS:      ts,
-			})
-		} else {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: "ntc_ratio_invalid"})
-		}
-	} else {
+	if ratio, err := d.dev.NTCRatio(); err != nil {
 		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: string(errcode.MapDriverErr(err))})
+	} else if deciC, ok := ntcRatioToDeciC(ratio, d.params.NTCBiasOhm, d.params.R25Ohm, d.params.BetaK); ok {
+		_ = d.res.Pub.Emit(core.Event{
+			Addr: d.aTmp, Payload: types.TemperatureValue{DeciC: deciC}, TS: ts,
+		})
+	} else {
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: "ntc_ratio_invalid"})
 	}
 }
 
@@ -760,78 +755,35 @@ func (d *Device) cleanup() {
 	d.res.Reg.ReleaseI2C(d.id, core.ResourceID(d.params.Bus))
 }
 
-// Integer LUT for 10k/3435K: R_ntc(°C) in ohms at 5°C steps, from Tmin to Tmax inclusive.
-// Tmin=-20, Tmax=100: 25 anchors. Monotonic decreasing with temperature.
-const (
-	ntcTMinC = -20
-	ntcTMaxC = 100
-)
-
-var ntcRAt5C = [...]uint32{
-	77523, 59606, 46290, 36290, 28704,
-	22897, 18410, 14916, 12171, 10000,
-	8269, 6881, 5759, 4847, 4101,
-	3488, 2981, 2559, 2207, 1912,
-	1662, 1451, 1272, 1118, 987,
-}
-
-// helper: clamp int32 to int16 range
-func clampI16(v int32) int16 {
-	if v > 32767 {
-		return 32767
-	}
-	if v < -32768 {
-		return -32768
-	}
-	return int16(v)
-}
-
-// Compute deci-°C from LTC4015 NTC_RATIO using integer math only.
-// Returns (deciC, ok). ok=false if the ratio is invalid or far outside LUT range.
-func ntcDeciCFromRatio(ratio uint16, rbiasOhm uint32) (int16, bool) {
-	// Valid 15-bit ratio: 1..21844
-	if ratio == 0 || ratio >= 21845 {
-		return 0, false
-	}
-	// R_ntc = R_bias * ratio / (21845 - ratio)  (all integer; use 64-bit intermediate)
-	denom := int64(21845 - ratio)
-	rntc := (int64(rbiasOhm) * int64(ratio)) / denom
-	if rntc <= 0 {
+// ratio(0..21845) -> deci-°C (int16). Uses RBIAS, R25, Beta from params.
+func ntcRatioToDeciC(ratio uint16, rbias, r25, beta uint32) (int16, bool) {
+	r := int64(ratio)
+	if r <= 0 || r >= 21845 {
 		return 0, false
 	}
 
-	// Locate 5°C segment: ntcRAt5C is decreasing with temperature.
-	// We want i such that R[i] >= rntc > R[i+1].
-	lo, hi := 0, len(ntcRAt5C)-1
-	if uint32(rntc) >= ntcRAt5C[0] {
-		// Colder than Tmin (very large R): clamp to Tmin
-		return clampI16(int32(ntcTMinC) * 10), true
-	}
-	if uint32(rntc) <= ntcRAt5C[hi] {
-		// Hotter than Tmax (very small R): clamp to Tmax
-		return clampI16(int32(ntcTMaxC) * 10), true
-	}
-	for hi-lo > 1 {
-		mid := (lo + hi) >> 1
-		if uint32(rntc) >= ntcRAt5C[mid] {
-			hi = mid
-		} else {
-			lo = mid
-		}
-	}
-	// Linear interpolation within the 5°C bracket (all integer).
-	// R_lo at T_lo, R_hi at T_hi (T_hi = T_lo + 5).
-	Rlo := int64(ntcRAt5C[lo])
-	Rhi := int64(ntcRAt5C[hi])
-	TloDeci := int64((ntcTMinC + lo*5) * 10) // deci-°C
-	// Since R decreases with T, fraction goes as (Rlo - Rntc)/(Rlo - Rhi)
-	num := (Rlo - rntc) * 50 // 5°C -> 50 deci-°C
-	den := (Rlo - Rhi)
-	fracDeci := int64(0)
-	if den > 0 {
-		fracDeci = num / den
-	}
-	return clampI16(int32(TloDeci + fracDeci)), true
+	// Rntc = Rbias * ratio / (21845 - ratio)   (all integers)
+	rntc := (int64(rbias) * r) / (21845 - r)
+
+	// ln(R/R25) in Q16.16
+	x_q16 := (rntc << 16) / int64(r25)
+	ln_q16 := lnQ16(x_q16)
+
+	// invT = 1/T0 + (1/β)*ln(R/R25)   in Q24.8  (keep precision on small term)
+	invBeta_q24 := int64(q24) / int64(beta)
+	invT_q24 := int64(invT0_q24) + ((ln_q16 * invBeta_q24) >> 16)
+
+	if invT_q24 <= 0 {
+		return 0, false
+	} // guard
+
+	// T[K] in Q24.8: T = 1 / invT
+	T_q24 := (int64(1) << 48) / invT_q24
+
+	// °C = K - 273.15; convert to deci-°C with rounding.
+	C_q24 := T_q24 - int64(c273_15_q24)
+	deciC := int16((C_q24*10 + (q24 / 2)) >> 24)
+	return deciC, true
 }
 
 // ---- Helpers ----
@@ -850,13 +802,38 @@ func addrOrDefault(a uint16) uint16 {
 	return a
 }
 
-func chemStr(s string) string {
-	switch s {
-	case "la", "lead", "leadacid":
-		return "leadacid"
-	case "auto", "detect":
-		return "auto"
-	default:
-		return "li"
+// ---------- fixed-point helpers (integers only) ----------
+const (
+	q16 = 1 << 16
+	q24 = 1 << 24
+
+	ln2_q16     = 45426      // round(ln(2) * 2^16)
+	invT0_q24   = 56271      // round((1/298.15 K) * 2^24)
+	c273_15_q24 = 4582696550 // round(273.15 * 2^24)
+)
+
+func divQ16(num, den int64) int64 { return (num << 16) / den }
+
+// ln(x) with x in Q16.16, result in Q16.16.
+// Range reduction x = m*2^k into m∈[0.5,2). ln(m) via 2*(z+z^3/3+z^5/5+z^7/7),
+// where z=(m-1)/(m+1).
+func lnQ16(x int64) int64 {
+	k := int64(0)
+	for x < (q16 >> 1) {
+		x <<= 1
+		k--
 	}
+	for x >= (2 * q16) {
+		x >>= 1
+		k++
+	}
+	num := x - q16
+	den := x + q16
+	z := (num << 16) / den
+	z2 := (z * z) >> 16
+	z3 := (z2 * z) >> 16
+	z5 := (z3 * z2) >> 16
+	z7 := (z5 * z2) >> 16
+	ln_m := 2 * (z + z3/3 + z5/5 + z7/7)
+	return ln_m + k*ln2_q16
 }
