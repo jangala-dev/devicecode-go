@@ -60,7 +60,7 @@ var SelectedSetup = types.HALConfig{
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
-			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3_330, RSNSI_uOhm: 1_670, Cells: 6,
+			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3_330, RSNSI_uOhm: 3_330, Cells: 6,
 			Chem: "la", SMBAlertPin: 20, VinLo_mV: 9_000, VinHi_mV: 11_000,
 			BSRHi_uOhmPerCell: 100_000,
 			DomainBattery:     "power", DomainCharger: "power", Name: "internal",
