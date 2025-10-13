@@ -340,6 +340,14 @@ func (d *Device) IChargeBSR_mA() (int32, error) {
 	return int32(uA / 1000), nil
 }
 
+func (d *Device) NTCRatio() (uint16, error) {
+	v, err := d.readWord(regNTCRatio)
+	if err != nil {
+		return 0, err
+	}
+	return v & 0x7FFF, nil // mask to 15 bits per datasheet
+}
+
 // ---------------- Effective DAC read-backs ----------------
 
 // Raw codes

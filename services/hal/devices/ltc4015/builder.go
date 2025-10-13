@@ -29,6 +29,11 @@ type Params struct {
 	BSRHi_uOhmPerCell uint32 // e.g. 100_000 to catch open battery
 	QCountPrescale    uint16 // optional; 0 => leave hardware default
 	TargetsWritable   bool   // set false if fixed-chem variant
+
+	NTCBiasOhm uint32 // top resistor; default 10_000
+	R25Ohm     uint32 // thermistor @25C; default 10_000
+	BetaK      uint32 // default 3435 (our part, 25/85C)
+
 }
 
 // Builder registration.
@@ -50,6 +55,15 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 	}
 	if p.DomainBattery == "" || p.DomainCharger == "" || p.Name == "" {
 		return nil, errcode.InvalidParams
+	}
+	if p.NTCBiasOhm == 0 {
+		p.NTCBiasOhm = 10_000
+	}
+	if p.R25Ohm == 0 {
+		p.R25Ohm = 10_000
+	}
+	if p.BetaK == 0 {
+		p.BetaK = 3435
 	}
 
 	// Claim I2C (serialised by provider) and SMBALERT pin for input.
@@ -74,6 +88,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 		id:   in.ID,
 		aBat: core.CapAddr{Domain: domBat, Kind: string(types.KindBattery), Name: name},
 		aChg: core.CapAddr{Domain: domChg, Kind: string(types.KindCharger), Name: name},
+		aTmp: core.CapAddr{Domain: domChg, Kind: string(types.KindTemperature), Name: name},
 
 		res:  in.Res,
 		i2c:  i2c,

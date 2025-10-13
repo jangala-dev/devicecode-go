@@ -18,6 +18,7 @@ type Device struct {
 	id   string
 	aBat core.CapAddr // power/battery/<name>
 	aChg core.CapAddr // power/charger/<name>
+	aTmp core.CapAddr
 
 	res   core.Resources
 	i2c   drivers.I2C
@@ -109,6 +110,14 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Kind:   types.KindCharger,
 			Name:   d.aChg.Name,
 			Info:   types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: ci},
+		},
+		{
+			Domain: d.aTmp.Domain, Kind: types.KindTemperature, Name: d.aTmp.Name,
+			Info: types.Info{
+				SchemaVersion: 1, Driver: "ltc4015", Detail: types.TemperatureInfo{
+					Sensor: "ntc@ltc4015", Addr: addrOrDefault(d.params.Addr), Bus: d.params.Bus,
+				},
+			},
 		},
 	}
 }
@@ -509,6 +518,21 @@ func (d *Device) sampleAndPublish() {
 		cv.Sys = uint16(ss)
 	}
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: cv, TS: ts})
+
+	if ratio, err := d.dev.NTCRatio(); err == nil {
+		deciC, ok := ntcDeciCFromRatio(ratio, d.params.NTCBiasOhm)
+		if ok {
+			_ = d.res.Pub.Emit(core.Event{
+				Addr:    d.aTmp,
+				Payload: types.TemperatureValue{DeciC: deciC},
+				TS:      ts,
+			})
+		} else {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: "ntc_ratio_invalid"})
+		}
+	} else {
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: string(errcode.MapDriverErr(err))})
+	}
 }
 
 func (d *Device) serviceSMBAlertWhileLow() {
@@ -734,6 +758,80 @@ func (d *Device) cleanup() {
 	}
 	d.res.Reg.ReleasePin(d.id, d.pin)
 	d.res.Reg.ReleaseI2C(d.id, core.ResourceID(d.params.Bus))
+}
+
+// Integer LUT for 10k/3435K: R_ntc(°C) in ohms at 5°C steps, from Tmin to Tmax inclusive.
+// Tmin=-20, Tmax=100: 25 anchors. Monotonic decreasing with temperature.
+const (
+	ntcTMinC = -20
+	ntcTMaxC = 100
+)
+
+var ntcRAt5C = [...]uint32{
+	77523, 59606, 46290, 36290, 28704,
+	22897, 18410, 14916, 12171, 10000,
+	8269, 6881, 5759, 4847, 4101,
+	3488, 2981, 2559, 2207, 1912,
+	1662, 1451, 1272, 1118, 987,
+}
+
+// helper: clamp int32 to int16 range
+func clampI16(v int32) int16 {
+	if v > 32767 {
+		return 32767
+	}
+	if v < -32768 {
+		return -32768
+	}
+	return int16(v)
+}
+
+// Compute deci-°C from LTC4015 NTC_RATIO using integer math only.
+// Returns (deciC, ok). ok=false if the ratio is invalid or far outside LUT range.
+func ntcDeciCFromRatio(ratio uint16, rbiasOhm uint32) (int16, bool) {
+	// Valid 15-bit ratio: 1..21844
+	if ratio == 0 || ratio >= 21845 {
+		return 0, false
+	}
+	// R_ntc = R_bias * ratio / (21845 - ratio)  (all integer; use 64-bit intermediate)
+	denom := int64(21845 - ratio)
+	rntc := (int64(rbiasOhm) * int64(ratio)) / denom
+	if rntc <= 0 {
+		return 0, false
+	}
+
+	// Locate 5°C segment: ntcRAt5C is decreasing with temperature.
+	// We want i such that R[i] >= rntc > R[i+1].
+	lo, hi := 0, len(ntcRAt5C)-1
+	if uint32(rntc) >= ntcRAt5C[0] {
+		// Colder than Tmin (very large R): clamp to Tmin
+		return clampI16(int32(ntcTMinC) * 10), true
+	}
+	if uint32(rntc) <= ntcRAt5C[hi] {
+		// Hotter than Tmax (very small R): clamp to Tmax
+		return clampI16(int32(ntcTMaxC) * 10), true
+	}
+	for hi-lo > 1 {
+		mid := (lo + hi) >> 1
+		if uint32(rntc) >= ntcRAt5C[mid] {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	// Linear interpolation within the 5°C bracket (all integer).
+	// R_lo at T_lo, R_hi at T_hi (T_hi = T_lo + 5).
+	Rlo := int64(ntcRAt5C[lo])
+	Rhi := int64(ntcRAt5C[hi])
+	TloDeci := int64((ntcTMinC + lo*5) * 10) // deci-°C
+	// Since R decreases with T, fraction goes as (Rlo - Rntc)/(Rlo - Rhi)
+	num := (Rlo - rntc) * 50 // 5°C -> 50 deci-°C
+	den := (Rlo - Rhi)
+	fracDeci := int64(0)
+	if den > 0 {
+		fracDeci = num / den
+	}
+	return clampI16(int32(TloDeci + fracDeci)), true
 }
 
 // ---- Helpers ----
