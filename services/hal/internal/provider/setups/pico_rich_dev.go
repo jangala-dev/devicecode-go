@@ -1,4 +1,4 @@
-//go:build pico && pico_rich_dev
+//go:build (rp2040 || rp2350) && pico_rich_dev
 
 package setups
 
