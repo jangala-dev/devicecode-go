@@ -12,9 +12,11 @@ import (
 	"devicecode-go/x/strconvx"
 )
 
-// ---- thresholds & timing (VIN/VBAT/TEMP) ----
+// -----------------------------------------------------------------------------
+// Thresholds & timing
+// -----------------------------------------------------------------------------
 
-const HAL_TIMEOUT = 5 // second
+const halTimeout = 5 * time.Second
 
 // Thermal (deci-°C)
 const (
@@ -24,23 +26,31 @@ const (
 
 // Power thresholds (mV)
 const (
-	// VIN (12 V adapter)
-	PG_ON_VIN = 12000 // debounced ON threshold
-	SAG_VIN   = 10600 // brownout immediate cut
+	PG_ON_VIN = 12000
+	SAG_VIN   = 10600
 
-	// VBAT (12 V SLA)
-	PG_ON_VBAT  = 12400 // debounced ON threshold
-	PG_OFF_HYST = 800   // OFF ≈ 11.6 V via hysteresis (12400-800)
-	SAG_VBAT    = 11400 // brownout immediate cut
+	PG_ON_VBAT  = 12400
+	PG_OFF_HYST = 800
+	SAG_VBAT    = 11400
 )
 
 // Debounce and data freshness
 const (
-	DEBOUNCE_OK = 400 * time.Millisecond
-	STALE_MAX   = 3 * time.Second
+	DEBOUNCE_OK = 300 * time.Millisecond
+	STALE_MAX   = 2 * time.Second
 )
 
-// ---- topics ----
+// Supervisory cadence
+const (
+	TICK = 100 * time.Millisecond // balances debounce precision and MCU overhead
+)
+
+// LED
+const pwmTop = 4095
+
+// -----------------------------------------------------------------------------
+// Topics
+// -----------------------------------------------------------------------------
 
 // HAL
 var halReadiness = bus.T("hal", "state")
@@ -69,16 +79,6 @@ func tSwitch(name string) bus.Topic {
 	return bus.T("hal", "cap", "power", string(types.KindSwitch), name, "control", "set")
 }
 
-var powerSeq = []RailStep{
-	{Name: "mpcie-usb", GapBefore: 200 * time.Millisecond},
-	{Name: "m2", GapBefore: 200 * time.Millisecond},
-	{Name: "mpcie", GapBefore: 200 * time.Millisecond},
-	{Name: "cm5", GapBefore: 200 * time.Millisecond},
-	{Name: "fan", GapBefore: 200 * time.Millisecond},
-	// Larger gap specifically before boost:
-	{Name: "boost-load", GapBefore: 500 * time.Millisecond},
-}
-
 // UART sessions
 func tSessOpen(name string) bus.Topic {
 	return bus.T("hal", "cap", "io", "serial", name, "control", "session_open")
@@ -90,8 +90,359 @@ func tSessClosed(name string) bus.Topic {
 	return bus.T("hal", "cap", "io", "serial", name, "event", "session_closed")
 }
 
+// -----------------------------------------------------------------------------
+// Rail order (pre-gap semantics)
+// -----------------------------------------------------------------------------
+
+type RailStep struct {
+	Name      string
+	GapBefore time.Duration // enforced before operating this rail
+}
+
+var powerSeq = []RailStep{
+	{Name: "mpcie-usb", GapBefore: 200 * time.Millisecond},
+	{Name: "m2", GapBefore: 200 * time.Millisecond},
+	{Name: "mpcie", GapBefore: 200 * time.Millisecond},
+	{Name: "cm5", GapBefore: 200 * time.Millisecond},
+	{Name: "fan", GapBefore: 200 * time.Millisecond},
+	{Name: "boost-load", GapBefore: 500 * time.Millisecond},
+}
+
+// -----------------------------------------------------------------------------
+// Reactor state machine (single goroutine)
+// -----------------------------------------------------------------------------
+
+type railsState int
+
+const (
+	stateOff railsState = iota
+	stateUpSeq
+	stateOn
+	stateDownSeq
+)
+
+type Reactor struct {
+	ui *bus.Connection
+
+	// UART
+	uart0Tx *shmring.Ring // telemetry (JSON to UART0)
+	// Logger UART1 already handled by global logger (see SetUART1)
+
+	// inputs (latest)
+	vin_mV, vbat_mV int32
+	iin_mA, ibat_mA int32
+	lastTDeci       int
+	tsVIN, tsVBAT   time.Time
+	tsTemp          time.Time
+
+	// derived latches
+	vbatGood bool // VBAT hysteresis
+	otActive bool // over-temp latch (forces down until recovered)
+
+	// debounce
+	pgSince  time.Time
+	pgStable bool
+
+	// rails / sequencing
+	state         railsState
+	seqIdx        int       // index into powerSeq for next action
+	seqOnCount    int       // number of rails currently ON
+	nextActionDue time.Time // when next rail operation may run
+
+	// LED
+	ledSteady bool
+	levelUp   bool
+	ledTick   int // throttles breathe commands
+
+	// misc
+	now time.Time
+
+	// telemetry drops counters
+	droppedUART0 int
+}
+
+func NewReactor(ui *bus.Connection) *Reactor {
+	return &Reactor{
+		ui:      ui,
+		levelUp: true,
+		state:   stateOff,
+		now:     time.Now(),
+	}
+}
+
+// ---- freshness and decisions ----
+
+func (r *Reactor) freshVIN() bool { return !r.tsVIN.IsZero() && r.now.Sub(r.tsVIN) <= STALE_MAX }
+func (r *Reactor) freshBAT() bool { return !r.tsVBAT.IsZero() && r.now.Sub(r.tsVBAT) <= STALE_MAX }
+func (r *Reactor) freshTMP() bool { return !r.tsTemp.IsZero() && r.now.Sub(r.tsTemp) <= STALE_MAX }
+
+func (r *Reactor) supplyPG() bool {
+	// Supply PG for turning on: VIN fresh ≥ PG_ON_VIN OR VBAT hysteresis true.
+	return (r.freshVIN() && int(r.vin_mV) >= PG_ON_VIN) || r.vbatGood
+}
+
+func (r *Reactor) tempOKForTurnOn() bool {
+	// Must be fresh and ≤ LIMIT - HYST
+	return r.freshTMP() && r.lastTDeci <= (TEMP_LIMIT-TEMP_HYST)
+}
+
+func (r *Reactor) mustCutNow() bool {
+	// Immediate cut if: temperature stale OR both sources bad (stale or < SAG) OR over-temp latch.
+	if !r.freshTMP() {
+		return true
+	}
+	vinOK := r.freshVIN() && int(r.vin_mV) >= SAG_VIN
+	vbatOK := r.freshBAT() && int(r.vbat_mV) >= SAG_VBAT
+	return !(vinOK || vbatOK) || r.otActive
+}
+
+func (r *Reactor) updateLatchesFromValues() {
+	// Over-temp latch
+	if r.freshTMP() {
+		if r.lastTDeci >= TEMP_LIMIT {
+			if !r.otActive {
+				log.Println("[thermal] over-temp → latch active")
+			}
+			r.otActive = true
+		} else if r.lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
+			if r.otActive {
+				log.Println("[thermal] temp recovered below hysteresis")
+			}
+			r.otActive = false
+		}
+	}
+	// VBAT hysteresis
+	if r.freshBAT() {
+		if !r.vbatGood && int(r.vbat_mV) >= PG_ON_VBAT {
+			r.vbatGood = true
+		} else if r.vbatGood && int(r.vbat_mV) < (PG_ON_VBAT-PG_OFF_HYST) {
+			r.vbatGood = false
+		}
+	} else {
+		r.vbatGood = false
+	}
+}
+
+// ---- sequencing (non-blocking) ----
+
+func (r *Reactor) startUpSeq() {
+	log.Println("[power] PG debounced + Temp OK → rails UP")
+	r.state = stateUpSeq
+	r.seqIdx = 0            // next to apply
+	r.nextActionDue = r.now // first step fires immediately
+	if r.seqOnCount < 0 {   // safety
+		r.seqOnCount = 0
+	}
+}
+
+func (r *Reactor) startDownSeq() {
+	log.Println("[power] brownout/stale/over-temp → rails DOWN")
+	r.state = stateDownSeq
+	if r.seqOnCount < 0 {
+		r.seqOnCount = 0
+	}
+	if r.seqOnCount > len(powerSeq) {
+		r.seqOnCount = len(powerSeq)
+	}
+	r.seqIdx = r.seqOnCount - 1 // start from last ON rail
+	r.nextActionDue = r.now     // first off fires immediately
+}
+
+func (r *Reactor) advanceSequenceIfDue() {
+	if r.state != stateUpSeq && r.state != stateDownSeq {
+		return
+	}
+	if r.now.Before(r.nextActionDue) {
+		return
+	}
+
+	switch r.state {
+	case stateUpSeq:
+		if r.seqIdx >= len(powerSeq) {
+			// finished: all rails are on
+			r.state = stateOn
+			r.seqOnCount = len(powerSeq)
+			return
+		}
+		step := powerSeq[r.seqIdx]
+		log.Println("[event] powering rail UP: ", step.Name)
+		r.publishSwitch(step.Name, true)
+		r.seqOnCount++
+		r.seqIdx++
+		if r.seqIdx < len(powerSeq) {
+			r.nextActionDue = r.now.Add(powerSeq[r.seqIdx].GapBefore)
+		}
+	case stateDownSeq:
+		if r.seqIdx < 0 {
+			// finished: all rails are off
+			r.state = stateOff
+			r.seqOnCount = 0
+			return
+		}
+		step := powerSeq[r.seqIdx]
+		log.Println("[event] powering rail down: ", step.Name)
+		r.publishSwitch(step.Name, false)
+		r.seqOnCount--
+		r.seqIdx--
+		if r.seqIdx >= 0 {
+			r.nextActionDue = r.now.Add(powerSeq[r.seqIdx].GapBefore)
+		}
+	}
+}
+
+func (r *Reactor) publishSwitch(name string, on bool) {
+	r.ui.Publish(r.ui.NewMessage(tSwitch(name), types.SwitchSet{On: on}, false))
+}
+
+// ---- state transitions (with symmetric reversal) ----
+
+func (r *Reactor) stepFSM() {
+	r.updateLatchesFromValues()
+
+	switch r.state {
+	case stateOff, stateDownSeq:
+		// Evaluate PG/thermal with debounce
+		if !r.otActive && r.supplyPG() && r.tempOKForTurnOn() {
+			if r.pgSince.IsZero() {
+				r.pgSince = r.now
+				r.pgStable = false
+			} else if !r.pgStable && r.now.Sub(r.pgSince) >= DEBOUNCE_OK {
+				r.pgStable = true
+			}
+		} else {
+			r.pgSince = time.Time{}
+			r.pgStable = false
+		}
+
+		// If actively powering down and inputs become stably good, reverse.
+		if r.state == stateDownSeq && r.pgStable {
+			log.Println("[power] inputs stably good → reverse to UP sequence")
+			r.startUpSeq()
+			return
+		}
+		if r.state == stateOff && r.pgStable {
+			r.startUpSeq()
+			return
+		}
+
+	case stateUpSeq, stateOn:
+		if r.mustCutNow() {
+			r.startDownSeq()
+			return
+		}
+	}
+}
+
+// ---- LED policy tied to rails state ----
+
+func (r *Reactor) stepLED() {
+	switch r.state {
+	case stateOn:
+		r.ledTick = 0
+		if !r.ledSteady {
+			r.ui.Publish(r.ui.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
+			r.ledSteady = true
+		}
+	default:
+		r.ledSteady = false
+		r.ledTick++
+		if r.ledTick%10 == 0 { // 4 * 250 ms = 1 s
+			var target uint16
+			if r.levelUp {
+				target = pwmTop
+			} else {
+				target = 0
+			}
+			r.levelUp = !r.levelUp
+			r.ui.Publish(r.ui.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
+		}
+	}
+}
+
+// ---- public input updaters (emit telemetry) ----
+
+func (r *Reactor) OnCharger(v types.ChargerValue) {
+	r.vin_mV = v.VIN_mV
+	r.iin_mA = v.IIn_mA
+	r.tsVIN = r.now
+
+	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
+	if r.uart0Tx != nil {
+		var w jsonw
+		w.r = r.uart0Tx
+		w.begin()
+		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
+		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
+		w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
+		w.end()
+	}
+}
+
+func (r *Reactor) OnBattery(v types.BatteryValue) {
+	r.vbat_mV = v.PackMilliV
+	r.ibat_mA = v.IBatMilliA
+	r.tsVBAT = r.now
+
+	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
+	if r.uart0Tx != nil {
+		var w jsonw
+		w.r = r.uart0Tx
+		w.begin()
+		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
+		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
+		w.end()
+	}
+}
+
+func (r *Reactor) OnTempDeciC(deci int) {
+	r.lastTDeci = deci
+	r.tsTemp = r.now
+
+	log.Deci("[value] env/temperature/core °C=", r.lastTDeci)
+
+	// JSON: {"env/temperature/core": <deciC>}
+	if r.uart0Tx != nil {
+		var w jsonw
+		w.r = r.uart0Tx
+		w.begin()
+		w.kvInt("env/temperature/core", deci)
+		w.end()
+	}
+}
+
+// ---- memory snapshot telemetry (every ~2 s in main loop) ----
+
+func (r *Reactor) emitMemSnapshot() {
+	var ms runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&ms)
+	// log line
+	log.Println(
+		"[mem] ",
+		"alloc:", int(ms.Alloc), " ",
+		"heapSys:", int(ms.HeapSys), " ",
+		"mallocs:", int(ms.Mallocs), " ",
+		"frees:", int(ms.Frees),
+	)
+	// JSON (minimal to keep overhead low)
+	if r.uart0Tx != nil {
+		var w jsonw
+		w.r = r.uart0Tx
+		w.begin()
+		w.kvInt("sys/mem/alloc", int(ms.Alloc))
+		w.end()
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+
 func main() {
+	// Allow early USB/console settle if needed
 	time.Sleep(3 * time.Second)
+	log.SetStart(time.Now())
+
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
@@ -100,12 +451,10 @@ func main() {
 	uiConn := b.NewConnection("ui")
 
 	log.Println("[main] starting hal.Run …")
-
-	// Start HAL
 	go hal.Run(ctx, halConn)
 
 	// Wait for retained hal/state=ready (or time out)
-	if !waitHALReady(ctx, halConn, HAL_TIMEOUT*time.Second) {
+	if !waitHALReady(ctx, halConn, halTimeout) {
 		for {
 			log.Println("[main] HAL not ready within timeout")
 			time.Sleep(2 * time.Second)
@@ -119,9 +468,6 @@ func main() {
 	valSub := uiConn.Subscribe(valTopic)
 	stSub := uiConn.Subscribe(stTopic)
 	evSub := uiConn.Subscribe(evTopic)
-	valCh := valSub.Channel()
-	stCh := stSub.Channel()
-	evCh := evSub.Channel()
 
 	// UART sessions (TX only needed for our use)
 	const (
@@ -137,50 +483,24 @@ func main() {
 	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
-	// State (PG + env + power + UART rings)
-	var (
-		// UART TX rings
-		uart0Tx *shmring.Ring // telemetry (JSON to UART0)
+	// Retry back-off guards
+	var retryTeleAt, retryLogAt time.Time
 
-		// env
-		lastTDeci int
-		tsTemp    int64
+	// Reactor
+	r := NewReactor(uiConn)
 
-		// power
-		lastVIN  int32
-		lastVBAT int32
-		tsVIN    int64
-		tsVBAT   int64
-		lastIIn  int32
-		lastIBat int32
-		haveIIn  bool
-		haveIBat bool
+	// Supervisory ticker
+	ticker := time.NewTicker(TICK)
+	defer ticker.Stop()
+	memTick := 0
 
-		// rails & PG tracking
-		pgSince   time.Time
-		pgStable  bool
-		railsUp   bool
-		vbatGood  bool // hysteresis latch for VBAT path
-		ledSteady bool // steady when railsUp
-
-		// thermal latch
-		otActive bool
-	)
-
-	// Single ticker does: LED control, mem stats, PG/TEMP check
-	rampTicker := time.NewTicker(2 * time.Second)
-	defer rampTicker.Stop()
-	const pwmTop = 4095
-	levelUp := true // for breathe mode only (railsDown)
-
-	log.Println("[main] entering loop (LED/mem/PG/TEMP tick; env/power prints; UART0 streaming JSON; UART1 logs) …")
-
+	log.Println("[main] entering reactor loop …")
 	for {
 		select {
 		// ---- UART session opened/closed ----
 		case m := <-subSessOpenTele.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				uart0Tx = shmring.Get(shmring.Handle(ev.TXHandle))
+				r.uart0Tx = shmring.Get(shmring.Handle(ev.TXHandle))
 				log.Println("[uart0] telemetry session opened")
 			}
 		case m := <-subSessOpenLog.Channel():
@@ -189,246 +509,112 @@ func main() {
 				log.Println("[uart1] log session opened")
 			}
 		case <-subSessClosedTele.Channel():
-			uart0Tx = nil
+			r.uart0Tx = nil
 			log.Println("[uart0] telemetry session closed")
-			// Auto-reopen
-			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+			// Auto-reopen with back-off
+			if time.Now().After(retryTeleAt) {
+				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+				retryTeleAt = time.Now().Add(2 * time.Second)
+			}
 		case <-subSessClosedLog.Channel():
 			log.SetUART1(nil)
 			log.Println("[uart1] log session closed")
-			// Auto-reopen
-			uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+			// Auto-reopen with back-off
+			if time.Now().After(retryLogAt) {
+				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+				retryLogAt = time.Now().Add(2 * time.Second)
+			}
 
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
-				lastTDeci = int(v.DeciC)
-				tsTemp = time.Now().UnixNano()
-				log.Deci("[value] env/temperature/core °C=", lastTDeci)
-
-				// JSON: {"env/temperature/core": <deciC>}
-				if uart0Tx != nil {
-					var w jsonw
-					w.r = uart0Tx
-					w.begin()
-					w.kvInt("env/temperature/core", int(v.DeciC))
-					w.end()
-				}
+				r.now = time.Now()
+				r.OnTempDeciC(int(v.DeciC))
 			}
-
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-
-				// JSON: {"env/humidity/core": <RHx100>}
-				if uart0Tx != nil {
+				// JSON
+				if r.uart0Tx != nil {
 					var w jsonw
-					w.r = uart0Tx
+					w.r = r.uart0Tx
 					w.begin()
 					w.kvInt("env/humidity/core", int(v.RHx100))
 					w.end()
 				}
 			}
 
-		// ---- LED + mem + PG/TEMP (one ticker) ----
-		case <-rampTicker.C:
-			// LED behaviour tied to railsUp:
-			// - railsUp => steady ON (send Set once when it flips up)
-			// - railsDown => breathe (alternate ramp up/down each tick)
-			if railsUp {
-				if !ledSteady {
-					uiConn.Publish(uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
-					ledSteady = true
-				}
-			} else {
-				ledSteady = false
-				var target uint16
-				if levelUp {
-					target = pwmTop
-				} else {
-					target = 0
-				}
-				levelUp = !levelUp
-				uiConn.Publish(uiConn.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
-			}
-
-			// Memory stats
-			runtime.GC()
-			printMem()
-
-			// JSON memory snapshot: { "sys/mem/mallocs":..,}
-			if uart0Tx != nil {
-				var ms runtime.MemStats
-				runtime.ReadMemStats(&ms)
-				var w jsonw
-				w.r = uart0Tx
-				w.begin()
-				w.kvInt("sys/mem/alloc", int(ms.Alloc))
-				w.end()
-			}
-
-			// ---- Freshness
-			now := time.Now()
-			freshVIN := tsVIN != 0 && now.Sub(time.Unix(0, tsVIN)) <= STALE_MAX
-			freshBAT := tsVBAT != 0 && now.Sub(time.Unix(0, tsVBAT)) <= STALE_MAX
-			freshTMP := tsTemp != 0 && now.Sub(time.Unix(0, tsTemp)) <= STALE_MAX
-
-			// ---- Temperature: over-limit latch
-			if freshTMP {
-				if lastTDeci >= TEMP_LIMIT {
-					if !otActive {
-						otActive = true
-						log.Println("[thermal] over-temp → rails DOWN")
-						if railsUp {
-							seqDown(uiConn)
-							railsUp = false
-						}
-					}
-				} else if lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
-					if otActive {
-						log.Println("[thermal] temp recovered below hysteresis")
-					}
-					otActive = false
-				}
-			}
-
-			// ---- Temperature: STALE ⇒ immediate rails down
-			if !freshTMP && railsUp {
-				log.Println("[thermal] temperature stale → rails DOWN")
-				seqDown(uiConn)
-				railsUp = false
-				pgStable = false
-				pgSince = time.Time{}
-			}
-
-			// ---- VBAT hysteresis latch for PG
-			if freshBAT {
-				if !vbatGood && lastVBAT >= PG_ON_VBAT {
-					vbatGood = true
-				} else if vbatGood && lastVBAT < (PG_ON_VBAT-PG_OFF_HYST) {
-					vbatGood = false
-				}
-			} else {
-				vbatGood = false // stale VBAT cannot count as good
-			}
-
-			// ---- Brownout immediate cut (only if rails are up)
-			// A source is OK only if it is fresh AND above SAG.
-			if railsUp {
-				vinOK := freshVIN && lastVIN >= SAG_VIN
-				vbatOK := freshBAT && lastVBAT >= SAG_VBAT
-				if !(vinOK || vbatOK) {
-					log.Println("[power] brownout or stale on all sources → rails DOWN")
-					seqDown(uiConn)
-					railsUp = false
-					pgStable = false
-					pgSince = time.Time{}
-				}
-			}
-
-			// ---- Power-good decision (debounced turn-on)
-			// 1) Supply PG: VIN fresh ≥ PG_ON_VIN OR VBAT hysteresis latch is set.
-			pgPG := (freshVIN && lastVIN >= PG_ON_VIN) || vbatGood
-
-			// 2) Temperature gate to *turn on*: must be fresh AND below (LIMIT - HYST).
-			tempOK := freshTMP && lastTDeci <= (TEMP_LIMIT-TEMP_HYST)
-
-			if pgPG && tempOK {
-				if pgSince.IsZero() {
-					pgSince = now
-				} else if !pgStable && now.Sub(pgSince) >= DEBOUNCE_OK {
-					pgStable = true
-					if !railsUp {
-						log.Println("[power] PG debounced + Temp OK → rails UP")
-						seqUp(uiConn)
-						railsUp = true
-					}
-				}
-			} else {
-				pgStable = false
-				pgSince = time.Time{}
-			}
-
 		// ---- Power values / status / events ----
-		case m := <-valCh:
+		case m := <-valSub.Channel():
+			r.now = time.Now()
 			switch v := m.Payload.(type) {
 			case types.BatteryValue:
-				lastVBAT = v.PackMilliV
-				tsVBAT = time.Now().UnixNano()
-				lastIBat = v.IBatMilliA
-				haveIBat = true
-
-				// JSON: {"power/battery/internal/VBAT":..,"power/battery/internal/IBAT":..}
-				if uart0Tx != nil {
-					var w jsonw
-					w.r = uart0Tx
-					w.begin()
-					w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
-					w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
-					w.end()
-				}
-
+				r.OnBattery(v)
+				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.ChargerValue:
-				lastVIN = v.VIN_mV
-				tsVIN = time.Now().UnixNano()
-				lastIIn = v.IIn_mA
-				haveIIn = true
-
-				// JSON: {"power/charger/internal/VIN":..,"power/charger/internal/VSYS":..,"power/charger/internal/IIN":..}
-				if uart0Tx != nil {
-					var w jsonw
-					w.r = uart0Tx
-					w.begin()
-					w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
-					w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
-					w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
-					w.end()
-				}
-
+				r.OnCharger(v)
+				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.TemperatureValue:
-				lastTDeci = int(v.DeciC)
-				tsTemp = time.Now().UnixNano()
-				log.Deci("[value] power/temperature/internal °C=", lastTDeci)
-
-				// JSON: {"power/temperature/internal": <deciC>}
-				if uart0Tx != nil {
+				r.OnTempDeciC(int(v.DeciC))
+				// also printed as power temperature if needed
+				log.Deci("[value] power/temperature/internal °C=", int(v.DeciC))
+				if r.uart0Tx != nil {
 					var w jsonw
-					w.r = uart0Tx
+					w.r = r.uart0Tx
 					w.begin()
 					w.kvInt("power/temperature/internal", int(v.DeciC))
 					w.end()
 				}
-
 			}
-			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
 
-		case m := <-stCh:
+		case m := <-stSub.Channel():
 			printCapStatus(m)
 
-		case m := <-evCh:
+		case m := <-evSub.Channel():
 			printCapEvent(m)
-
 			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
-			if uart0Tx != nil {
+			if r.uart0Tx != nil {
 				dom, _ := m.Topic.At(2).(string)
 				kind, _ := m.Topic.At(3).(string)
 				name, _ := m.Topic.At(4).(string)
 				tag, _ := m.Topic.At(6).(string)
-
-				var w jsonw
-				w.r = uart0Tx
-				w.begin()
-				w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
-				w.end()
+				if dom != "" && kind != "" && name != "" && tag != "" {
+					var w jsonw
+					w.r = r.uart0Tx
+					w.begin()
+					w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
+					w.end()
+				}
 			}
 
+		// ---- Supervisory tick ----
+		case <-ticker.C:
+			r.now = time.Now()
+
+			// 1) Run FSM (includes symmetric reversal)
+			r.stepFSM()
+
+			// 2) Advance sequencing steps if due
+			r.advanceSequenceIfDue()
+
+			// 3) LED behaviour
+			r.stepLED()
+
+			// 4) Periodic memory snapshot (~2 s)
+			memTick++
+			if memTick%30 == 0 { // 8 * 250 ms = 2 s
+				r.emitMemSnapshot()
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// ---- HAL readiness helper (uses retained state) ----
+// -----------------------------------------------------------------------------
+// HAL readiness helper (retained)
+// -----------------------------------------------------------------------------
+
 func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool {
 	sub := c.Subscribe(halReadiness)
 	defer c.Unsubscribe(sub)
@@ -442,53 +628,101 @@ func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool 
 			if st, ok := m.Payload.(types.HALState); ok && st.Level == "ready" {
 				return true
 			}
-			// ignore other levels (e.g. "stopped") and keep waiting
 		case <-ctx2.Done():
 			return false
 		}
 	}
 }
 
-// ----------- power rail sequencing -----------
+// -----------------------------------------------------------------------------
+// Minimal streaming JSON writer for shmring (no buffers/allocs)
+// -----------------------------------------------------------------------------
 
-type RailStep struct {
-	Name      string
-	GapBefore time.Duration // delay inserted before operating this rail
+type jsonw struct {
+	r     *shmring.Ring
+	first bool
 }
 
-// ---- sequencing helpers ----
-
-// seqUp powers rails in order, inserting each step's configured pre-gap.
-// The first step has no initial delay (keeps behaviour intuitive).
-func seqUp(uiConn *bus.Connection) {
-	first := true
-	for _, s := range powerSeq {
-		if !first && s.GapBefore > 0 {
-			time.Sleep(s.GapBefore)
-		}
-		log.Println("[event] ", "powering rail UP: ", s.Name)
-		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: true}, false))
-		first = false
+func (w *jsonw) begin() {
+	w.first = true
+	if w.r != nil {
+		_ = w.r.TryWriteFrom([]byte("{"))
 	}
 }
-
-// seqDown powers rails off in reverse order with the same pre-gap policy.
-func seqDown(uiConn *bus.Connection) {
-	first := true
-	for i := len(powerSeq) - 1; i >= 0; i-- {
-		s := powerSeq[i]
-		if !first && s.GapBefore > 0 {
-			time.Sleep(s.GapBefore)
-		}
-		log.Println("[event] ", "powering rail down: ", s.Name)
-		uiConn.Publish(uiConn.NewMessage(tSwitch(s.Name), types.SwitchSet{On: false}, false))
-		first = false
+func (w *jsonw) end() {
+	if w.r != nil {
+		_ = w.r.TryWriteFrom([]byte("}\n"))
 	}
 }
+func (w *jsonw) comma() {
+	if w.r == nil {
+		return
+	}
+	if !w.first {
+		_ = w.r.TryWriteFrom([]byte(","))
+	} else {
+		w.first = false
+	}
+}
+func (w *jsonw) key(k string) {
+	if w.r == nil {
+		return
+	}
+	_ = w.r.TryWriteFrom([]byte(`"`))
+	_ = w.r.TryWriteFrom([]byte(k))
+	_ = w.r.TryWriteFrom([]byte(`":`))
+}
+func (w *jsonw) kvInt(k string, v int) {
+	w.comma()
+	w.key(k)
+	if w.r != nil {
+		_ = w.r.TryWriteFrom([]byte(strconvx.Itoa(v)))
+	}
+}
+func (w *jsonw) kvStr(k, s string) {
+	w.comma()
+	w.key(k)
+	if w.r == nil {
+		return
+	}
+	_ = w.r.TryWriteFrom([]byte(`"`))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\\', '"':
+			_ = w.r.TryWriteFrom([]byte{'\\', c})
+		case '\b':
+			_ = w.r.TryWriteFrom([]byte{'\\', 'b'})
+		case '\f':
+			_ = w.r.TryWriteFrom([]byte{'\\', 'f'})
+		case '\n':
+			_ = w.r.TryWriteFrom([]byte{'\\', 'n'})
+		case '\r':
+			_ = w.r.TryWriteFrom([]byte{'\\', 'r'})
+		case '\t':
+			_ = w.r.TryWriteFrom([]byte{'\\', 't'})
+		default:
+			if c < 0x20 {
+				// \u00XX escape for other controls
+				var buf [6]byte
+				buf[0], buf[1], buf[2], buf[3] = '\\', 'u', '0', '0'
+				hex := "0123456789abcdef"
+				buf[4] = hex[c>>4]
+				buf[5] = hex[c&0xF]
+				_ = w.r.TryWriteFrom(buf[:])
+			} else {
+				_ = w.r.TryWriteFrom([]byte{c})
+			}
+		}
+	}
+	_ = w.r.TryWriteFrom([]byte(`"`))
+}
 
-// ----------- printing helpers (all via Logger) -----------
+// -----------------------------------------------------------------------------
+// Printing helpers (via Logger)
+// -----------------------------------------------------------------------------
 
-func printCapValue(m *bus.Message, lastIIn *int32, haveIIn *bool, lastIBat *int32, haveIBat *bool) {
+func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *bool) {
 	// hal/cap/<domain>/<kind>/<name>/value
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
@@ -498,22 +732,23 @@ func printCapValue(m *bus.Message, lastIIn *int32, haveIIn *bool, lastIBat *int3
 	case types.BatteryValue:
 		log.Print("[value] ", dom, "/", kind, "/", name,
 			" | VBAT=", int(v.PackMilliV), "mV per=", int(v.PerCellMilliV), "mV | IBAT=", int(v.IBatMilliA), "mA")
-		*lastIBat = v.IBatMilliA
-		*haveIBat = true
-		if *haveIIn && *haveIBat {
-			isys := *lastIIn - *lastIBat
+		if lastIBat != nil {
+			*lastIBat = v.IBatMilliA
+		}
+		if lastIIn != nil {
+			isys := *lastIIn - v.IBatMilliA
 			log.Print(" | ISYS≈", int(isys), "mA")
 		}
 		log.Println()
-
 	case types.ChargerValue:
 		log.Print("[value] ", dom, "/", kind, "/", name,
 			" | VIN=", int(v.VIN_mV), "mV | VSYS=", int(v.VSYS_mV), "mV | IIN=", int(v.IIn_mA), "mA")
-		*lastIIn = v.IIn_mA
-		*haveIIn = true
-		if *haveIIn && *haveIBat {
-			isys := *lastIIn - *lastIBat
-			log.Print(" | ISYS≈", int(isys), "mA")
+		if lastIIn != nil {
+			*lastIIn = v.IIn_mA
+			if lastIBat != nil {
+				isys := *lastIIn - *lastIBat
+				log.Print(" | ISYS≈", int(isys), "mA")
+			}
 		}
 		log.Println()
 	default:
@@ -539,7 +774,7 @@ func printCapStatus(m *bus.Message) {
 		log.Println(
 			"[link] ", dom, "/", kind, "/", name,
 			" | link=", string(sVal.Link),
-			" ts=", strconvx.Itoa64(sVal.TS), // note: cast to int for Logger's Itoa
+			" ts=", strconvx.Itoa64(sVal.TS),
 		)
 	}
 }
@@ -562,60 +797,8 @@ func printCapEvent(m *bus.Message) {
 }
 
 // -----------------------------------------------------------------------------
-// Minimal streaming JSON writer for shmring (no buffers/allocs)
+// Logger (mirrors to USB console and optionally uart1). No heap churn.
 // -----------------------------------------------------------------------------
-
-type jsonw struct {
-	r     *shmring.Ring
-	first bool
-}
-
-func (w *jsonw) begin() {
-	w.first = true
-	_ = w.r.TryWriteFrom([]byte("{"))
-}
-func (w *jsonw) end() {
-	_ = w.r.TryWriteFrom([]byte("}\n"))
-}
-func (w *jsonw) comma() {
-	if !w.first {
-		_ = w.r.TryWriteFrom([]byte(","))
-	} else {
-		w.first = false
-	}
-}
-func (w *jsonw) key(k string) {
-	_ = w.r.TryWriteFrom([]byte(`"`))
-	_ = w.r.TryWriteFrom([]byte(k))
-	_ = w.r.TryWriteFrom([]byte(`":`))
-}
-func (w *jsonw) kvInt(k string, v int) {
-	w.comma()
-	w.key(k)
-	_ = w.r.TryWriteFrom([]byte(strconvx.Itoa(v)))
-}
-func (w *jsonw) kvStr(k, s string) {
-	w.comma()
-	w.key(k)
-	_ = w.r.TryWriteFrom([]byte(`"`))
-	// very small escape: replace \ and "
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\\' || c == '"' {
-			_ = w.r.TryWriteFrom([]byte{'\\', c})
-		} else {
-			_ = w.r.TryWriteFrom([]byte{c})
-		}
-	}
-	_ = w.r.TryWriteFrom([]byte(`"`))
-}
-
-// -----------------------------------------------------------------------------
-// Logger: mirrors every message to USB console and (optionally) uart1.
-// No append; emits parts directly. Supports strings, []byte, ints and bools.
-// -----------------------------------------------------------------------------
-
-// ---- Logger with hh.hh prefix per line -------------------------------------
 
 type Logger struct {
 	target    *shmring.Ring
@@ -625,9 +808,7 @@ type Logger struct {
 
 var nl = [...]byte{'\n'}
 
-// Anchor the time origin; also mark that the next write starts a new line.
-func (l *Logger) SetStart(t time.Time) { l.t0, l.lineStart = t, true }
-
+func (l *Logger) SetStart(t time.Time)     { l.t0, l.lineStart = t, true }
 func (l *Logger) SetUART1(r *shmring.Ring) { l.target = r }
 
 func (l *Logger) writeString(s string) {
@@ -639,7 +820,6 @@ func (l *Logger) writeString(s string) {
 		}
 	}
 }
-
 func (l *Logger) writeBytes(b []byte) {
 	if len(b) == 0 {
 		return
@@ -650,14 +830,11 @@ func (l *Logger) writeBytes(b []byte) {
 		_ = l.target.TryWriteFrom(b)
 	}
 }
-
-// Called at the first output of each line; emits "sss.mmm ".
 func (l *Logger) writePrefixIfLineStart() {
 	if !l.lineStart {
 		return
 	}
 	l.lineStart = false
-
 	if l.t0.IsZero() {
 		l.t0 = time.Now()
 	}
@@ -684,14 +861,12 @@ func (l *Logger) writePrefixIfLineStart() {
 		n += writeDec(buf[:], n, secs)
 		buf[n] = '.'
 		n++
-		n += writeDecPad3(buf[:], n, ms) // zero-padded to 3 digits
+		n += writeDecPad3(buf[:], n, ms)
 		buf[n] = ' '
 		n++
 		_ = l.target.TryWriteFrom(buf[:n])
 	}
 }
-
-// Writes v (0..999) as exactly three digits into dst at off. Returns 3.
 func writeDecPad3(dst []byte, off int, v int) int {
 	if v < 0 {
 		v = 0
@@ -703,9 +878,6 @@ func writeDecPad3(dst []byte, off int, v int) int {
 	dst[off+2] = byte('0' + v%10)
 	return 3
 }
-
-// Decimal writer: appends v into dst at off, returns bytes written.
-// Avoids fmt/strconv allocations; v >= 0.
 func writeDec(dst []byte, off int, v int) int {
 	if v == 0 {
 		dst[off] = '0'
@@ -725,7 +897,6 @@ func writeDec(dst []byte, off int, v int) int {
 	}
 	return i - off
 }
-
 func (l *Logger) writePart(v any) {
 	switch x := v.(type) {
 	case string:
@@ -754,13 +925,11 @@ func (l *Logger) writePart(v any) {
 		l.writeString("?")
 	}
 }
-
 func (l *Logger) Print(parts ...any) {
 	for i := range parts {
 		l.writePart(parts[i])
 	}
 }
-
 func (l *Logger) newline() {
 	print("\n")
 	if l.target != nil {
@@ -768,10 +937,8 @@ func (l *Logger) newline() {
 	}
 	l.lineStart = true
 }
-
 func (l *Logger) Println(parts ...any) { l.Print(parts...); l.newline() }
 
-// Fixed-point helpers
 func (l *Logger) Deci(label string, deci int) {
 	l.writePrefixIfLineStart()
 	if deci < 0 {
@@ -785,7 +952,6 @@ func (l *Logger) Deci(label string, deci int) {
 	frac := deci % 10
 	l.Println(strconvx.Itoa(whole), ".", strconvx.Itoa(frac))
 }
-
 func (l *Logger) Hundredths(label string, hx100 int) {
 	l.writePrefixIfLineStart()
 	if hx100 < 0 {
@@ -800,18 +966,5 @@ func (l *Logger) Hundredths(label string, hx100 int) {
 	}
 }
 
-// Global instance; ensure first line is prefixed.
+// Global logger instance
 var log = Logger{lineStart: true}
-
-// ---- TinyGo runtime memory snapshot ----
-func printMem() {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	log.Println(
-		"[mem] ",
-		"alloc:", int(ms.Alloc), " ",
-		"heapSys:", int(ms.HeapSys), " ",
-		"mallocs:", int(ms.Mallocs), " ",
-		"frees:", int(ms.Frees),
-	)
-}
