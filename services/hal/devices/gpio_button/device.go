@@ -38,7 +38,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	d.a = core.CapAddr{Domain: d.dom, Kind: string(types.KindButton), Name: d.name}
+	d.a = core.CapAddr{Domain: d.dom, Kind: types.KindButton, Name: d.name}
 
 	// Publish initial value.
 	lvl := d.gpio.Get()
@@ -87,7 +87,7 @@ func (d *Device) edgeLoop() {
 		if pressed {
 			tag = "pressed"
 		}
-		_ = d.pub.Emit(core.Event{Addr: d.a, IsEvent: true, EventTag: tag, TS: ev.TS})
+		_ = d.pub.Emit(core.Event{Addr: d.a, EventTag: tag, TS: ev.TS})
 		_ = d.pub.Emit(core.Event{Addr: d.a, Payload: types.ButtonValue{Pressed: pressed}, TS: ev.TS})
 	}
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"container/heap"
 	"context"
+	"devicecode-go/types"
 	"math/rand"
 	"sync"
 	"time"
@@ -10,15 +11,17 @@ import (
 
 type PollReq struct {
 	Domain string
-	Kind   string
+	Kind   types.Kind
 	Name   string
 	Verb   string
 	Every  time.Duration
 }
 
 type pollKey struct {
-	d, k, n string
-	verb    string
+	d    string
+	k    types.Kind
+	n    string
+	verb string
 }
 
 type pollItem struct {
@@ -71,7 +74,7 @@ func NewPoller(out chan<- PollReq) *Poller {
 // Upsert adds or updates a schedule.
 // The first fire occurs after interval plus a random jitter in [0..jitter].
 // Jitter is also applied on each subsequent re-arm.
-func (p *Poller) Upsert(d, k, n, verb string, interval, jitter time.Duration) {
+func (p *Poller) Upsert(d string, k types.Kind, n, verb string, interval, jitter time.Duration) {
 	if interval <= 0 || verb == "" {
 		return
 	}
@@ -104,7 +107,7 @@ func (p *Poller) Upsert(d, k, n, verb string, interval, jitter time.Duration) {
 	p.wakeup()
 }
 
-func (p *Poller) Stop(d, k, n, verb string) {
+func (p *Poller) Stop(d string, k types.Kind, n, verb string) {
 	key := pollKey{d: d, k: k, n: n, verb: verb}
 	p.mu.Lock()
 	if it := p.items[key]; it != nil {
@@ -115,7 +118,7 @@ func (p *Poller) Stop(d, k, n, verb string) {
 	p.wakeup()
 }
 
-func (p *Poller) BumpAfter(d, k, n, verb string, lastEmitNs int64) {
+func (p *Poller) BumpAfter(d string, k types.Kind, n, verb string, lastEmitNs int64) {
 	key := pollKey{d: d, k: k, n: n, verb: verb}
 	now := time.Now()
 	p.mu.Lock()

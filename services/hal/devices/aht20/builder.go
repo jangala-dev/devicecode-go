@@ -102,8 +102,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 func (d *Device) Init(ctx context.Context) error {
 	// Establish capability addresses; avoid touching the bus here.
-	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: string(types.KindTemperature), Name: d.name}
-	d.addrHum = core.CapAddr{Domain: d.dom, Kind: string(types.KindHumidity), Name: d.name}
+	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: types.KindTemperature, Name: d.name}
+	d.addrHum = core.CapAddr{Domain: d.dom, Kind: types.KindHumidity, Name: d.name}
 	// Provide the address without doing I²C; Configure() will occur on first Read.
 	d.drv.Address = d.addr
 	return nil

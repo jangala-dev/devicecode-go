@@ -1,6 +1,9 @@
 package core
 
-import "devicecode-go/bus"
+import (
+	"devicecode-go/bus"
+	"devicecode-go/types"
+)
 
 // Opaque-topic helpers
 
@@ -9,19 +12,23 @@ func T(tokens ...bus.Token) bus.Topic { return bus.T(tokens...) }
 func topicConfigHAL() bus.Topic { return T("config", "hal") }
 
 // hal/cap/<domain>/<kind>/<name>/...
-func capBase(domain, kind, name string) bus.Topic { return T("hal", "cap", domain, kind, name) }
+func capBase(domain string, kind types.Kind, name string) bus.Topic {
+	return T("hal", "cap", domain, string(kind), name)
+}
 
-func capInfo(domain, kind, name string) bus.Topic { return capBase(domain, kind, name).Append("info") }
-func capStatus(domain, kind, name string) bus.Topic {
+func capInfo(domain string, kind types.Kind, name string) bus.Topic {
+	return capBase(domain, kind, name).Append("info")
+}
+func capStatus(domain string, kind types.Kind, name string) bus.Topic {
 	return capBase(domain, kind, name).Append("status")
 }
-func capValue(domain, kind, name string) bus.Topic {
+func capValue(domain string, kind types.Kind, name string) bus.Topic {
 	return capBase(domain, kind, name).Append("value")
 }
-func capEvent(domain, kind, name string) bus.Topic {
+func capEvent(domain string, kind types.Kind, name string) bus.Topic {
 	return capBase(domain, kind, name).Append("event")
 }
-func capEventTagged(domain, kind, name, tag string) bus.Topic {
+func capEventTagged(domain string, kind types.Kind, name, tag string) bus.Topic {
 	return capEvent(domain, kind, name).Append(tag)
 }
 
@@ -38,7 +45,7 @@ func parseCapCtrl(t bus.Topic) (CapAddr, string, bool) {
 	if !(ok1 && ok2 && ok3 && ok4) {
 		return CapAddr{}, "", false
 	}
-	return CapAddr{Domain: d, Kind: k, Name: n}, v, true
+	return CapAddr{Domain: d, Kind: types.Kind(k), Name: n}, v, true
 }
 
 // hal/cap/+/+/+/control/+

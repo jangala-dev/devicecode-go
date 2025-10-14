@@ -14,7 +14,7 @@ const eventQueueLen = 32
 
 type capKey struct {
 	domain string
-	kind   string
+	kind   types.Kind
 	name   string
 }
 
@@ -98,7 +98,7 @@ func (h *HAL) Run(ctx context.Context) {
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
-				h.reply(m, false, errcode.HALNotReady, nil)
+				h.replyErr(m, errcode.HALNotReady)
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
@@ -199,84 +199,58 @@ func (h *HAL) handleControl(msg *bus.Message) {
 	// hal/cap/<domain>/<kind>/<name>/control/<verb>
 	cap, verb, ok := parseCapCtrl(msg.Topic)
 	if !ok {
-		h.reply(msg, false, errcode.InvalidTopic, nil)
+		h.replyErr(msg, errcode.InvalidTopic)
 		return
 	}
 
 	// HAL-handled verbs for polling (strictly typed payloads).
 	switch verb {
 	case "poll_start":
-		switch v := msg.Payload.(type) {
-		case types.PollStart:
-			if v.Verb == "" || v.IntervalMs == 0 {
-				h.reply(msg, false, errcode.InvalidPayload, nil)
-				return
-			}
-			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
-				time.Duration(v.IntervalMs)*time.Millisecond,
-				time.Duration(v.JitterMs)*time.Millisecond)
-			h.reply(msg, true, "", nil)
-			return
-		case *types.PollStart:
-			if v == nil || v.Verb == "" || v.IntervalMs == 0 {
-				h.reply(msg, false, errcode.InvalidPayload, nil)
-				return
-			}
-			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
-				time.Duration(v.IntervalMs)*time.Millisecond,
-				time.Duration(v.JitterMs)*time.Millisecond)
-			h.reply(msg, true, "", nil)
-			return
-		default:
-			h.reply(msg, false, errcode.InvalidPayload, nil)
+		ps, code := As[types.PollStart](msg.Payload)
+		if code != "" || ps.Verb == "" || ps.IntervalMs == 0 {
+			h.replyErr(msg, errcode.InvalidPayload)
 			return
 		}
+		h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, ps.Verb,
+			time.Duration(ps.IntervalMs)*time.Millisecond,
+			time.Duration(ps.JitterMs)*time.Millisecond)
+		h.replyOK(msg)
+		return
 	case "poll_stop":
-		verbToStop := "read"
-		switch v := msg.Payload.(type) {
-		case nil:
-			// default
-		case types.PollStop:
-			if v.Verb != "" {
-				verbToStop = v.Verb
-			}
-		case *types.PollStop:
-			if v != nil && v.Verb != "" {
-				verbToStop = v.Verb
-			}
-		default:
-			h.reply(msg, false, errcode.InvalidPayload, nil)
-			return
+		ps, _ := As[types.PollStop](msg.Payload) // zero-value allowed
+		verbToStop := ps.Verb
+		if verbToStop == "" {
+			verbToStop = "read"
 		}
 		h.poll.Stop(cap.Domain, cap.Kind, cap.Name, verbToStop)
-		h.reply(msg, true, "", nil)
+		h.replyOK(msg)
 		return
 	}
 
 	ownerID, ok := h.capIndex[capKey{domain: cap.Domain, kind: cap.Kind, name: cap.Name}]
 	if !ok {
-		h.reply(msg, false, errcode.UnknownCapability, nil)
+		h.replyErr(msg, errcode.UnknownCapability)
 		return
 	}
 	dev := h.dev[ownerID]
 	if dev == nil {
-		h.reply(msg, false, errcode.Error, nil)
+		h.replyErr(msg, errcode.Error)
 		return
 	}
 
 	res, err := dev.Control(cap, verb, msg.Payload)
 	if err != nil {
-		h.reply(msg, false, "", err)
+		h.replyErr(msg, errcode.Of(err))
 		return
 	}
 	if !msg.CanReply() {
 		return
 	}
 	if res.OK {
-		h.reply(msg, true, "", nil)
+		h.replyOK(msg)
 		return
 	}
-	h.reply(msg, false, res.Error, nil)
+	h.replyErr(msg, res.Error)
 }
 
 func (h *HAL) handleEvent(ev Event) {
@@ -288,12 +262,8 @@ func (h *HAL) handleEvent(ev Event) {
 		return
 	}
 	// 2) Success: event vs value
-	if ev.IsEvent {
-		if ev.EventTag != "" {
-			h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
-		} else {
-			h.conn.Publish(h.conn.NewMessage(capEvent(d, k, n), ev.Payload, false))
-		}
+	if ev.EventTag != "" {
+		h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
 	} else {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 		// Record last successful retained value emission for coalescing (capability-level).
@@ -321,7 +291,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 		panic(fmtx.Sprintf("[hal] capability must specify non-empty domain/kind/name: dev=%s", devID))
 	}
 	domain := cs.Domain
-	k := string(cs.Kind)
+	k := cs.Kind
 	name := cs.Name
 	// Index for control routing.
 	h.capIndex[capKey{domain: domain, kind: k, name: name}] = devID
@@ -350,7 +320,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 
 // pubStatus publishes a retained status update for a capability.
 // err=="" → LinkUp; otherwise LinkDegraded and Error is included.
-func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
+func (h *HAL) pubStatus(domain string, kind types.Kind, name string, ts int64, err string) {
 	link := types.LinkUp
 	if err != "" {
 		link = types.LinkDegraded

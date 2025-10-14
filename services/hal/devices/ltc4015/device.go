@@ -42,8 +42,8 @@ type Device struct {
 // Emit a tagged event and degraded status on both caps.
 func (d *Device) evtErrBoth(tag, code string) {
 	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: tag, TS: ts})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: tag, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag, TS: ts})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: code})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: code})
 }
@@ -51,14 +51,14 @@ func (d *Device) evtErrBoth(tag, code string) {
 // Charger-only: tagged event + degraded.
 func (d *Device) evtErrChg(tag, code string) {
 	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: tag, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag, TS: ts})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: code})
 }
 
 // Battery-only: tagged event + degraded.
 func (d *Device) evtErrBat(tag, code string) {
 	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: tag, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag, TS: ts})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: code})
 }
 
@@ -594,17 +594,17 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 		}
 		switch {
 		case mv >= hi:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "vin_connected", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_connected", TS: now})
 			d.setVinEdgeMask(d.dev, ltc4015.VINLo)
 		case mv <= lo:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "vin_disconnected", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_disconnected", TS: now})
 			d.setVinEdgeMask(d.dev, ltc4015.VINHi)
 		default:
 			d.setVinEdgeMask(d.dev, ltc4015.VINLo|ltc4015.VINHi)
 		}
 	}
 	if ev.Limit.Has(ltc4015.BSRHi) {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: "bsr_high", TS: now})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: "bsr_high", TS: now})
 	}
 
 	// ---- Charger state: faults and phase edges (events), then re-arm + clear ----
@@ -612,25 +612,25 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 		s := ev.ChgState
 		// Emit a tag for each asserted bit we care about.
 		if s.Has(ltc4015.BatMissingFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_missing", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_missing", TS: now})
 		}
 		if s.Has(ltc4015.BatShortFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_short", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_short", TS: now})
 		}
 		if s.Has(ltc4015.MaxChargeTimeFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "max_charge_time_fault", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "max_charge_time_fault", TS: now})
 		}
 		if s.Has(ltc4015.AbsorbCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "absorb", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "absorb", TS: now})
 		}
 		if s.Has(ltc4015.EqualizeCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "equalize", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "equalize", TS: now})
 		}
 		if s.Has(ltc4015.CCCVCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cccv", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cccv", TS: now})
 		}
 		if s.Has(ltc4015.Precharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "precharge", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "precharge", TS: now})
 		}
 
 		// Re-arm charger-state edges: enable only bits that are NOT currently asserted.
@@ -660,16 +660,16 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 	if ev.ChgStatus != 0 {
 		s := ev.ChgStatus
 		if s.Has(ltc4015.IinLimitActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "iin_limited", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "iin_limited", TS: now})
 		}
 		if s.Has(ltc4015.VinUvclActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "uvcl_active", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "uvcl_active", TS: now})
 		}
 		if s.Has(ltc4015.ConstCurrent) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cc_phase", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cc_phase", TS: now})
 		}
 		if s.Has(ltc4015.ConstVoltage) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cv_phase", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cv_phase", TS: now})
 		}
 
 		en := baseStatusMask()

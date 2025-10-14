@@ -79,14 +79,14 @@ func (d *Device) toLogical(phys uint16) uint16 {
 func (d *Device) Init(ctx context.Context) error {
 	if err := d.pwm.Configure(d.freq, d.top); err != nil {
 		d.pub.Emit(core.Event{
-			Addr: core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name},
+			Addr: core.CapAddr{Domain: d.dom, Kind: types.KindPWM, Name: d.name},
 			TS:   time.Now().UnixNano(),
 			Err:  string(errcode.MapDriverErr(err)),
 		})
 		return nil
 	}
 
-	d.addr = core.CapAddr{Domain: d.dom, Kind: string(types.KindPWM), Name: d.name}
+	d.addr = core.CapAddr{Domain: d.dom, Kind: types.KindPWM, Name: d.name}
 
 	// Apply initial logical level (default 0) as *physical* output.
 	initialLog := d.clamp(d.initial)
@@ -115,9 +115,9 @@ func (d *Device) Close() error {
 func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.EnqueueResult, error) {
 	switch method {
 	case "set":
-		p, ok := payload.(types.PWMSet)
-		if !ok {
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		p, code := core.As[types.PWMSet](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		logical := d.clamp(p.Level)
 		d.pwm.Set(d.toPhys(logical))
@@ -129,9 +129,9 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 		return core.EnqueueResult{OK: true}, nil
 
 	case "ramp":
-		p, ok := payload.(types.PWMRamp) // {To uint16, DurationMs uint32, Steps uint16, Mode uint8}
-		if !ok {
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		p, code := core.As[types.PWMRamp](payload) // {To, DurationMs, Steps, Mode}
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		toPhys := d.toPhys(d.clamp(p.To)) // invert target if active-low
 		started := d.pwm.Ramp(toPhys, p.DurationMs, p.Steps, core.PWMRampMode(p.Mode))

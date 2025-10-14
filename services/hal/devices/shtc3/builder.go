@@ -94,8 +94,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 // Init sets up addresses without touching the bus.
 func (d *Device) Init(ctx context.Context) error {
-	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: string(types.KindTemperature), Name: d.name}
-	d.addrHum = core.CapAddr{Domain: d.dom, Kind: string(types.KindHumidity), Name: d.name}
+	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: types.KindTemperature, Name: d.name}
+	d.addrHum = core.CapAddr{Domain: d.dom, Kind: types.KindHumidity, Name: d.name}
 	return nil
 }
 

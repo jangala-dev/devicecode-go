@@ -215,7 +215,7 @@ type PollStop struct {
 // HAL applies these at startup (and whenever a new config is applied).
 type PollSpec struct {
 	Domain     string // capability domain, e.g. "env"
-	Kind       string // capability kind,   e.g. "temperature"
+	Kind       Kind   // capability kind,   e.g. "temperature"
 	Name       string // capability name,   e.g. "core"
 	Verb       string // control verb to call, typically "read"
 	IntervalMs uint32 // >0

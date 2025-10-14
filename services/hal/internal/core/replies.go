@@ -6,25 +6,18 @@ import (
 	"devicecode-go/types"
 )
 
-// reply is a unified helper for control replies.
-func (h *HAL) reply(m *bus.Message, enqOK bool, code errcode.Code, err error) {
+func (h *HAL) replyOK(m *bus.Message) {
+	if m.CanReply() {
+		h.conn.Reply(m, types.OKReply{OK: true}, false)
+	}
+}
+
+func (h *HAL) replyErr(m *bus.Message, code errcode.Code) {
 	if !m.CanReply() {
 		return
 	}
-	if err != nil {
-		c := errcode.Of(err)
-		if c == errcode.OK {
-			c = errcode.Error
-		}
-		h.conn.Reply(m, types.ErrorReply{OK: false, Error: string(c)}, false)
-		return
-	}
-	if enqOK {
-		h.conn.Reply(m, types.OKReply{OK: true}, false)
-		return
-	}
 	if code == "" {
-		code = errcode.Busy
+		code = errcode.Error
 	}
 	h.conn.Reply(m, types.ErrorReply{OK: false, Error: string(code)}, false)
 }

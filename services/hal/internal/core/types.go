@@ -10,9 +10,9 @@ import (
 // ---- Addressing ----
 
 type CapAddr struct {
-	Domain string // e.g. "io","power","env"
-	Kind   string // e.g. "led","temperature"
-	Name   string // logical instance
+	Domain string     // e.g. "io","power","env"
+	Kind   types.Kind // e.g. "led","temperature"
+	Name   string     // logical instance
 }
 
 // ---- Capability & device model ----
@@ -62,7 +62,6 @@ type Event struct {
 	Payload  any
 	TS       int64
 	Err      string
-	IsEvent  bool
 	EventTag string
 }
 
