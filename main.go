@@ -394,18 +394,15 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 	}
 }
 
-func (r *Reactor) OnTempDeciC(deci int) {
+func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	r.lastTDeci = deci
 	r.tsTemp = r.now
-
-	log.Deci("[value] env/temperature/core °C=", r.lastTDeci)
-
-	// JSON: {"env/temperature/core": <deciC>}
+	log.Deci(label, deci)
 	if r.uart0Tx != nil {
 		var w jsonw
 		w.r = r.uart0Tx
 		w.begin()
-		w.kvInt("env/temperature/core", deci)
+		w.kvInt(jsonKey, deci)
 		w.end()
 	}
 }
@@ -529,7 +526,7 @@ func main() {
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
 				r.now = time.Now()
-				r.OnTempDeciC(int(v.DeciC))
+				r.OnTempDeciC("[value] env/temperature/core °C=", int(v.DeciC), "env/temperature/core")
 			}
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
@@ -555,16 +552,7 @@ func main() {
 				r.OnCharger(v)
 				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.TemperatureValue:
-				r.OnTempDeciC(int(v.DeciC))
-				// also printed as power temperature if needed
-				log.Deci("[value] power/temperature/internal °C=", int(v.DeciC))
-				if r.uart0Tx != nil {
-					var w jsonw
-					w.r = r.uart0Tx
-					w.begin()
-					w.kvInt("power/temperature/internal", int(v.DeciC))
-					w.end()
-				}
+				r.OnTempDeciC("[value] power/temperature/internal °C=", int(v.DeciC), "power/temperature/internal")
 			}
 
 		case m := <-stSub.Channel():

@@ -2,6 +2,7 @@ package ltc4015dev
 
 import (
 	"context"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -714,35 +715,16 @@ func (d *Device) cleanup() {
 	d.res.Reg.ReleaseI2C(d.id, core.ResourceID(d.params.Bus))
 }
 
-// ratio(0..21845) -> deci-°C (int16). Uses RBIAS, R25, Beta from params.
+// ratio(1..21844) -> deci-°C using the Beta equation.
 func ntcRatioToDeciC(ratio uint16, rbias, r25, beta uint32) (int16, bool) {
-	r := int64(ratio)
-	if r <= 0 || r >= 21845 {
+	if ratio == 0 || ratio >= 21845 || r25 == 0 || beta == 0 {
 		return 0, false
 	}
 
-	// Rntc = Rbias * ratio / (21845 - ratio)   (all integers)
-	rntc := (int64(rbias) * r) / (21845 - r)
-
-	// ln(R/R25) in Q16.16
-	x_q16 := (rntc << 16) / int64(r25)
-	ln_q16 := lnQ16(x_q16)
-
-	// invT = 1/T0 + (1/β)*ln(R/R25)   in Q24.8  (keep precision on small term)
-	invBeta_q24 := int64(q24) / int64(beta)
-	invT_q24 := int64(invT0_q24) + ((ln_q16 * invBeta_q24) >> 16)
-
-	if invT_q24 <= 0 {
-		return 0, false
-	} // guard
-
-	// T[K] in Q24.8: T = 1 / invT
-	T_q24 := (int64(1) << 48) / invT_q24
-
-	// °C = K - 273.15; convert to deci-°C with rounding.
-	C_q24 := T_q24 - int64(c273_15_q24)
-	deciC := int16((C_q24*10 + (q24 / 2)) >> 24)
-	return deciC, true
+	Rntc := float64(rbias) * float64(ratio) / float64(21845-ratio)
+	T := 1.0 / (1.0/298.15 + math.Log(Rntc/float64(r25))/float64(beta)) // kelvin
+	Cd := math.Round((T - 273.15) * 10.0)                               // deci-°C
+	return int16(Cd), true
 }
 
 // ---- Helpers ----
@@ -759,40 +741,4 @@ func addrOrDefault(a uint16) uint16 {
 		return ltc4015.AddressDefault
 	}
 	return a
-}
-
-// ---------- fixed-point helpers (integers only) ----------
-const (
-	q16 = 1 << 16
-	q24 = 1 << 24
-
-	ln2_q16     = 45426      // round(ln(2) * 2^16)
-	invT0_q24   = 56271      // round((1/298.15 K) * 2^24)
-	c273_15_q24 = 4582696550 // round(273.15 * 2^24)
-)
-
-func divQ16(num, den int64) int64 { return (num << 16) / den }
-
-// ln(x) with x in Q16.16, result in Q16.16.
-// Range reduction x = m*2^k into m∈[0.5,2). ln(m) via 2*(z+z^3/3+z^5/5+z^7/7),
-// where z=(m-1)/(m+1).
-func lnQ16(x int64) int64 {
-	k := int64(0)
-	for x < (q16 >> 1) {
-		x <<= 1
-		k--
-	}
-	for x >= (2 * q16) {
-		x >>= 1
-		k++
-	}
-	num := x - q16
-	den := x + q16
-	z := (num << 16) / den
-	z2 := (z * z) >> 16
-	z3 := (z2 * z) >> 16
-	z5 := (z3 * z2) >> 16
-	z7 := (z5 * z2) >> 16
-	ln_m := 2 * (z + z3/3 + z5/5 + z7/7)
-	return ln_m + k*ln2_q16
 }
