@@ -10,7 +10,7 @@ import (
 	"devicecode-go/x/fmtx"
 )
 
-const eventQueueLen = 32
+const eventQueueLen = 8
 
 type capKey struct {
 	domain string
@@ -54,7 +54,7 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		dev:         map[string]Device{},
 		capIndex:    map[capKey]string{},
 		evCh:        make(chan Event, eventQueueLen),
-		pollCh:      make(chan PollReq, 32),
+		pollCh:      make(chan PollReq, 8),
 		lastEmit:    make(map[capKey]int64),
 		lastDevEmit: make(map[string]int64),
 		lastStatus: make(map[capKey]struct {
@@ -248,7 +248,6 @@ func (h *HAL) handleControl(msg *bus.Message) {
 	} else {
 		h.replyErr(msg, res.Error)
 	}
-	h.replyErr(msg, res.Error)
 }
 
 func (h *HAL) handleEvent(ev Event) {
@@ -264,7 +263,7 @@ func (h *HAL) handleEvent(ev Event) {
 	if ev.EventTag != "" {
 		h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
 	} else {
-		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
+		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, false))
 		// Record last successful retained value emission for coalescing (capability-level).
 		h.lastEmit[ck] = ts
 		// Also record device-level emission time for cross-capability coalescing.
