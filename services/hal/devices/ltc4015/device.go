@@ -181,62 +181,30 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		// Polling should be used for periodic sampling.
 		return send(request{op: opSampleAll})
 	case "enable":
-		var v types.ChargerEnable
-		switch x := payload.(type) {
-		case types.ChargerEnable:
-			v = x
-		case *types.ChargerEnable:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.ChargerEnable](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opEnableCharging, arg: v})
 
 	case "set_input_limit":
-		var v types.SetInputLimit
-		switch x := payload.(type) {
-		case types.SetInputLimit:
-			v = x
-		case *types.SetInputLimit:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetInputLimit](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetIinLimit, arg: v})
 
 	case "set_charge_target":
-		var v types.SetChargeTarget
-		switch x := payload.(type) {
-		case types.SetChargeTarget:
-			v = x
-		case *types.SetChargeTarget:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetChargeTarget](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetIChargeTarget, arg: v})
 
 	case "set_vin_window":
-		var v types.SetVinWindow
-		switch x := payload.(type) {
-		case types.SetVinWindow:
-			v = x
-		case *types.SetVinWindow:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetVinWindow](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetVinWindow, arg: v})
 
