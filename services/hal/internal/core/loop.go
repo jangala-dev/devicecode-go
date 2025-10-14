@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"math/rand"
 	"time"
 
 	"devicecode-go/bus"
@@ -34,9 +35,14 @@ type HAL struct {
 	// Single-threaded publication of device events
 	evCh chan Event
 
-	// Polling
-	pollCh      chan PollReq
-	poll        *Poller
+	// ---- Inlined poller state (single-threaded in HAL loop) ----
+	pollWake   chan struct{} // edge-triggered wake
+	pollTimer  *time.Timer   // reused timer
+	pollItems  map[pollKey]*pollItem
+	pollHeap   pollHeap
+	randJitter *rand.Rand
+
+	// Coalescing timestamps (retained value emissions)
 	lastEmit    map[capKey]int64 // last retained value emission TS (ns) per capability
 	lastDevEmit map[string]int64 // last retained value emission TS (ns) per device
 
@@ -54,38 +60,73 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		dev:         map[string]Device{},
 		capIndex:    map[capKey]string{},
 		evCh:        make(chan Event, eventQueueLen),
-		pollCh:      make(chan PollReq, 8),
 		lastEmit:    make(map[capKey]int64),
 		lastDevEmit: make(map[string]int64),
 		lastStatus: make(map[capKey]struct {
 			link types.Link
 			err  string
 		}),
+		// Inlined poller
+		pollWake:   make(chan struct{}, 1),
+		pollTimer:  time.NewTimer(time.Hour),
+		pollItems:  make(map[pollKey]*pollItem),
+		randJitter: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	// Ensure timer is stopped & drained before use.
+	if !h.pollTimer.Stop() {
+		select {
+		case <-h.pollTimer.C:
+		default:
+		}
 	}
 	// HAL provides the emitter to devices.
 	h.res.Pub = h
-	// Poller delivers schedule ticks into h.pollCh.
-	h.poll = NewPoller(h.pollCh)
 	return h
 }
 
 func (h *HAL) Run(ctx context.Context) {
-	// Start poller with child context; it exits when ctx is cancelled.
-	pctx, cancel := context.WithCancel(ctx)
-	go h.poll.Run(pctx)
-	defer cancel()
-
 	h.cfgSub = h.conn.Subscribe(topicConfigHAL())
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
 	defer h.conn.Unsubscribe(h.cfgSub)
 	defer h.conn.Unsubscribe(h.ctrlSub)
+
 	ready := false
+
 	for {
+		// Arm/re-arm poll timer based on next due
+		wait := h.pollNextWait()
+		switch {
+		case wait < 0:
+			// no items -> keep timer stopped
+			if !h.pollTimer.Stop() {
+				select {
+				case <-h.pollTimer.C:
+				default:
+				}
+			}
+		case wait == 0:
+			// immediate fire: kick the loop
+			select {
+			case h.pollWake <- struct{}{}:
+			default:
+			}
+			// leave timer stopped
+			if !h.pollTimer.Stop() {
+				select {
+				case <-h.pollTimer.C:
+				default:
+				}
+			}
+		default:
+			h.pollTimer.Reset(wait)
+		}
+
 		select {
 		case <-ctx.Done():
 			h.shutdown()
 			h.pubHALState("stopped", "context_cancelled")
 			return
+
 		case msg := <-h.cfgSub.Channel():
 			if v, ok := msg.Payload.(types.HALConfig); ok {
 				// Existing applyConfig is additive/idempotent for existing devices.
@@ -95,6 +136,7 @@ func (h *HAL) Run(ctx context.Context) {
 					h.pubHALState("ready", "")
 				}
 			}
+
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
@@ -102,38 +144,50 @@ func (h *HAL) Run(ctx context.Context) {
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
+
 		case ev := <-h.evCh:
 			// All device→HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
-		// Scheduled polling ticks are handled here and routed to devices.
-		case pr := <-h.pollCh:
-			if !ready {
-				continue
-			}
-			k := capKey{domain: pr.Domain, kind: pr.Kind, name: pr.Name}
-			now := time.Now().UnixNano()
 
-			// Resolve owner for device-level coalescing.
-			ownerID, ok := h.capIndex[k]
-			if !ok {
-				continue
-			}
+		// Inlined poller wakes
+		case <-h.pollWake:
+			// handled after select
+		case <-h.pollTimer.C:
+			// handled after select
+		}
 
-			// Coalesce using both capability-level and device-level last emissions.
-			lastCap := h.lastEmit[k]
-			lastDev := h.lastDevEmit[ownerID]
-			lastAny := lastCap
-			if lastDev > lastAny {
-				lastAny = lastDev
-			}
-			if lastAny > 0 && (now-lastAny) < pr.Every.Nanoseconds() {
-				h.poll.BumpAfter(pr.Domain, pr.Kind, pr.Name, pr.Verb, lastAny)
-				continue
-			}
+		// After any wake/timer: fire at most one due poll (keeps loop responsive)
+		if ready {
+			if fire := h.pollFireDue(); fire != nil {
+				// Coalescing: skip if a retained value was recently emitted
+				k := capKey{domain: fire.key.d, kind: fire.key.k, name: fire.key.n}
+				now := time.Now().UnixNano()
 
-			if dev := h.dev[ownerID]; dev != nil {
-				// Best-effort; devices should return Busy if already active.
-				_, _ = dev.Control(CapAddr{Domain: pr.Domain, Kind: pr.Kind, Name: pr.Name}, pr.Verb, nil)
+				ownerID, ok := h.capIndex[k]
+				if ok {
+					lastCap := h.lastEmit[k]
+					lastDev := h.lastDevEmit[ownerID]
+					lastAny := lastCap
+					if lastDev > lastAny {
+						lastAny = lastDev
+					}
+					if lastAny > 0 && (now-lastAny) < fire.every.Nanoseconds() {
+						h.pollBumpAfter(fire.key.d, fire.key.k, fire.key.n, fire.key.verb, lastAny)
+					} else {
+						if dev := h.dev[ownerID]; dev != nil {
+							// Best-effort; devices should return Busy if already active.
+							_, _ = dev.Control(CapAddr{Domain: fire.key.d, Kind: fire.key.k, Name: fire.key.n}, fire.key.verb, nil)
+						}
+					}
+				}
+			}
+		}
+
+		// Drain timer channel if we stopped it but it fired concurrently.
+		if !h.pollTimer.Stop() {
+			select {
+			case <-h.pollTimer.C:
+			default:
 			}
 		}
 	}
@@ -187,7 +241,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		if ps.IntervalMs == 0 || ps.Verb == "" || ps.Domain == "" || ps.Kind == "" || ps.Name == "" {
 			continue
 		}
-		h.poll.Upsert(
+		h.pollUpsert(
 			ps.Domain, ps.Kind, ps.Name, ps.Verb,
 			time.Duration(ps.IntervalMs)*time.Millisecond,
 			time.Duration(ps.JitterMs)*time.Millisecond,
@@ -211,7 +265,7 @@ func (h *HAL) handleControl(msg *bus.Message) {
 			h.replyErr(msg, errcode.InvalidPayload)
 			return
 		}
-		h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, ps.Verb,
+		h.pollUpsert(cap.Domain, cap.Kind, cap.Name, ps.Verb,
 			time.Duration(ps.IntervalMs)*time.Millisecond,
 			time.Duration(ps.JitterMs)*time.Millisecond)
 		h.replyOK(msg)
@@ -222,7 +276,7 @@ func (h *HAL) handleControl(msg *bus.Message) {
 		if verbToStop == "" {
 			verbToStop = "read"
 		}
-		h.poll.Stop(cap.Domain, cap.Kind, cap.Name, verbToStop)
+		h.pollStop(cap.Domain, cap.Kind, cap.Name, verbToStop)
 		h.replyOK(msg)
 		return
 	}
@@ -263,7 +317,7 @@ func (h *HAL) handleEvent(ev Event) {
 	if ev.EventTag != "" {
 		h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
 	} else {
-		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, false))
+		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 		// Record last successful retained value emission for coalescing (capability-level).
 		h.lastEmit[ck] = ts
 		// Also record device-level emission time for cross-capability coalescing.
