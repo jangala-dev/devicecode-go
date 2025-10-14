@@ -41,25 +41,22 @@ type Device struct {
 
 // Emit a tagged event and degraded status on both caps.
 func (d *Device) evtErrBoth(tag, code string) {
-	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: tag, TS: ts})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: tag, TS: ts})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: code})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: code})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
 }
 
 // Charger-only: tagged event + degraded.
 func (d *Device) evtErrChg(tag, code string) {
-	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: tag, TS: ts})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: code})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
 }
 
 // Battery-only: tagged event + degraded.
 func (d *Device) evtErrBat(tag, code string) {
-	ts := time.Now().UnixNano()
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: tag, TS: ts})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: code})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
 }
 
 type opCode uint8
@@ -184,62 +181,30 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		// Polling should be used for periodic sampling.
 		return send(request{op: opSampleAll})
 	case "enable":
-		var v types.ChargerEnable
-		switch x := payload.(type) {
-		case types.ChargerEnable:
-			v = x
-		case *types.ChargerEnable:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.ChargerEnable](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opEnableCharging, arg: v})
 
 	case "set_input_limit":
-		var v types.SetInputLimit
-		switch x := payload.(type) {
-		case types.SetInputLimit:
-			v = x
-		case *types.SetInputLimit:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetInputLimit](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetIinLimit, arg: v})
 
 	case "set_charge_target":
-		var v types.SetChargeTarget
-		switch x := payload.(type) {
-		case types.SetChargeTarget:
-			v = x
-		case *types.SetChargeTarget:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetChargeTarget](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetIChargeTarget, arg: v})
 
 	case "set_vin_window":
-		var v types.SetVinWindow
-		switch x := payload.(type) {
-		case types.SetVinWindow:
-			v = x
-		case *types.SetVinWindow:
-			if x == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			v = *x
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		v, code := core.As[types.SetVinWindow](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		return send(request{op: opSetVinWindow, arg: v})
 
@@ -463,20 +428,16 @@ func (d *Device) sampleAndPublish() {
 	// Only publish when measurements are valid; otherwise drive degraded status.
 	ok, err := d.dev.MeasSystemValid()
 	if err != nil {
-		ts := time.Now().UnixNano()
 		code := string(errcode.MapDriverErr(err))
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: code})
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: code})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
 		return
 	}
 	if !ok {
-		ts := time.Now().UnixNano()
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: "meas_invalid"})
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: "meas_invalid"})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: "meas_invalid"})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "meas_invalid"})
 		return
 	}
-
-	ts := time.Now().UnixNano()
 
 	// Battery group
 	var bv types.BatteryValue
@@ -495,7 +456,7 @@ func (d *Device) sampleAndPublish() {
 	if bsr, err := d.dev.BSRMicroOhmPerCell(); err == nil {
 		bv.BSR_uOhmPerCell = bsr
 	}
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Payload: bv, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Payload: bv})
 
 	// Charger group
 	var cv types.ChargerValue
@@ -517,16 +478,16 @@ func (d *Device) sampleAndPublish() {
 	if ss, err := d.dev.SystemStatus(); err == nil {
 		cv.Sys = uint16(ss)
 	}
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: cv, TS: ts})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: cv})
 
 	if ratio, err := d.dev.NTCRatio(); err != nil {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: string(errcode.MapDriverErr(err))})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: string(errcode.MapDriverErr(err))})
 	} else if deciC, ok := ntcRatioToDeciC(ratio, d.params.NTCBiasOhm, d.params.R25Ohm, d.params.BetaK); ok {
 		_ = d.res.Pub.Emit(core.Event{
-			Addr: d.aTmp, Payload: types.TemperatureValue{DeciC: deciC}, TS: ts,
+			Addr: d.aTmp, Payload: types.TemperatureValue{DeciC: deciC},
 		})
 	} else {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, TS: ts, Err: "ntc_ratio_invalid"})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "ntc_ratio_invalid"})
 	}
 }
 
@@ -550,9 +511,8 @@ func (d *Device) serviceSMBAlertWhileLow() {
 		ev, ok, err := d.dev.ServiceSMBAlert()
 		if err != nil {
 			// Publish degraded statuses and back-off.
-			ts := time.Now().UnixNano()
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, TS: ts, Err: string(errcode.MapDriverErr(err))})
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, TS: ts, Err: string(errcode.MapDriverErr(err))})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: string(errcode.MapDriverErr(err))})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: string(errcode.MapDriverErr(err))})
 			// back-off: 2ms << min(iters, 4) → max 32ms
 			time.Sleep(time.Duration(1<<min(iters, 4)) * time.Millisecond)
 			continue
@@ -581,7 +541,6 @@ func (d *Device) serviceSMBAlertWhileLow() {
 }
 
 func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
-	now := time.Now().UnixNano()
 
 	// ---- Limit alerts: VIN window and BSR ----
 	if vinBits := ev.Limit & (ltc4015.VINLo | ltc4015.VINHi); vinBits != 0 {
@@ -594,17 +553,17 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 		}
 		switch {
 		case mv >= hi:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "vin_connected", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_connected"})
 			d.setVinEdgeMask(d.dev, ltc4015.VINLo)
 		case mv <= lo:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "vin_disconnected", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_disconnected"})
 			d.setVinEdgeMask(d.dev, ltc4015.VINHi)
 		default:
 			d.setVinEdgeMask(d.dev, ltc4015.VINLo|ltc4015.VINHi)
 		}
 	}
 	if ev.Limit.Has(ltc4015.BSRHi) {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, IsEvent: true, EventTag: "bsr_high", TS: now})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: "bsr_high"})
 	}
 
 	// ---- Charger state: faults and phase edges (events), then re-arm + clear ----
@@ -612,25 +571,25 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 		s := ev.ChgState
 		// Emit a tag for each asserted bit we care about.
 		if s.Has(ltc4015.BatMissingFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_missing", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_missing"})
 		}
 		if s.Has(ltc4015.BatShortFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "bat_short", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_short"})
 		}
 		if s.Has(ltc4015.MaxChargeTimeFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "max_charge_time_fault", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "max_charge_time_fault"})
 		}
 		if s.Has(ltc4015.AbsorbCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "absorb", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "absorb"})
 		}
 		if s.Has(ltc4015.EqualizeCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "equalize", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "equalize"})
 		}
 		if s.Has(ltc4015.CCCVCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cccv", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cccv"})
 		}
 		if s.Has(ltc4015.Precharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "precharge", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "precharge"})
 		}
 
 		// Re-arm charger-state edges: enable only bits that are NOT currently asserted.
@@ -660,16 +619,16 @@ func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
 	if ev.ChgStatus != 0 {
 		s := ev.ChgStatus
 		if s.Has(ltc4015.IinLimitActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "iin_limited", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "iin_limited"})
 		}
 		if s.Has(ltc4015.VinUvclActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "uvcl_active", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "uvcl_active"})
 		}
 		if s.Has(ltc4015.ConstCurrent) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cc_phase", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cc_phase"})
 		}
 		if s.Has(ltc4015.ConstVoltage) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, IsEvent: true, EventTag: "cv_phase", TS: now})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cv_phase"})
 		}
 
 		en := baseStatusMask()

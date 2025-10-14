@@ -102,8 +102,8 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 
 func (d *Device) Init(ctx context.Context) error {
 	// Establish capability addresses; avoid touching the bus here.
-	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: string(types.KindTemperature), Name: d.name}
-	d.addrHum = core.CapAddr{Domain: d.dom, Kind: string(types.KindHumidity), Name: d.name}
+	d.addrTemp = core.CapAddr{Domain: d.dom, Kind: types.KindTemperature, Name: d.name}
+	d.addrHum = core.CapAddr{Domain: d.dom, Kind: types.KindHumidity, Name: d.name}
 	// Provide the address without doing I²C; Configure() will occur on first Read.
 	d.drv.Address = d.addr
 	return nil
@@ -141,9 +141,8 @@ func (d *Device) readOnce() {
 		TriggerHint:    80 * time.Millisecond,
 	})
 
-	start := time.Now().UnixNano()
 	if err := d.drv.Read(); err != nil {
-		d.emitErr(string(errcode.MapDriverErr(err)), start)
+		d.emitErr(string(errcode.MapDriverErr(err)))
 		return
 	}
 
@@ -160,26 +159,22 @@ func (d *Device) readOnce() {
 
 	// Hard-range validation: if outside, treat as a failed sample.
 	if decic < tMin || decic > tMax || rhx100 < hMin || rhx100 > hMax {
-		d.emitErr("invalid_sample", start)
+		d.emitErr("invalid_sample")
 		return
 	}
-
-	ts := time.Now().UnixNano()
 
 	// Publish retained values
 	d.pub.Emit(core.Event{
 		Addr:    d.addrTemp,
 		Payload: types.TemperatureValue{DeciC: int16(decic)},
-		TS:      ts,
 	})
 	d.pub.Emit(core.Event{
 		Addr:    d.addrHum,
 		Payload: types.HumidityValue{RHx100: uint16(rhx100)},
-		TS:      ts,
 	})
 }
 
-func (d *Device) emitErr(code string, t0 int64) {
-	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TS: t0})
-	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TS: t0})
+func (d *Device) emitErr(code string) {
+	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code})
+	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code})
 }

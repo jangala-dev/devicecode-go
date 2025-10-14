@@ -2,7 +2,6 @@ package gpio_dout
 
 import (
 	"context"
-	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
@@ -63,9 +62,9 @@ func New(role Role, id string, p Params, h core.GPIOHandle, pub core.EventEmitte
 			d.domain = "io"
 		}
 	}
-	kind := string(types.KindLED)
+	kind := types.KindLED
 	if role == RoleSwitch {
-		kind = string(types.KindSwitch)
+		kind = types.KindSwitch
 	}
 	d.addr = core.CapAddr{Domain: d.domain, Kind: kind, Name: d.name}
 	return d
@@ -124,15 +123,15 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 	case "set":
 		switch d.role {
 		case RoleSwitch:
-			p, ok := payload.(types.SwitchSet)
-			if !ok {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+			p, code := core.As[types.SwitchSet](payload)
+			if code != "" {
+				return core.EnqueueResult{OK: false, Error: code}, nil
 			}
 			d.setLogical(p.On)
 		default:
-			p, ok := payload.(types.LEDSet)
-			if !ok {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+			p, code := core.As[types.LEDSet](payload)
+			if code != "" {
+				return core.EnqueueResult{OK: false, Error: code}, nil
 			}
 			d.setLogical(p.Level)
 		}
@@ -167,13 +166,11 @@ func (d *Device) getLogical() bool {
 }
 
 func (d *Device) emitValueNow() {
-	ts := time.Now().UnixNano()
 	switch d.role {
 	case RoleSwitch:
 		_ = d.pub.Emit(core.Event{
 			Addr:    d.addr,
 			Payload: types.SwitchValue{On: d.getLogical()},
-			TS:      ts,
 		})
 	default:
 		var v uint8
@@ -183,7 +180,6 @@ func (d *Device) emitValueNow() {
 		_ = d.pub.Emit(core.Event{
 			Addr:    d.addr,
 			Payload: types.LEDValue{Level: v},
-			TS:      ts,
 		})
 	}
 }

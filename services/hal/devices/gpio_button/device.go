@@ -38,7 +38,7 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	d.a = core.CapAddr{Domain: d.dom, Kind: string(types.KindButton), Name: d.name}
+	d.a = core.CapAddr{Domain: d.dom, Kind: types.KindButton, Name: d.name}
 
 	// Publish initial value.
 	lvl := d.gpio.Get()
@@ -46,12 +46,11 @@ func (d *Device) Init(ctx context.Context) error {
 	d.pub.Emit(core.Event{
 		Addr:    d.a,
 		Payload: types.ButtonValue{Pressed: pressed},
-		TS:      time.Now().UnixNano(),
 	})
 
 	es, err := d.reg.SubscribeGPIOEdges(d.id, d.pinN, core.EdgeBoth, d.debounce, 8)
 	if err != nil {
-		d.pub.Emit(core.Event{Addr: d.a, TS: time.Now().UnixNano(), Err: "edge_sub_failed"})
+		d.pub.Emit(core.Event{Addr: d.a, Err: "edge_sub_failed"})
 		return nil
 	}
 	d.es = es
@@ -71,9 +70,8 @@ func (d *Device) Close() error {
 func (d *Device) Control(_ core.CapAddr, verb string, _ any) (core.EnqueueResult, error) {
 	switch verb {
 	case "read":
-		ts := time.Now().UnixNano()
 		pressed := d.logicalPressed(d.gpio.Get())
-		_ = d.pub.Emit(core.Event{Addr: d.a, Payload: types.ButtonValue{Pressed: pressed}, TS: ts})
+		_ = d.pub.Emit(core.Event{Addr: d.a, Payload: types.ButtonValue{Pressed: pressed}})
 		return core.EnqueueResult{OK: true}, nil
 	default:
 		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
@@ -87,8 +85,8 @@ func (d *Device) edgeLoop() {
 		if pressed {
 			tag = "pressed"
 		}
-		_ = d.pub.Emit(core.Event{Addr: d.a, IsEvent: true, EventTag: tag, TS: ev.TS})
-		_ = d.pub.Emit(core.Event{Addr: d.a, Payload: types.ButtonValue{Pressed: pressed}, TS: ev.TS})
+		_ = d.pub.Emit(core.Event{Addr: d.a, EventTag: tag})
+		_ = d.pub.Emit(core.Event{Addr: d.a, Payload: types.ButtonValue{Pressed: pressed}})
 	}
 }
 

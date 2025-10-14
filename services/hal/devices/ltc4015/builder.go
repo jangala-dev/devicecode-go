@@ -86,9 +86,9 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 
 	dev := &Device{
 		id:   in.ID,
-		aBat: core.CapAddr{Domain: domBat, Kind: string(types.KindBattery), Name: name},
-		aChg: core.CapAddr{Domain: domChg, Kind: string(types.KindCharger), Name: name},
-		aTmp: core.CapAddr{Domain: domChg, Kind: string(types.KindTemperature), Name: name},
+		aBat: core.CapAddr{Domain: domBat, Kind: types.KindBattery, Name: name},
+		aChg: core.CapAddr{Domain: domChg, Kind: types.KindCharger, Name: name},
+		aTmp: core.CapAddr{Domain: domChg, Kind: types.KindTemperature, Name: name},
 
 		res:  in.Res,
 		i2c:  i2c,

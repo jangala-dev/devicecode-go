@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"math/rand"
 	"time"
 
 	"devicecode-go/bus"
@@ -10,11 +11,11 @@ import (
 	"devicecode-go/x/fmtx"
 )
 
-const eventQueueLen = 32
+const eventQueueLen = 8
 
 type capKey struct {
 	domain string
-	kind   string
+	kind   types.Kind
 	name   string
 }
 
@@ -34,9 +35,14 @@ type HAL struct {
 	// Single-threaded publication of device events
 	evCh chan Event
 
-	// Polling
-	pollCh      chan PollReq
-	poll        *Poller
+	// ---- Inlined poller state (single-threaded in HAL loop) ----
+	pollWake   chan struct{} // edge-triggered wake
+	pollTimer  *time.Timer   // reused timer
+	pollItems  map[pollKey]*pollItem
+	pollHeap   pollHeap
+	randJitter *rand.Rand
+
+	// Coalescing timestamps (retained value emissions)
 	lastEmit    map[capKey]int64 // last retained value emission TS (ns) per capability
 	lastDevEmit map[string]int64 // last retained value emission TS (ns) per device
 
@@ -54,38 +60,73 @@ func NewHAL(conn *bus.Connection, res Resources) *HAL {
 		dev:         map[string]Device{},
 		capIndex:    map[capKey]string{},
 		evCh:        make(chan Event, eventQueueLen),
-		pollCh:      make(chan PollReq, 32),
 		lastEmit:    make(map[capKey]int64),
 		lastDevEmit: make(map[string]int64),
 		lastStatus: make(map[capKey]struct {
 			link types.Link
 			err  string
 		}),
+		// Inlined poller
+		pollWake:   make(chan struct{}, 1),
+		pollTimer:  time.NewTimer(time.Hour),
+		pollItems:  make(map[pollKey]*pollItem),
+		randJitter: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	// Ensure timer is stopped & drained before use.
+	if !h.pollTimer.Stop() {
+		select {
+		case <-h.pollTimer.C:
+		default:
+		}
 	}
 	// HAL provides the emitter to devices.
 	h.res.Pub = h
-	// Poller delivers schedule ticks into h.pollCh.
-	h.poll = NewPoller(h.pollCh)
 	return h
 }
 
 func (h *HAL) Run(ctx context.Context) {
-	// Start poller with child context; it exits when ctx is cancelled.
-	pctx, cancel := context.WithCancel(ctx)
-	go h.poll.Run(pctx)
-	defer cancel()
-
 	h.cfgSub = h.conn.Subscribe(topicConfigHAL())
 	h.ctrlSub = h.conn.Subscribe(ctrlWildcard())
 	defer h.conn.Unsubscribe(h.cfgSub)
 	defer h.conn.Unsubscribe(h.ctrlSub)
+
 	ready := false
+
 	for {
+		// Arm/re-arm poll timer based on next due
+		wait := h.pollNextWait()
+		switch {
+		case wait < 0:
+			// no items -> keep timer stopped
+			if !h.pollTimer.Stop() {
+				select {
+				case <-h.pollTimer.C:
+				default:
+				}
+			}
+		case wait == 0:
+			// immediate fire: kick the loop
+			select {
+			case h.pollWake <- struct{}{}:
+			default:
+			}
+			// leave timer stopped
+			if !h.pollTimer.Stop() {
+				select {
+				case <-h.pollTimer.C:
+				default:
+				}
+			}
+		default:
+			h.pollTimer.Reset(wait)
+		}
+
 		select {
 		case <-ctx.Done():
 			h.shutdown()
 			h.pubHALState("stopped", "context_cancelled")
 			return
+
 		case msg := <-h.cfgSub.Channel():
 			if v, ok := msg.Payload.(types.HALConfig); ok {
 				// Existing applyConfig is additive/idempotent for existing devices.
@@ -95,45 +136,58 @@ func (h *HAL) Run(ctx context.Context) {
 					h.pubHALState("ready", "")
 				}
 			}
+
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
-				h.reply(m, false, errcode.HALNotReady, nil)
+				h.replyErr(m, errcode.HALNotReady)
 				continue
 			}
 			h.handleControl(m) // strictly non-blocking
+
 		case ev := <-h.evCh:
 			// All device→HAL telemetry is published from this goroutine.
 			h.handleEvent(ev)
-		// Scheduled polling ticks are handled here and routed to devices.
-		case pr := <-h.pollCh:
-			if !ready {
-				continue
-			}
-			k := capKey{domain: pr.Domain, kind: pr.Kind, name: pr.Name}
-			now := time.Now().UnixNano()
 
-			// Resolve owner for device-level coalescing.
-			ownerID, ok := h.capIndex[k]
-			if !ok {
-				continue
-			}
+		// Inlined poller wakes
+		case <-h.pollWake:
+			// handled after select
+		case <-h.pollTimer.C:
+			// handled after select
+		}
 
-			// Coalesce using both capability-level and device-level last emissions.
-			lastCap := h.lastEmit[k]
-			lastDev := h.lastDevEmit[ownerID]
-			lastAny := lastCap
-			if lastDev > lastAny {
-				lastAny = lastDev
-			}
-			if lastAny > 0 && (now-lastAny) < pr.Every.Nanoseconds() {
-				h.poll.BumpAfter(pr.Domain, pr.Kind, pr.Name, pr.Verb, lastAny)
-				continue
-			}
+		// After any wake/timer: fire at most one due poll (keeps loop responsive)
+		if ready {
+			if fire := h.pollFireDue(); fire != nil {
+				// Coalescing: skip if a retained value was recently emitted
+				k := capKey{domain: fire.key.d, kind: fire.key.k, name: fire.key.n}
+				now := time.Now().UnixNano()
 
-			if dev := h.dev[ownerID]; dev != nil {
-				// Best-effort; devices should return Busy if already active.
-				_, _ = dev.Control(CapAddr{Domain: pr.Domain, Kind: pr.Kind, Name: pr.Name}, pr.Verb, nil)
+				ownerID, ok := h.capIndex[k]
+				if ok {
+					lastCap := h.lastEmit[k]
+					lastDev := h.lastDevEmit[ownerID]
+					lastAny := lastCap
+					if lastDev > lastAny {
+						lastAny = lastDev
+					}
+					if lastAny > 0 && (now-lastAny) < fire.every.Nanoseconds() {
+						h.pollBumpAfter(fire.key.d, fire.key.k, fire.key.n, fire.key.verb, lastAny)
+					} else {
+						if dev := h.dev[ownerID]; dev != nil {
+							// Best-effort; devices should return Busy if already active.
+							_, _ = dev.Control(CapAddr{Domain: fire.key.d, Kind: fire.key.k, Name: fire.key.n}, fire.key.verb, nil)
+						}
+					}
+				}
+			}
+		}
+
+		// Drain timer channel if we stopped it but it fired concurrently.
+		if !h.pollTimer.Stop() {
+			select {
+			case <-h.pollTimer.C:
+			default:
 			}
 		}
 	}
@@ -187,7 +241,7 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		if ps.IntervalMs == 0 || ps.Verb == "" || ps.Domain == "" || ps.Kind == "" || ps.Name == "" {
 			continue
 		}
-		h.poll.Upsert(
+		h.pollUpsert(
 			ps.Domain, ps.Kind, ps.Name, ps.Verb,
 			time.Duration(ps.IntervalMs)*time.Millisecond,
 			time.Duration(ps.JitterMs)*time.Millisecond,
@@ -199,112 +253,80 @@ func (h *HAL) handleControl(msg *bus.Message) {
 	// hal/cap/<domain>/<kind>/<name>/control/<verb>
 	cap, verb, ok := parseCapCtrl(msg.Topic)
 	if !ok {
-		h.reply(msg, false, errcode.InvalidTopic, nil)
+		h.replyErr(msg, errcode.InvalidTopic)
 		return
 	}
 
 	// HAL-handled verbs for polling (strictly typed payloads).
 	switch verb {
 	case "poll_start":
-		switch v := msg.Payload.(type) {
-		case types.PollStart:
-			if v.Verb == "" || v.IntervalMs == 0 {
-				h.reply(msg, false, errcode.InvalidPayload, nil)
-				return
-			}
-			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
-				time.Duration(v.IntervalMs)*time.Millisecond,
-				time.Duration(v.JitterMs)*time.Millisecond)
-			h.reply(msg, true, "", nil)
-			return
-		case *types.PollStart:
-			if v == nil || v.Verb == "" || v.IntervalMs == 0 {
-				h.reply(msg, false, errcode.InvalidPayload, nil)
-				return
-			}
-			h.poll.Upsert(cap.Domain, cap.Kind, cap.Name, v.Verb,
-				time.Duration(v.IntervalMs)*time.Millisecond,
-				time.Duration(v.JitterMs)*time.Millisecond)
-			h.reply(msg, true, "", nil)
-			return
-		default:
-			h.reply(msg, false, errcode.InvalidPayload, nil)
+		ps, code := As[types.PollStart](msg.Payload)
+		if code != "" || ps.Verb == "" || ps.IntervalMs == 0 {
+			h.replyErr(msg, errcode.InvalidPayload)
 			return
 		}
+		h.pollUpsert(cap.Domain, cap.Kind, cap.Name, ps.Verb,
+			time.Duration(ps.IntervalMs)*time.Millisecond,
+			time.Duration(ps.JitterMs)*time.Millisecond)
+		h.replyOK(msg)
+		return
 	case "poll_stop":
-		verbToStop := "read"
-		switch v := msg.Payload.(type) {
-		case nil:
-			// default
-		case types.PollStop:
-			if v.Verb != "" {
-				verbToStop = v.Verb
-			}
-		case *types.PollStop:
-			if v != nil && v.Verb != "" {
-				verbToStop = v.Verb
-			}
-		default:
-			h.reply(msg, false, errcode.InvalidPayload, nil)
-			return
+		ps, _ := As[types.PollStop](msg.Payload) // zero-value allowed
+		verbToStop := ps.Verb
+		if verbToStop == "" {
+			verbToStop = "read"
 		}
-		h.poll.Stop(cap.Domain, cap.Kind, cap.Name, verbToStop)
-		h.reply(msg, true, "", nil)
+		h.pollStop(cap.Domain, cap.Kind, cap.Name, verbToStop)
+		h.replyOK(msg)
 		return
 	}
 
 	ownerID, ok := h.capIndex[capKey{domain: cap.Domain, kind: cap.Kind, name: cap.Name}]
 	if !ok {
-		h.reply(msg, false, errcode.UnknownCapability, nil)
+		h.replyErr(msg, errcode.UnknownCapability)
 		return
 	}
 	dev := h.dev[ownerID]
 	if dev == nil {
-		h.reply(msg, false, errcode.Error, nil)
+		h.replyErr(msg, errcode.Error)
 		return
 	}
 
 	res, err := dev.Control(cap, verb, msg.Payload)
 	if err != nil {
-		h.reply(msg, false, "", err)
-		return
-	}
-	if !msg.CanReply() {
+		h.replyErr(msg, errcode.Of(err))
 		return
 	}
 	if res.OK {
-		h.reply(msg, true, "", nil)
-		return
+		h.replyOK(msg)
+	} else {
+		h.replyErr(msg, res.Error)
 	}
-	h.reply(msg, false, res.Error, nil)
 }
 
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
 	ck := capKey{domain: d, kind: k, name: n}
+	ts := time.Now().UnixNano()
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
-		h.pubStatus(d, k, n, ev.TS, ev.Err)
+		h.pubStatus(d, k, n, ts, ev.Err)
 		return
 	}
 	// 2) Success: event vs value
-	if ev.IsEvent {
-		if ev.EventTag != "" {
-			h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
-		} else {
-			h.conn.Publish(h.conn.NewMessage(capEvent(d, k, n), ev.Payload, false))
-		}
+	if ev.EventTag != "" {
+		h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
 	} else {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 		// Record last successful retained value emission for coalescing (capability-level).
-		h.lastEmit[ck] = ev.TS
+		h.lastEmit[ck] = ts
 		// Also record device-level emission time for cross-capability coalescing.
 		if ownerID, ok := h.capIndex[ck]; ok {
-			h.lastDevEmit[ownerID] = ev.TS
+			h.lastDevEmit[ownerID] = ts
 		}
 	}
 	// 3) Retained status: up
-	h.pubStatus(d, k, n, ev.TS, "")
+	h.pubStatus(d, k, n, ts, "")
 }
 
 func (h *HAL) pubHALState(level, status string) {
@@ -321,7 +343,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 		panic(fmtx.Sprintf("[hal] capability must specify non-empty domain/kind/name: dev=%s", devID))
 	}
 	domain := cs.Domain
-	k := string(cs.Kind)
+	k := cs.Kind
 	name := cs.Name
 	// Index for control routing.
 	h.capIndex[capKey{domain: domain, kind: k, name: name}] = devID
@@ -350,7 +372,7 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 
 // pubStatus publishes a retained status update for a capability.
 // err=="" → LinkUp; otherwise LinkDegraded and Error is included.
-func (h *HAL) pubStatus(domain, kind, name string, ts int64, err string) {
+func (h *HAL) pubStatus(domain string, kind types.Kind, name string, ts int64, err string) {
 	link := types.LinkUp
 	if err != "" {
 		link = types.LinkDegraded

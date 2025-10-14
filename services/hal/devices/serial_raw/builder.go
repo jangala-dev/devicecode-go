@@ -81,7 +81,7 @@ func (builder) Build(ctx context.Context, in core.BuilderInput) (core.Device, er
 
 	d := &Device{
 		id:    in.ID,
-		a:     core.CapAddr{Domain: p.Domain, Kind: string(types.KindSerial), Name: p.Name},
+		a:     core.CapAddr{Domain: p.Domain, Kind: types.KindSerial, Name: p.Name},
 		res:   in.Res,
 		busID: p.Bus,
 		port:  sp,
@@ -128,7 +128,7 @@ func (d *Device) Init(ctx context.Context) error {
 
 	// Publish initial degraded status while inactive.
 	d.res.Pub.Emit(core.Event{
-		Addr: d.a, TS: time.Now().UnixNano(), Err: "initialising",
+		Addr: d.a, Err: "initialising",
 	})
 	return nil
 }
@@ -148,14 +148,9 @@ func (d *Device) Close() error {
 func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
 	switch verb {
 	case "session_open":
-		var req types.SerialSessionOpen
-		switch v := payload.(type) {
-		case nil:
-			// default sizes will be applied below
-		case types.SerialSessionOpen:
-			req = v
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		req, code := core.As[types.SerialSessionOpen](payload) // zero value => apply defaults
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 
 		if d.sess != nil {
@@ -213,33 +208,27 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 			RXHandle:  uint32(d.sess.rxHandle),
 			TXHandle:  uint32(d.sess.txHandle),
 		}
-		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, Payload: rep, TS: now, IsEvent: true, EventTag: "session_opened",
+			Addr: d.a, Payload: rep, EventTag: "session_opened",
 		})
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, IsEvent: true, EventTag: "link_up",
+			Addr: d.a, EventTag: "link_up",
 		})
 
 		return core.EnqueueResult{OK: true}, nil
 
 	case "session_close":
-		switch payload.(type) {
-		case nil, types.SerialSessionClose, *types.SerialSessionClose:
-			// ok
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-		}
+		// Accept zero-value payload (no fields)
+		_, _ = core.As[types.SerialSessionClose](payload)
 		if d.sess == nil {
 			return core.EnqueueResult{OK: true}, nil
 		}
 		d.stopSession()
-		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, IsEvent: true, EventTag: "session_closed",
+			Addr: d.a, EventTag: "session_closed",
 		})
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, Err: "session_closed",
+			Addr: d.a, Err: "session_closed",
 		})
 		return core.EnqueueResult{OK: true}, nil
 
@@ -247,17 +236,9 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		if d.cfgB == nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
-		var req types.SerialSetBaud
-		switch v := payload.(type) {
-		case types.SerialSetBaud:
-			req = v
-		case *types.SerialSetBaud:
-			if v == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			req = *v
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		req, code := core.As[types.SerialSetBaud](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		_ = d.cfgB.SetBaudRate(req.Baud)
 		return core.EnqueueResult{OK: true}, nil
@@ -266,17 +247,9 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		if d.cfgF == nil {
 			return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
 		}
-		var req types.SerialSetFormat
-		switch v := payload.(type) {
-		case types.SerialSetFormat:
-			req = v
-		case *types.SerialSetFormat:
-			if v == nil {
-				return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
-			}
-			req = *v
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.InvalidPayload}, nil
+		req, code := core.As[types.SerialSetFormat](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
 		if req.DataBits == 0 || req.StopBits == 0 {
 			return core.EnqueueResult{OK: false, Error: errcode.InvalidParams}, nil
