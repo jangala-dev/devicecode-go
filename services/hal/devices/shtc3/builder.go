@@ -150,20 +150,17 @@ func (d *Device) readOnce() {
 		return
 	}
 
-	ts := time.Now().UnixNano()
 	d.pub.Emit(core.Event{
 		Addr:    d.addrTemp,
 		Payload: types.TemperatureValue{DeciC: int16(decic)},
-		TS:      ts,
 	})
 	d.pub.Emit(core.Event{
 		Addr:    d.addrHum,
 		Payload: types.HumidityValue{RHx100: uint16(rh)},
-		TS:      ts,
 	})
 }
 
 func (d *Device) emitErr(code string, t0 int64) {
-	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code, TS: t0})
-	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code, TS: t0})
+	d.pub.Emit(core.Event{Addr: d.addrTemp, Err: code})
+	d.pub.Emit(core.Event{Addr: d.addrHum, Err: code})
 }

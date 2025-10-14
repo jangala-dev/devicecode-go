@@ -243,12 +243,10 @@ func (h *HAL) handleControl(msg *bus.Message) {
 		h.replyErr(msg, errcode.Of(err))
 		return
 	}
-	if !msg.CanReply() {
-		return
-	}
 	if res.OK {
 		h.replyOK(msg)
-		return
+	} else {
+		h.replyErr(msg, res.Error)
 	}
 	h.replyErr(msg, res.Error)
 }
@@ -256,9 +254,10 @@ func (h *HAL) handleControl(msg *bus.Message) {
 func (h *HAL) handleEvent(ev Event) {
 	d, k, n := ev.Addr.Domain, ev.Addr.Kind, ev.Addr.Name
 	ck := capKey{domain: d, kind: k, name: n}
+	ts := time.Now().UnixNano()
 	// 1) Error → retained status:degraded; no value/event published.
 	if ev.Err != "" {
-		h.pubStatus(d, k, n, ev.TS, ev.Err)
+		h.pubStatus(d, k, n, ts, ev.Err)
 		return
 	}
 	// 2) Success: event vs value
@@ -267,14 +266,14 @@ func (h *HAL) handleEvent(ev Event) {
 	} else {
 		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
 		// Record last successful retained value emission for coalescing (capability-level).
-		h.lastEmit[ck] = ev.TS
+		h.lastEmit[ck] = ts
 		// Also record device-level emission time for cross-capability coalescing.
 		if ownerID, ok := h.capIndex[ck]; ok {
-			h.lastDevEmit[ownerID] = ev.TS
+			h.lastDevEmit[ownerID] = ts
 		}
 	}
 	// 3) Retained status: up
-	h.pubStatus(d, k, n, ev.TS, "")
+	h.pubStatus(d, k, n, ts, "")
 }
 
 func (h *HAL) pubHALState(level, status string) {

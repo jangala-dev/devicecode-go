@@ -128,7 +128,7 @@ func (d *Device) Init(ctx context.Context) error {
 
 	// Publish initial degraded status while inactive.
 	d.res.Pub.Emit(core.Event{
-		Addr: d.a, TS: time.Now().UnixNano(), Err: "initialising",
+		Addr: d.a, Err: "initialising",
 	})
 	return nil
 }
@@ -208,12 +208,11 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 			RXHandle:  uint32(d.sess.rxHandle),
 			TXHandle:  uint32(d.sess.txHandle),
 		}
-		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, Payload: rep, TS: now, EventTag: "session_opened",
+			Addr: d.a, Payload: rep, EventTag: "session_opened",
 		})
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, EventTag: "link_up",
+			Addr: d.a, EventTag: "link_up",
 		})
 
 		return core.EnqueueResult{OK: true}, nil
@@ -225,12 +224,11 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 			return core.EnqueueResult{OK: true}, nil
 		}
 		d.stopSession()
-		now := time.Now().UnixNano()
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, EventTag: "session_closed",
+			Addr: d.a, EventTag: "session_closed",
 		})
 		d.res.Pub.Emit(core.Event{
-			Addr: d.a, TS: now, Err: "session_closed",
+			Addr: d.a, Err: "session_closed",
 		})
 		return core.EnqueueResult{OK: true}, nil
 
