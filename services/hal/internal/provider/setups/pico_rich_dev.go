@@ -30,7 +30,7 @@ var SelectedSetup = types.HALConfig{
 			Pin:       11,
 			FreqHz:    1000,
 			Top:       4095,
-			ActiveLow: true,
+			ActiveLow: false,
 			Initial:   4095,
 			Domain:    "io",
 			Name:      "button-led",
