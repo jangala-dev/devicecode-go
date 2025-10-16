@@ -437,6 +437,8 @@ func (r *Reactor) emitMemSnapshot() {
 // -----------------------------------------------------------------------------
 
 func main() {
+	// Allow early USB/console settle if needed
+	time.Sleep(3 * time.Second)
 	log.SetStart(time.Now())
 
 	ctx := context.Background()
