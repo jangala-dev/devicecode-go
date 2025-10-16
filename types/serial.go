@@ -12,6 +12,19 @@ const (
 	ParityOdd
 )
 
+func (p Parity) String() string {
+	switch p {
+	case ParityEven:
+		return "even"
+	case ParityOdd:
+		return "odd"
+	default:
+		return "none"
+	}
+}
+
+func (p Parity) MarshalJSON() ([]byte, error) { return []byte(`"` + p.String() + `"`), nil }
+
 type SerialSessionOpen struct {
 	// Power-of-two sizes (bytes). Device will default if zero.
 	RXSize int `json:"rx_size,omitempty"`
