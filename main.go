@@ -55,10 +55,9 @@ const pwmTop = 4095
 // HAL
 var halReadiness = bus.T("hal", "state")
 
-// PWM
+// LED
 var (
-	tPWMCtrlSet  = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "set")
-	tPWMCtrlRamp = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "ramp")
+	tLEDCtrlSet = bus.T("hal", "cap", "io", string(types.KindLED), "button_led", "control", "set")
 )
 
 // Env
@@ -337,24 +336,26 @@ func (r *Reactor) stepFSM() {
 
 func (r *Reactor) stepLED() {
 	switch r.state {
-	case stateOn:
+	case stateUpSeq, stateOn:
 		r.ledTick = 0
 		if !r.ledSteady {
-			r.ui.Publish(r.ui.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
+			// Steady ON on healthy rails
+			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
 			r.ledSteady = true
 		}
 	default:
+		// Blink at 1 Hz: 100 ms ON, 900 ms OFF (TICK = 100 ms)
 		r.ledSteady = false
 		r.ledTick++
-		if r.ledTick%10 == 0 { // 4 * 250 ms = 1 s
-			var target uint16
-			if r.levelUp {
-				target = pwmTop
-			} else {
-				target = 0
-			}
-			r.levelUp = !r.levelUp
-			r.ui.Publish(r.ui.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
+		phase := r.ledTick % 10
+		switch phase {
+		case 0:
+			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
+		case 1:
+			// keep ON for one more tick? comment/uncomment to lengthen pulse
+			// r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
+		case 2:
+			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: false}, false))
 		}
 	}
 }
@@ -436,8 +437,6 @@ func (r *Reactor) emitMemSnapshot() {
 // -----------------------------------------------------------------------------
 
 func main() {
-	// Allow early USB/console settle if needed
-	time.Sleep(3 * time.Second)
 	log.SetStart(time.Now())
 
 	ctx := context.Background()

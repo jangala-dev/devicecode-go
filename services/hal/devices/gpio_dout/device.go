@@ -133,7 +133,7 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 			if code != "" {
 				return core.EnqueueResult{OK: false, Error: code}, nil
 			}
-			d.setLogical(p.Level)
+			d.setLogical(p.On)
 		}
 		d.emitValueNow()
 		return core.EnqueueResult{OK: true}, nil
@@ -173,13 +173,9 @@ func (d *Device) emitValueNow() {
 			Payload: types.SwitchValue{On: d.getLogical()},
 		})
 	default:
-		var v uint8
-		if d.getLogical() {
-			v = 1
-		}
 		_ = d.pub.Emit(core.Event{
 			Addr:    d.addr,
-			Payload: types.LEDValue{Level: v},
+			Payload: types.LEDValue{On: d.getLogical()},
 		})
 	}
 }
