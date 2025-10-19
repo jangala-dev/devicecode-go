@@ -224,17 +224,15 @@ func (h *HAL) applyConfig(ctx context.Context, cfg types.HALConfig) {
 		if err != nil {
 			panic(fmtx.Sprintf("[hal] build failed for: %s err: %s\n", dc.ID, err.Error()))
 		}
-		if err := dev.Init(ctx); err != nil {
-			panic(fmtx.Sprintf("[hal] init failed for: %s\n", dc.ID))
-		}
 		h.dev[dev.ID()] = dev
-
 		// Register capabilities, publish retained info + initial status:down
 		for _, cs := range dev.Capabilities() {
 			h.registerCap(dev.ID(), cs)
 		}
+		if err := dev.Init(ctx); err != nil {
+			panic(fmtx.Sprintf("[hal] init failed for: %s\n", dc.ID))
+		}
 	}
-
 	// Apply declarative pollers from config after all capabilities are registered.
 	for i := range cfg.Pollers {
 		ps := cfg.Pollers[i]

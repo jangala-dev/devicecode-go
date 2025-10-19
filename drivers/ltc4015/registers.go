@@ -1,22 +1,16 @@
-// Package ltc4015 provides constants for register addresses and bitfields used
-// in the operation of the LTC4015 battery charger controller.
 package ltc4015
 
-// -----------------------------------------------------------------------------
-// Device I2C address
-// -----------------------------------------------------------------------------
+// Device I2C address (7-bit).
+const AddressDefault = 0x68
 
-const (
-	// 7-bit I2C address (1101_000b).
-	AddressDefault = 0x68
-)
+// SMBus Alert Response Address (7-bit form for TinyGo).
+const ARAAddress = 0x0C
 
 // -----------------------------------------------------------------------------
 // Register map (16-bit word registers)
 // -----------------------------------------------------------------------------
 
-// Alert limit threshold registers (write thresholds here; formats match telemetry).
-// VBAT limits are per-cell.
+// Alert limit threshold registers (formats match telemetry). VBAT limits are per-cell.
 const (
 	regVBATLoAlertLimit     = 0x01 // VBAT format (per-cell)
 	regVBATHiAlertLimit     = 0x02 // VBAT format (per-cell)
@@ -54,23 +48,34 @@ const (
 	regVinUvclSetting  = 0x16 // R/W
 )
 
-// --- SMBus ARA
-// SMBus Alert Response Address: datasheet quotes 0x19 (8-bit incl. R/W).
-// TinyGo I2C expects a 7-bit address, which is 0x0C.
-const ARAAddress = 0x0C
+// JEITA thresholds and targets (lithium).
+const (
+	regJEITAT1 = 0x1F // R/W (NTC_RATIO)
+	regJEITAT2 = 0x20 // R/W
+	regJEITAT3 = 0x21 // R/W
+	regJEITAT4 = 0x22 // R/W
+	regJEITAT5 = 0x23 // R/W
+	regJEITAT6 = 0x24 // R/W
 
-// --- Charger targets/timers and config (note: some parts are read-only in fixed-chem modes)
+	regJEITAVchg_2_4 = 0x26 // VCHARGE codes: R/W (regions 2..4 packed)
+	regJEITAVchg_5_6 = 0x25 // VCHARGE codes: R/W (regions 5..6 packed)
+	regJEITAIchg_2_4 = 0x28 // ICHARGE codes: R/W (regions 2..4 packed)
+	regJEITAIchg_5_6 = 0x27 // ICHARGE codes: R/W (regions 5..6 packed)
+)
+
+// Targets/timers (note: some parts are read-only in fixed-chem modes).
 const (
 	regIChargeTarget   = 0x1A // ICHARGE_TARGET (R/W)      [5-bit field]
-	regVChargeSetting  = 0x1B // VCHARGE_SETTING (R/W)     [6-bit field, LA use]
+	regVChargeSetting  = 0x1B // VCHARGE_SETTING (R/W)     [6-bit LA field]
 	regCOverXThreshold = 0x1C // C/X_THRESHOLD (R/W)
 	regMaxCVTime       = 0x1D // MAX_CV_TIME (R/W)         [s]
 	regMaxChargeTime   = 0x1E // MAX_CHARGE_TIME (R/W)     [s]
 	regChargerCfgBits  = 0x29 // CHARGER_CONFIG_BITS (R/W)
-	regVAbsorbDelta    = 0x2A // VABSORB_DELTA (R/W)       [LA, per-cell]
-	regMaxAbsorbTime   = 0x2B
+	regVAbsorbDelta    = 0x2A // VABSORB_DELTA (R/W)       [LA & LiFePO4, per-cell]
+	regMaxAbsorbTime   = 0x2B // MAX_ABSORB_TIME (R/W)     [s]
 	regVEqualizeDelta  = 0x2C // VEQUALIZE_DELTA (R/W)     [LA, per-cell]
 	regEqualizeTime    = 0x2D // EQUALIZE_TIME (R/W)       [s]
+	regLiFePO4RchgTh   = 0x2E // LiFePO4_RECHARGE_THRESHOLD (R/W) [per-cell]
 )
 
 // Effective DAC read-backs (applied targets after algorithms/JEITA)
@@ -97,12 +102,17 @@ const (
 	regNTCRatio          = 0x40 // R
 	regBSR               = 0x41 // R
 	regChemCells         = 0x43 // R
-	regIChargeBSR        = 0x48 // ICHARGE_BSR (R), IBAT used for BSR calc
+	regIChargeBSR        = 0x48 // ICHARGE_BSR (R)
 	regMeasSysValid      = 0x4A // R (bit0 indicates valid)
+
+	// Timer read-backs (exposed as convenience helpers).
+	regCVTimer       = 0x31 // lithium CV timer (R)
+	regAbsorbTimer   = 0x32 // LiFePO4 / Lead-acid absorb timer (R)
+	regEqualizeTimer = 0x33 // Lead-acid equalise timer (R)
 )
 
 // -----------------------------------------------------------------------------
-// Bitfields (positions)
+// Bitfields
 // -----------------------------------------------------------------------------
 
 // CONFIG_BITS (0x14)
@@ -142,10 +152,6 @@ const (
 	IntvccGt4p3V    SystemStatus = 1 << 1
 	IntvccGt2p8V    SystemStatus = 1 << 0
 )
-
-// -----------------------------------------------------------------------------
-// Typed masks using alias pattern (enables ↔ alerts share bit definitions)
-// -----------------------------------------------------------------------------
 
 // LIMIT_ALERTS / EN_LIMIT_ALERTS (0x36 / 0x0D)
 type LimitBits uint16
@@ -191,15 +197,12 @@ const (
 	BatShortFault      ChargerStateBits = 1 << 0
 )
 
-// CHARGE_STATUS bits reused across status (0x35), enables (0x0F), and alerts (0x38).
+// CHARGE_STATUS (0x35 / 0x0F / 0x38) shared bit definitions
 type ChargeStatusBits uint16
-
-// Aliases by register context
-type ChargeStatus = ChargeStatusBits       // 0x35 (read-only status)
+type ChargeStatus = ChargeStatusBits       // 0x35 (R)
 type ChargeStatusEnable = ChargeStatusBits // 0x0F (enable mask)
 type ChargeStatusAlerts = ChargeStatusBits // 0x38 (R/Clear)
 
-// Bit definitions (one set only)
 const (
 	VinUvclActive  ChargeStatusBits = 1 << 3
 	IinLimitActive ChargeStatusBits = 1 << 2
