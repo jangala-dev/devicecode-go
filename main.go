@@ -45,9 +45,6 @@ const (
 	TICK = 100 * time.Millisecond // balances debounce precision and MCU overhead
 )
 
-// LED
-const pwmTop = 4095
-
 // -----------------------------------------------------------------------------
 // Topics
 // -----------------------------------------------------------------------------
@@ -375,6 +372,49 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
 		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
 		w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
+		// Full bitfield maps (0/1) for LOCF pipelines
+		{
+			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.kvInt("power/charger/internal/system/"+bitName, 1)
+				} else {
+					w.kvInt("power/charger/internal/system/"+bitName, 0)
+				}
+			}
+		}
+		{
+			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.kvInt("power/charger/internal/charge_status/"+bitName, 1)
+				} else {
+					w.kvInt("power/charger/internal/charge_status/"+bitName, 0)
+				}
+			}
+		}
+		{
+			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.kvInt("power/charger/internal/charger_state/"+bitName, 1)
+				} else {
+					w.kvInt("power/charger/internal/charger_state/"+bitName, 0)
+				}
+			}
+		}
 		w.end()
 	}
 }
@@ -589,9 +629,9 @@ func main() {
 			// 3) LED behaviour
 			r.stepLED()
 
-			// 4) Periodic memory snapshot (~2 s)
+			// 4) Periodic memory snapshot (~3 s)
 			memTick++
-			if memTick%30 == 0 { // 8 * 250 ms = 2 s
+			if memTick%30 == 0 { // 30 * 100 ms = 3 s
 				r.emitMemSnapshot()
 			}
 		case <-ctx.Done():
@@ -728,7 +768,7 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 			isys := *lastIIn - v.IBatMilliA
 			log.Print(" | ISYS≈", int(isys), "mA")
 		}
-		log.Println()
+
 	case types.ChargerValue:
 		log.Print("[value] ", dom, "/", kind, "/", name,
 			" | VIN=", int(v.VIN_mV), "mV | VSYS=", int(v.VSYS_mV), "mV | IIN=", int(v.IIn_mA), "mA")
@@ -739,10 +779,59 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 				log.Print(" | ISYS≈", int(isys), "mA")
 			}
 		}
+		// ---- human-readable (SET bits only) ----
+		{
+			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
+			first := true
+			log.Print(" | system=[")
+			for name, ok := it.Next(); ok; name, ok = it.Next() {
+				if !first {
+					log.Print(",")
+				} else {
+					first = false
+				}
+				log.Print(name)
+			}
+			log.Print("]")
+		}
+		{
+			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
+			first := true
+			log.Print(" | charge_status=[")
+			for name, ok := it.Next(); ok; name, ok = it.Next() {
+				if !first {
+					log.Print(",")
+				} else {
+					first = false
+				}
+				log.Print(name)
+			}
+			log.Print("]")
+		}
+		{
+			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
+			first := true
+			log.Print(" | charger_state=[")
+			for name, ok := it.Next(); ok; name, ok = it.Next() {
+				if !first {
+					log.Print(",")
+				} else {
+					first = false
+				}
+				log.Print(name)
+			}
+			log.Print("]")
+		}
 		log.Println()
+
 	default:
 		// ignore others
 	}
+}
+
+// helper: prefix for status lines (keeps logger zero-alloc style)
+func (r *Reactor) logPrefixStatus(path, label string) {
+	log.Print("[status] ", path, " ", label, ": ")
 }
 
 func printCapStatus(m *bus.Message) {

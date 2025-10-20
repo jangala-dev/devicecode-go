@@ -93,3 +93,138 @@ type NTCRatioWindowRaw struct{ Hi, Lo uint16 }
 type ChargerConfigBitsUpdate struct {
 	Set, Clear uint16
 }
+
+// SYSTEM_STATUS (0x39)
+type SystemStatus uint16
+
+const (
+	ChargerEnabled  SystemStatus = 1 << 13
+	MpptEnPin       SystemStatus = 1 << 11
+	EqualizeReq     SystemStatus = 1 << 10
+	DrvccGood       SystemStatus = 1 << 9
+	CellCountError  SystemStatus = 1 << 8
+	OkToCharge      SystemStatus = 1 << 6
+	NoRt            SystemStatus = 1 << 5
+	ThermalShutdown SystemStatus = 1 << 4
+	VinOvlo         SystemStatus = 1 << 3
+	VinGtVbat       SystemStatus = 1 << 2
+	IntvccGt4p3V    SystemStatus = 1 << 1
+	IntvccGt2p8V    SystemStatus = 1 << 0
+)
+
+// CHARGER_STATE_ALERTS (0x37)
+type ChargerStateBits uint16
+
+const (
+	EqualizeCharge     ChargerStateBits = 1 << 10
+	AbsorbCharge       ChargerStateBits = 1 << 9
+	ChargerSuspended   ChargerStateBits = 1 << 8
+	Precharge          ChargerStateBits = 1 << 7
+	CCCVCharge         ChargerStateBits = 1 << 6
+	NTCPause           ChargerStateBits = 1 << 5
+	TimerTerm          ChargerStateBits = 1 << 4
+	COverXTerm         ChargerStateBits = 1 << 3
+	MaxChargeTimeFault ChargerStateBits = 1 << 2
+	BatMissingFault    ChargerStateBits = 1 << 1
+	BatShortFault      ChargerStateBits = 1 << 0
+)
+
+// CHARGE_STATUS (0x38)
+type ChargeStatusBits uint16
+
+const (
+	VinUvclActive  ChargeStatusBits = 1 << 3
+	IinLimitActive ChargeStatusBits = 1 << 2
+	ConstCurrent   ChargeStatusBits = 1 << 1
+	ConstVoltage   ChargeStatusBits = 1 << 0
+)
+
+// Generic pairing of a bit value with a printable name.
+// T is a uint16-like type (e.g., SystemStatus, ChargerStateBits, ChargeStatusBits).
+type BitName[T ~uint16] struct {
+	Bit  T
+	Name string
+}
+
+// BitIter is a zero-alloc iterator over set bits in a value, filtered by a table.
+// Caller advances with Next(); no callbacks, no closures.
+type BitIter[T ~uint16] struct {
+	v     uint16
+	i     int
+	table []BitName[T]
+}
+
+// NewBitIter constructs an iterator over set bits present in v that also exist in table.
+func NewBitIter[T ~uint16](v T, table []BitName[T]) BitIter[T] {
+	return BitIter[T]{v: uint16(v), i: 0, table: table}
+}
+
+// Next returns the next SET bit: (name, ok). ok=false when done.
+func (it *BitIter[T]) Next() (string, bool) {
+	for it.i < len(it.table) {
+		e := it.table[it.i]
+		it.i++
+		if (it.v & uint16(e.Bit)) != 0 {
+			return e.Name, true
+		}
+	}
+	return "", false
+}
+
+// Reset allows reusing the iterator.
+func (it *BitIter[T]) Reset() { it.i = 0 }
+
+// NextAny returns the next table entry: (name, set, ok).
+// set indicates whether the bit is present in the value.
+func (it *BitIter[T]) NextAny() (string, bool, bool) {
+	if it.i >= len(it.table) {
+		return "", false, false
+	}
+	e := it.table[it.i]
+	it.i++
+	set := (it.v & uint16(e.Bit)) != 0
+	return e.Name, set, true
+}
+
+// -----------------------------
+// Display tables for bitfields
+// -----------------------------
+
+// ChargerStateBits display (ordering is cosmetic).
+var ChargerStateTable = [...]BitName[ChargerStateBits]{
+	{BatShortFault, "bat_short"},
+	{BatMissingFault, "bat_missing"},
+	{MaxChargeTimeFault, "max_charge_time_fault"},
+	{COverXTerm, "c_over_x_term"},
+	{TimerTerm, "timer_term"},
+	{NTCPause, "ntc_pause"},
+	{Precharge, "precharge"},
+	{CCCVCharge, "cccv"},
+	{AbsorbCharge, "absorb"},
+	{EqualizeCharge, "equalize"},
+	{ChargerSuspended, "suspended"},
+}
+
+// ChargeStatusBits display.
+var ChargeStatusTable = [...]BitName[ChargeStatusBits]{
+	{IinLimitActive, "iin_limited"},
+	{VinUvclActive, "uvcl_active"},
+	{ConstCurrent, "cc_phase"},
+	{ConstVoltage, "cv_phase"},
+}
+
+// SystemStatus display.
+var SystemStatusTable = [...]BitName[SystemStatus]{
+	{ChargerEnabled, "charger_enabled"},
+	{MpptEnPin, "mppt_en_pin"},
+	{EqualizeReq, "equalize_req"},
+	{DrvccGood, "drvcc_good"},
+	{CellCountError, "cell_count_error"},
+	{OkToCharge, "ok_to_charge"},
+	{NoRt, "no_rt"},
+	{ThermalShutdown, "thermal_shutdown"},
+	{VinOvlo, "vin_ovlo"},
+	{VinGtVbat, "vin_gt_vbat"},
+	{IntvccGt4p3V, "intvcc_gt_4p3v"},
+	{IntvccGt2p8V, "intvcc_gt_2p8v"},
+}
