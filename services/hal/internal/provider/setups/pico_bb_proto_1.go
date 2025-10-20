@@ -54,7 +54,7 @@ var SelectedSetup = types.HALConfig{
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
-			Bus: "i2c1", Addr: 0x67, SMBAlertPin: 20,
+			Bus: "i2c1", Addr: 0x68, SMBAlertPin: 20,
 			RSNSB_uOhm: 3330, RSNSI_uOhm: 3330, Cells: 6,
 			Chem:       "leadacid",
 			NTCBiasOhm: 10000, R25Ohm: 10000, BetaK: 3435,
