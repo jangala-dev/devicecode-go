@@ -768,6 +768,7 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 			isys := *lastIIn - v.IBatMilliA
 			log.Print(" | ISYS≈", int(isys), "mA")
 		}
+		log.Println()
 
 	case types.ChargerValue:
 		log.Print("[value] ", dom, "/", kind, "/", name,
