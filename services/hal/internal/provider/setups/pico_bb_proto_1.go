@@ -39,8 +39,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart0",
 			Baud:   115_200,
-			RXSize: 128,
-			TXSize: 128,
+			RXSize: 32,
+			TXSize: 1024,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -49,8 +49,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 128,
-			TXSize: 128,
+			RXSize: 32,
+			TXSize: 512,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{

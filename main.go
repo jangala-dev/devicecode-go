@@ -641,7 +641,7 @@ func main() {
 }
 
 // -----------------------------------------------------------------------------
-// HAL readiness helper (retained)
+// HAL readiness helper
 // -----------------------------------------------------------------------------
 
 func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool {
