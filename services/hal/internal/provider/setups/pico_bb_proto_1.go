@@ -40,7 +40,7 @@ var SelectedSetup = types.HALConfig{
 			Name:   "uart0",
 			Baud:   115_200,
 			RXSize: 32,
-			TXSize: 2048,
+			TXSize: 1024,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
