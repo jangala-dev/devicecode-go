@@ -1,6 +1,6 @@
 # Board Test Harness for Pico (RP2040)
 
-This harness exercises Pico-based boards using HAL. It sequences the power rails up and down for multimeter checks and verifies that values are arriving from the **LTC4015** (battery + charger) and **AHT20** (temperature + humidity). It reports **PASS/FAIL** on both UARTs and flashes the button LED (double short = PASS, single long = FAIL).
+This harness exercises our low speed board using HAL. It sequences the power rails up and down for multimeter checks and verifies that values are arriving from the **LTC4015** (battery + charger) and **AHT20** (temperature + humidity). It reports **PASS/FAIL** on both UARTs and flashes the button LED (double short = PASS, single long = FAIL).
 
 ## Prerequisites
 
@@ -64,9 +64,8 @@ HAL auto-polling is assumed; the harness only observes messages.
 
 ## Adjustments (edit `main.go` constants)
 
-* `powerSeq`: list of switch names to exercise. Must match your setup (e.g. `mpcie-usb`, `m2`, `mpcie`, `cm5`, `fan`, `boost-load`). Remove or add to fit the board.
+* `powerSeq`: list of switch names to exercise. Must match your setup (eg. `mpcie-usb`, `m2`, `mpcie`, `cm5`, `fan`, `boost-load`). Remove or add to fit the board.
 * Timings:
-
   * `stepDelayUp` / `stepDelayDown`: delay between per-rail operations.
   * `dwellUp` / `dwellDown`: time held fully up or fully down.
   * `freshMaxAge`: how recent a sensor value must be to count as OK.
