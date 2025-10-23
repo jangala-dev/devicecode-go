@@ -24,7 +24,7 @@ Build tags select the wiring plan and initial HAL config:
 or:
 
 ```bash
-tinygo flash -target pico -tags "pico pico_bb_proto_1" ./cmd/boardtest
+tinygo flash -target pico -tags "pico_bb_proto_1" ./cmd/boardtest
 ```
 
 ## What the harness does
