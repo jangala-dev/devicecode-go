@@ -40,7 +40,7 @@ var SelectedSetup = types.HALConfig{
 			Name:   "uart0",
 			Baud:   115_200,
 			RXSize: 32,
-			TXSize: 1024,
+			TXSize: 2048,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -50,7 +50,7 @@ var SelectedSetup = types.HALConfig{
 			Name:   "uart1",
 			Baud:   115_200,
 			RXSize: 32,
-			TXSize: 512,
+			TXSize: 256,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
@@ -64,7 +64,7 @@ var SelectedSetup = types.HALConfig{
 			Boot: []types.BootAction{
 				{Verb: "configure", Payload: types.ChargerConfigure{
 					VinLo_mV: PtrI32(9000), VinHi_mV: PtrI32(11000),
-					BSRHigh_uOhmPerCell: PtrU32(100000),
+					BSRHigh_uOhmPerCell: PtrU32(100000), IChargeTarget_mA: PtrI32(5000),
 					// optional config-bit changes, limits, etc.
 				}},
 				{Verb: "enable"},

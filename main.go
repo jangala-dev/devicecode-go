@@ -37,7 +37,7 @@ const (
 // Debounce and data freshness
 const (
 	DEBOUNCE_OK = 300 * time.Millisecond
-	STALE_MAX   = 2 * time.Second
+	STALE_MAX   = 4 * time.Second
 )
 
 // Supervisory cadence
@@ -121,7 +121,7 @@ type Reactor struct {
 	ui *bus.Connection
 
 	// UART
-	uart0Tx *shmring.Ring // telemetry (JSON to UART0)
+	jsonOut *shmring.Ring // telemetry (JSON UART TX)
 	// Logger UART1 already handled by global logger (see SetUART1)
 
 	// inputs (latest)
@@ -365,9 +365,9 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 	r.tsVIN = r.now
 
 	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
-	if r.uart0Tx != nil {
+	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.uart0Tx
+		w.r = r.jsonOut
 		w.begin()
 		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
 		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
@@ -395,9 +395,9 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 					break
 				}
 				if set {
-					w.kvInt("power/charger/internal/charge_status/"+bitName, 1)
+					w.kvInt("power/charger/internal/status/"+bitName, 1)
 				} else {
-					w.kvInt("power/charger/internal/charge_status/"+bitName, 0)
+					w.kvInt("power/charger/internal/status/"+bitName, 0)
 				}
 			}
 		}
@@ -409,9 +409,9 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 					break
 				}
 				if set {
-					w.kvInt("power/charger/internal/charger_state/"+bitName, 1)
+					w.kvInt("power/charger/internal/state/"+bitName, 1)
 				} else {
-					w.kvInt("power/charger/internal/charger_state/"+bitName, 0)
+					w.kvInt("power/charger/internal/state/"+bitName, 0)
 				}
 			}
 		}
@@ -425,9 +425,9 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 	r.tsVBAT = r.now
 
 	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
-	if r.uart0Tx != nil {
+	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.uart0Tx
+		w.r = r.jsonOut
 		w.begin()
 		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
 		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
@@ -439,9 +439,9 @@ func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	r.lastTDeci = deci
 	r.tsTemp = r.now
 	log.Deci(label, deci)
-	if r.uart0Tx != nil {
+	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.uart0Tx
+		w.r = r.jsonOut
 		w.begin()
 		w.kvInt(jsonKey, deci)
 		w.end()
@@ -463,9 +463,9 @@ func (r *Reactor) emitMemSnapshot() {
 		"frees:", int(ms.Frees),
 	)
 	// JSON (minimal to keep overhead low)
-	if r.uart0Tx != nil {
+	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.uart0Tx
+		w.r = r.jsonOut
 		w.begin()
 		w.kvInt("sys/mem/alloc", int(ms.Alloc))
 		w.end()
@@ -484,7 +484,7 @@ func main() {
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
-	b := bus.NewBus(4, "+", "#")
+	b := bus.NewBus(3, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
@@ -538,7 +538,7 @@ func main() {
 		// ---- UART session opened/closed ----
 		case m := <-subSessOpenTele.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				r.uart0Tx = shmring.Get(shmring.Handle(ev.TXHandle))
+				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
 				log.Println("[uart0] telemetry session opened")
 			}
 		case m := <-subSessOpenLog.Channel():
@@ -547,7 +547,7 @@ func main() {
 				log.Println("[uart1] log session opened")
 			}
 		case <-subSessClosedTele.Channel():
-			r.uart0Tx = nil
+			r.jsonOut = nil
 			log.Println("[uart0] telemetry session closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryTeleAt) {
@@ -573,9 +573,9 @@ func main() {
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 				// JSON
-				if r.uart0Tx != nil {
+				if r.jsonOut != nil {
 					var w jsonw
-					w.r = r.uart0Tx
+					w.r = r.jsonOut
 					w.begin()
 					w.kvInt("env/humidity/core", int(v.RHx100))
 					w.end()
@@ -602,14 +602,14 @@ func main() {
 		case m := <-evSub.Channel():
 			printCapEvent(m)
 			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
-			if r.uart0Tx != nil {
+			if r.jsonOut != nil {
 				dom, _ := m.Topic.At(2).(string)
 				kind, _ := m.Topic.At(3).(string)
 				name, _ := m.Topic.At(4).(string)
 				tag, _ := m.Topic.At(6).(string)
 				if dom != "" && kind != "" && name != "" && tag != "" {
 					var w jsonw
-					w.r = r.uart0Tx
+					w.r = r.jsonOut
 					w.begin()
 					w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
 					w.end()
@@ -798,7 +798,7 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 		{
 			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
 			first := true
-			log.Print(" | charge_status=[")
+			log.Print(" | status=[")
 			for name, ok := it.Next(); ok; name, ok = it.Next() {
 				if !first {
 					log.Print(",")
@@ -812,7 +812,7 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 		{
 			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
 			first := true
-			log.Print(" | charger_state=[")
+			log.Print(" | state=[")
 			for name, ok := it.Next(); ok; name, ok = it.Next() {
 				if !first {
 					log.Print(",")
