@@ -64,7 +64,7 @@ var SelectedSetup = types.HALConfig{
 			Boot: []types.BootAction{
 				{Verb: "configure", Payload: types.ChargerConfigure{
 					VinLo_mV: PtrI32(9000), VinHi_mV: PtrI32(11000),
-					BSRHigh_uOhmPerCell: PtrU32(100000), IChargeTarget_mA: PtrI32(5000),
+					BSRHigh_uOhmPerCell: PtrU32(100000), IChargeTarget_mA: PtrI32(9600),
 					// optional config-bit changes, limits, etc.
 				}},
 				{Verb: "enable"},
