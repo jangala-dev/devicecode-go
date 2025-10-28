@@ -436,8 +436,6 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 }
 
 func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
-	r.lastTDeci = deci
-	r.tsTemp = r.now
 	log.Deci(label, deci)
 	if r.jsonOut != nil {
 		var w jsonw
@@ -567,7 +565,10 @@ func main() {
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
 				r.now = time.Now()
-				r.OnTempDeciC("[value] env/temperature/core °C=", int(v.DeciC), "env/temperature/core")
+				deci := int(v.DeciC)
+				r.lastTDeci = deci
+				r.tsTemp = r.now
+				r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
 			}
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
