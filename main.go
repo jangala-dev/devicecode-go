@@ -153,8 +153,8 @@ type Reactor struct {
 	// misc
 	now time.Time
 
-	// telemetry drops counters
-	droppedUART0 int
+	// telemetry drop counters (bytes)
+	droppedUART0Bytes int
 }
 
 func NewReactor(ui *bus.Connection) *Reactor {
@@ -367,7 +367,7 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
 	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.jsonOut
+		w.write = r.jsonWrite
 		w.begin()
 		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
 		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
@@ -427,7 +427,7 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
 	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.jsonOut
+		w.write = r.jsonWrite
 		w.begin()
 		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
 		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
@@ -441,7 +441,7 @@ func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	log.Deci(label, deci)
 	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.jsonOut
+		w.write = r.jsonWrite
 		w.begin()
 		w.kvInt(jsonKey, deci)
 		w.end()
@@ -465,7 +465,7 @@ func (r *Reactor) emitMemSnapshot() {
 	// JSON (minimal to keep overhead low)
 	if r.jsonOut != nil {
 		var w jsonw
-		w.r = r.jsonOut
+		w.write = r.jsonWrite
 		w.begin()
 		w.kvInt("sys/mem/alloc", int(ms.Alloc))
 		w.end()
@@ -575,7 +575,7 @@ func main() {
 				// JSON
 				if r.jsonOut != nil {
 					var w jsonw
-					w.r = r.jsonOut
+					w.write = r.jsonWrite
 					w.begin()
 					w.kvInt("env/humidity/core", int(v.RHx100))
 					w.end()
@@ -609,7 +609,7 @@ func main() {
 				tag, _ := m.Topic.At(6).(string)
 				if dom != "" && kind != "" && name != "" && tag != "" {
 					var w jsonw
-					w.r = r.jsonOut
+					w.write = r.jsonWrite
 					w.begin()
 					w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
 					w.end()
@@ -664,87 +664,124 @@ func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool 
 }
 
 // -----------------------------------------------------------------------------
+// Centralised UART write helpers (handle partial writes)
+// -----------------------------------------------------------------------------
+
+// uart0 (telemetry JSON) — returns bytes written; tracks dropped bytes on partial writes.
+func (r *Reactor) jsonWrite(b []byte) int {
+	if r == nil || r.jsonOut == nil || len(b) == 0 {
+		return 0
+	}
+	n := r.jsonOut.TryWriteFrom(b)
+	if n < len(b) {
+		r.droppedUART0Bytes += (len(b) - n)
+		// Rate-limited note
+		if r.droppedUART0Bytes == (len(b)-n) || (r.droppedUART0Bytes%1024) == 0 {
+			log.Println("[uart0] dropped bytes =", r.droppedUART0Bytes)
+		}
+	}
+	return n
+}
+
+// uart1 (logger mirror) — returns bytes written; tracks dropped bytes on partial writes.
+func (l *Logger) logWrite(b []byte) int {
+	if l == nil || l.target == nil || len(b) == 0 {
+		return 0
+	}
+	n := l.target.TryWriteFrom(b)
+	if n < len(b) {
+		l.droppedUART1Bytes += (len(b) - n)
+		// Avoid recursion; print to console directly.
+		if l.droppedUART1Bytes == (len(b)-n) || (l.droppedUART1Bytes%1024) == 0 {
+			print("[uart1] dropped bytes = ")
+			print(strconvx.Itoa(l.droppedUART1Bytes))
+			print("\n")
+		}
+	}
+	return n
+}
+
+// -----------------------------------------------------------------------------
 // Minimal streaming JSON writer for shmring (no buffers/allocs)
 // -----------------------------------------------------------------------------
 
 type jsonw struct {
-	r     *shmring.Ring
+	write func([]byte) int
 	first bool
 }
 
 func (w *jsonw) begin() {
 	w.first = true
-	if w.r != nil {
-		_ = w.r.TryWriteFrom([]byte("{"))
+	if w.write != nil {
+		w.write([]byte("{"))
 	}
 }
 func (w *jsonw) end() {
-	if w.r != nil {
-		_ = w.r.TryWriteFrom([]byte("}\n"))
+	if w.write != nil {
+		w.write([]byte("}\n"))
 	}
 }
 func (w *jsonw) comma() {
-	if w.r == nil {
+	if w.write == nil {
 		return
 	}
 	if !w.first {
-		_ = w.r.TryWriteFrom([]byte(","))
+		w.write([]byte(","))
 	} else {
 		w.first = false
 	}
 }
 func (w *jsonw) key(k string) {
-	if w.r == nil {
+	if w.write == nil {
 		return
 	}
-	_ = w.r.TryWriteFrom([]byte(`"`))
-	_ = w.r.TryWriteFrom([]byte(k))
-	_ = w.r.TryWriteFrom([]byte(`":`))
+	w.write([]byte(`"`))
+	w.write([]byte(k))
+	w.write([]byte(`":`))
 }
 func (w *jsonw) kvInt(k string, v int) {
 	w.comma()
 	w.key(k)
-	if w.r != nil {
-		_ = w.r.TryWriteFrom([]byte(strconvx.Itoa(v)))
+	if w.write != nil {
+		w.write([]byte(strconvx.Itoa(v)))
 	}
 }
 func (w *jsonw) kvStr(k, s string) {
 	w.comma()
 	w.key(k)
-	if w.r == nil {
+	if w.write == nil {
 		return
 	}
-	_ = w.r.TryWriteFrom([]byte(`"`))
+	w.write([]byte(`"`))
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
 		case '\\', '"':
-			_ = w.r.TryWriteFrom([]byte{'\\', c})
+			w.write([]byte{'\\', c})
 		case '\b':
-			_ = w.r.TryWriteFrom([]byte{'\\', 'b'})
+			w.write([]byte{'\\', 'b'})
 		case '\f':
-			_ = w.r.TryWriteFrom([]byte{'\\', 'f'})
+			w.write([]byte{'\\', 'f'})
 		case '\n':
-			_ = w.r.TryWriteFrom([]byte{'\\', 'n'})
+			w.write([]byte{'\\', 'n'})
 		case '\r':
-			_ = w.r.TryWriteFrom([]byte{'\\', 'r'})
+			w.write([]byte{'\\', 'r'})
 		case '\t':
-			_ = w.r.TryWriteFrom([]byte{'\\', 't'})
+			w.write([]byte{'\\', 't'})
 		default:
 			if c < 0x20 {
-				// \u00XX escape for other controls
 				var buf [6]byte
 				buf[0], buf[1], buf[2], buf[3] = '\\', 'u', '0', '0'
-				hex := "0123456789abcdef"
+				const hex = "0123456789abcdef"
 				buf[4] = hex[c>>4]
 				buf[5] = hex[c&0xF]
-				_ = w.r.TryWriteFrom(buf[:])
+				w.write(buf[:])
 			} else {
-				_ = w.r.TryWriteFrom([]byte{c})
+				w.write([]byte{c})
 			}
 		}
 	}
-	_ = w.r.TryWriteFrom([]byte(`"`))
+	w.write([]byte(`"`))
 }
 
 // -----------------------------------------------------------------------------
@@ -880,9 +917,10 @@ func printCapEvent(m *bus.Message) {
 // -----------------------------------------------------------------------------
 
 type Logger struct {
-	target    *shmring.Ring
-	t0        time.Time
-	lineStart bool
+	target            *shmring.Ring
+	t0                time.Time
+	lineStart         bool
+	droppedUART1Bytes int // mirror dropped bytes
 }
 
 var nl = [...]byte{'\n'}
@@ -894,9 +932,7 @@ func (l *Logger) writeString(s string) {
 	l.writePrefixIfLineStart()
 	if s != "" {
 		print(s)
-		if l.target != nil {
-			_ = l.target.TryWriteFrom([]byte(s))
-		}
+		l.logWrite([]byte(s))
 	}
 }
 func (l *Logger) writeBytes(b []byte) {
@@ -905,9 +941,7 @@ func (l *Logger) writeBytes(b []byte) {
 	}
 	l.writePrefixIfLineStart()
 	print(string(b))
-	if l.target != nil {
-		_ = l.target.TryWriteFrom(b)
-	}
+	l.logWrite(b)
 }
 func (l *Logger) writePrefixIfLineStart() {
 	if !l.lineStart {
@@ -943,7 +977,7 @@ func (l *Logger) writePrefixIfLineStart() {
 		n += writeDecPad3(buf[:], n, ms)
 		buf[n] = ' '
 		n++
-		_ = l.target.TryWriteFrom(buf[:n])
+		l.logWrite(buf[:n])
 	}
 }
 func writeDecPad3(dst []byte, off int, v int) int {
@@ -1011,9 +1045,7 @@ func (l *Logger) Print(parts ...any) {
 }
 func (l *Logger) newline() {
 	print("\n")
-	if l.target != nil {
-		_ = l.target.TryWriteFrom(nl[:])
-	}
+	l.logWrite(nl[:])
 	l.lineStart = true
 }
 func (l *Logger) Println(parts ...any) { l.Print(parts...); l.newline() }
