@@ -489,6 +489,15 @@ func (d *Device) applyConfigure(c types.ChargerConfigure) {
 			_ = d.dev.SetConfigBits(ltc4015.SuspendCharger)
 		}
 	}
+	if c.LeadAcidTempComp != nil {
+		if d.dev.Chem() == ltc4015.ChemLeadAcid {
+			if *c.LeadAcidTempComp {
+				_ = d.dev.SetChargerConfigBits(ltc4015.EnLeadAcidTempComp)
+			} else {
+				_ = d.dev.ClearChargerConfigBits(ltc4015.EnLeadAcidTempComp)
+			}
+		}
+	}
 
 	// Targets and limits
 	if c.IinLimit_mA != nil {

@@ -46,7 +46,9 @@ type SetVinWindow struct{ Lo_mV, Hi_mV int32 } // verb: "set_vin_window"
 // ChargerConfigure is a partial update. Nil means "leave as-is".
 type ChargerConfigure struct {
 	// Global behaviour
-	Enable   *bool   `json:"enable,omitempty"`    // true => resume, false => suspend
+	Enable           *bool `json:"enable,omitempty"`              // true => resume, false => suspend
+	LeadAcidTempComp *bool `json:"lead_acid_temp_comp,omitempty"` // true => enable LA temp comp, false => disable LA temp comp
+
 	CfgSet   *uint16 `json:"cfg_set,omitempty"`   // ltc4015.ConfigBits mask to SET
 	CfgClear *uint16 `json:"cfg_clear,omitempty"` // ltc4015.ConfigBits mask to CLEAR
 
