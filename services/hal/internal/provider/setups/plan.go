@@ -21,3 +21,7 @@ type UARTPlan struct {
 	RX   int    // GPIO number
 	Baud uint32 // initial baud (format can be added later)
 }
+
+func PtrI32(v int32) *int32   { return &v }
+func PtrU32(v uint32) *uint32 { return &v }
+func PtrU16(v uint16) *uint16 { return &v }

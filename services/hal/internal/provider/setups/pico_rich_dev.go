@@ -39,8 +39,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart0",
 			Baud:   115_200,
-			RXSize: 128,
-			TXSize: 128,
+			RXSize: 32,
+			TXSize: 2048,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -49,16 +49,27 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 128,
-			TXSize: 128,
+			RXSize: 32,
+			TXSize: 256,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
-			Bus: "i2c1", Addr: 0, RSNSB_uOhm: 3_330, RSNSI_uOhm: 1_670, Cells: 6,
-			Chem: "leadacid", SMBAlertPin: 20, VinLo_mV: 9_000, VinHi_mV: 11_000,
-			BSRHi_uOhmPerCell: 100_000,
-			DomainBattery:     "power", DomainCharger: "power", Name: "internal",
-			NTCBiasOhm: 10_000, R25Ohm: 10_000, BetaK: 3435,
+			Bus: "i2c1", Addr: 0x68, SMBAlertPin: 20,
+			RSNSB_uOhm: 3330, RSNSI_uOhm: 1670, Cells: 6,
+			Chem:       "leadacid",
+			NTCBiasOhm: 10000, R25Ohm: 10000, BetaK: 3435,
+			QCountPrescale: 0,
+			DomainBattery:  "power", DomainCharger: "power", Name: "internal",
+
+			Boot: []types.BootAction{
+				// {Verb: "disable"},
+				{Verb: "configure", Payload: types.ChargerConfigure{
+					VinLo_mV: PtrI32(9000), VinHi_mV: PtrI32(11000),
+					BSRHigh_uOhmPerCell: PtrU32(100000), IChargeTarget_mA: PtrI32(2000),
+					// optional config-bit changes, limits, etc.
+				}},
+				{Verb: "enable"},
+			},
 		}},
 
 		// Gates / enables -> switches (power domain)

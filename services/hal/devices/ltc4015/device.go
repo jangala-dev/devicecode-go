@@ -1,3 +1,4 @@
+// services/hal/devices/ltc4015/device.go
 package ltc4015dev
 
 import (
@@ -14,61 +15,49 @@ import (
 	"tinygo.org/x/drivers"
 )
 
-// Device is a single-goroutine HAL device for LTC4015.
 type Device struct {
 	id   string
 	aBat core.CapAddr // power/battery/<name>
 	aChg core.CapAddr // power/charger/<name>
-	aTmp core.CapAddr
+	aTmp core.CapAddr // power/charger/<name>/temperature
 
-	res   core.Resources
-	i2c   drivers.I2C
-	pin   int
-	gpio  core.GPIOHandle
-	es    core.GPIOEdgeStream
-	alive atomic.Bool
+	res  core.Resources
+	i2c  drivers.I2C
+	pin  int
+	gpio core.GPIOHandle
+	es   core.GPIOEdgeStream
+
+	// Worker orchestration
+	ctx    context.Context
+	cancel context.CancelFunc
+	dev    *ltc4015.Device
+	reqCh  chan request
+	done   chan struct{}
+	alive  atomic.Bool // guards enqueue/timers after stop
+
+	// Retry timer for SMBALERT# re-service
+	retryTimer *time.Timer
+
+	// Last configured windows (for state-aware opposite-edge re-arming)
+	lastVinLo, lastVinHi           int32
+	lastVsysLo, lastVsysHi         int32
+	lastVbatLoCell, lastVbatHiCell int32
+	lastNTCHi, lastNTCLo           uint16
+
+	// Desired alert sources (user intent). Auto re-arming always applies.
+	desiredLimit  ltc4015.LimitEnable
+	desiredState  ltc4015.ChargerStateEnable
+	desiredStatus ltc4015.ChargeStatusEnable
 
 	params Params
-
-	// Owned by the worker only:
-	dev *ltc4015.Device
-
-	// Single-owner worker channels
-	reqCh chan request
-	// optional retry timer for asserted/held SMBALERT#
-	retry *time.Timer
-	done  chan struct{}
-}
-
-// Emit a tagged event and degraded status on both caps.
-func (d *Device) evtErrBoth(tag, code string) {
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
-}
-
-// Charger-only: tagged event + degraded.
-func (d *Device) evtErrChg(tag, code string) {
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
-}
-
-// Battery-only: tagged event + degraded.
-func (d *Device) evtErrBat(tag, code string) {
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag})
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
 }
 
 type opCode uint8
 
 const (
-	opSampleAll opCode = iota
-	opReadCharger
-	opEnableCharging
-	opSetIinLimit
-	opSetIChargeTarget
-	opSetVinWindow
+	opRead opCode = iota
+	opConfigure
+	opServiceAlert
 	opStop
 )
 
@@ -77,137 +66,261 @@ type request struct {
 	arg any
 }
 
-// ---- core.Device interface ----
-
 func (d *Device) ID() string { return d.id }
 
 func (d *Device) Capabilities() []core.CapabilitySpec {
-	// Static info payloads (retained by HAL at registration).
 	bi := types.BatteryInfo{
 		Cells:      d.params.Cells,
 		Chem:       d.params.Chem,
 		RSNSB_uOhm: d.params.RSNSB_uOhm,
 		Bus:        d.params.Bus,
-		Addr:       addrOrDefault(d.params.Addr),
+		Addr:       d.params.Addr,
 	}
 	ci := types.ChargerInfo{
 		RSNSI_uOhm: d.params.RSNSI_uOhm,
 		Bus:        d.params.Bus,
-		Addr:       addrOrDefault(d.params.Addr),
+		Addr:       d.params.Addr,
 	}
-
 	return []core.CapabilitySpec{
 		{
-			Domain: d.aBat.Domain,
-			Kind:   types.KindBattery,
-			Name:   d.aBat.Name,
-			Info:   types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: bi},
+			Domain: d.aBat.Domain, Kind: types.KindBattery, Name: d.aBat.Name,
+			Info: types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: bi},
 		},
 		{
-			Domain: d.aChg.Domain,
-			Kind:   types.KindCharger,
-			Name:   d.aChg.Name,
-			Info:   types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: ci},
+			Domain: d.aChg.Domain, Kind: types.KindCharger, Name: d.aChg.Name,
+			Info: types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: ci},
 		},
 		{
 			Domain: d.aTmp.Domain, Kind: types.KindTemperature, Name: d.aTmp.Name,
 			Info: types.Info{
-				SchemaVersion: 1, Driver: "ltc4015", Detail: types.TemperatureInfo{
-					Sensor: "ntc@ltc4015", Addr: addrOrDefault(d.params.Addr), Bus: d.params.Bus,
-				},
+				SchemaVersion: 1, Driver: "ltc4015",
+				Detail: types.TemperatureInfo{Sensor: "ntc@ltc4015", Addr: d.params.Addr, Bus: d.params.Bus},
 			},
 		},
 	}
 }
 
 func (d *Device) Init(ctx context.Context) error {
-	// Subscribe to falling edges on SMBALERT# with a modest buffer.
-	es, err := d.res.Reg.SubscribeGPIOEdges(d.id, d.pin, core.EdgeFalling, 2*time.Millisecond, 8)
-	if err != nil {
-		// Publish degraded status upfront; continue with worker regardless.
-		d.evtErrBoth("alert_subscribe_failed", "alert_subscribe_failed")
-		// We still start the worker; SMBALERT# will be polled via line level checks.
-	}
-	d.es = es
-
-	// Set up worker channels and start the single worker goroutine.
+	// Initialise worker channels and context *before* spawning any goroutines that call enqueue.
 	d.reqCh = make(chan request, 8)
-	d.retry = nil
 	d.done = make(chan struct{})
-
+	d.ctx, d.cancel = context.WithCancel(ctx)
 	d.alive.Store(true)
-	go d.worker(ctx)
+
+	// Subscribe to SMBALERT# falling edges (best-effort).
+	if es, err := d.res.Reg.SubscribeGPIOEdges(d.id, d.pin, core.EdgeFalling, 2*time.Millisecond, 8); err == nil {
+		d.es = es
+	} else {
+		// Degraded status if IRQ subscription fails; polling via worker will still operate.
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: "alert_subscribe_failed"})
+		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "alert_subscribe_failed"})
+	}
+
+	// Advertise initial state as degraded until the first good sample.
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: "initialising"})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "initialising"})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "initialising"})
+
+	go d.worker(d.ctx)
+
+	// Apply any boot actions declared in Params via the standard control path.
+	if d.params.Boot != nil {
+		for _, a := range d.params.Boot {
+			// Use the charger capability as the target; Control ignores the CapAddr value.
+			_, _ = d.Control(d.aChg, a.Verb, a.Payload)
+		}
+	}
+
+	// Seed a first sample.
+	d.enqueue(opRead, nil)
 	return nil
 }
 
 func (d *Device) Close() error {
-	if d.alive.Load() {
-		// best-effort stop
-		select {
-		case d.reqCh <- request{op: opStop}:
-			d.alive.Store(false)
-		default:
+	// Prevent further enqueues and stop any outstanding retry timer early.
+	d.alive.Store(false)
+	if d.retryTimer != nil {
+		if !d.retryTimer.Stop() {
+			select {
+			case <-d.retryTimer.C:
+			default:
+			}
 		}
-		// bounded wait; rely on HAL ctx cancellation in normal shutdown
-		t := time.NewTimer(300 * time.Millisecond)
-		select {
-		case <-d.done:
-		case <-t.C:
-			// Worker did not exit in time: force a local cleanup so that registry claims
-			// are not left held. This matches HAL’s expectation that Close() releases claims.
-			d.cleanup()
+		d.retryTimer = nil
+	}
+
+	// If the worker was never started, just cancel and return.
+	if d.reqCh == nil || d.done == nil {
+		if d.cancel != nil {
+			d.cancel()
 		}
-		t.Stop()
+		return nil
+	}
+
+	// Prefer an orderly stop; fallback to cancellation if the queue is full.
+	select {
+	case d.reqCh <- request{op: opStop}:
+	default:
+		if d.cancel != nil {
+			d.cancel()
+		}
+	}
+
+	// Wait for worker exit with a bounded timeout; ensure cancellation if slow.
+	t := time.NewTimer(300 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-d.done:
+		// ok
+	case <-t.C:
+		if d.cancel != nil {
+			d.cancel()
+		}
+		<-d.done
 	}
 	return nil
 }
 
-func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
-	// Map verbs to requests; all controls are non-blocking enqueue-only.
-	send := func(req request) (core.EnqueueResult, error) {
-		if !d.alive.Load() {
-			return core.EnqueueResult{OK: false, Error: errcode.Unavailable}, nil
-		}
-		select {
-		case d.reqCh <- req:
-			return core.EnqueueResult{OK: true}, nil
-		default:
-			return core.EnqueueResult{OK: false, Error: errcode.Busy}, nil
-		}
-	}
+// ---- Controls ----
 
+func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.EnqueueResult, error) {
 	switch verb {
 	case "read":
-		// Non-blocking enqueue; HAL guarantees retained values for consumers.
-		// Polling should be used for periodic sampling.
-		return send(request{op: opSampleAll})
+		d.enqueue(opRead, nil)
+		return core.EnqueueResult{OK: true}, nil
+
+	case "configure":
+		cfg, code := core.As[types.ChargerConfigure](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		d.enqueue(opConfigure, cfg)
+		return core.EnqueueResult{OK: true}, nil
+
+	// Convenience verbs -> configure partials
 	case "enable":
-		v, code := core.As[types.ChargerEnable](payload)
-		if code != "" {
-			return core.EnqueueResult{OK: false, Error: code}, nil
-		}
-		return send(request{op: opEnableCharging, arg: v})
-
-	case "set_input_limit":
-		v, code := core.As[types.SetInputLimit](payload)
-		if code != "" {
-			return core.EnqueueResult{OK: false, Error: code}, nil
-		}
-		return send(request{op: opSetIinLimit, arg: v})
-
-	case "set_charge_target":
-		v, code := core.As[types.SetChargeTarget](payload)
-		if code != "" {
-			return core.EnqueueResult{OK: false, Error: code}, nil
-		}
-		return send(request{op: opSetIChargeTarget, arg: v})
+		t := true
+		d.enqueue(opConfigure, types.ChargerConfigure{Enable: &t})
+		return core.EnqueueResult{OK: true}, nil
+	case "disable":
+		f := false
+		d.enqueue(opConfigure, types.ChargerConfigure{Enable: &f})
+		return core.EnqueueResult{OK: true}, nil
 
 	case "set_vin_window":
-		v, code := core.As[types.SetVinWindow](payload)
+		p, code := core.As[types.VinWindowSet](payload)
 		if code != "" {
 			return core.EnqueueResult{OK: false, Error: code}, nil
 		}
-		return send(request{op: opSetVinWindow, arg: v})
+		lo, hi := p.Lo_mV, p.Hi_mV
+		d.enqueue(opConfigure, types.ChargerConfigure{VinLo_mV: &lo, VinHi_mV: &hi})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_vbat_window":
+		p, code := core.As[types.VbatWindowSet](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		lo, hi := p.Lo_mVPerCell, p.Hi_mVPerCell
+		d.enqueue(opConfigure, types.ChargerConfigure{VbatLo_mVPerCell: &lo, VbatHi_mVPerCell: &hi})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_vsys_window":
+		p, code := core.As[types.VsysWindowSet](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		lo, hi := p.Lo_mV, p.Hi_mV
+		d.enqueue(opConfigure, types.ChargerConfigure{VsysLo_mV: &lo, VsysHi_mV: &hi})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_iin_high":
+		p, code := core.As[types.CurrentMA](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliA
+		d.enqueue(opConfigure, types.ChargerConfigure{IinHigh_mA: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_ibat_low":
+		p, code := core.As[types.CurrentMA](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliA
+		d.enqueue(opConfigure, types.ChargerConfigure{IbatLow_mA: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_die_temp_high":
+		p, code := core.As[types.TempMilliC](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliC
+		d.enqueue(opConfigure, types.ChargerConfigure{DieTempHigh_mC: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_ntc_ratio_window":
+		p, code := core.As[types.NTCRatioWindowRaw](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		hi, lo := p.Hi, p.Lo
+		d.enqueue(opConfigure, types.ChargerConfigure{NTCRatioHi: &hi, NTCRatioLo: &lo})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_vin_uvcl":
+		p, code := core.As[types.VoltageMV](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliV
+		d.enqueue(opConfigure, types.ChargerConfigure{VinUVCL_mV: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_input_limit":
+		p, code := core.As[types.CurrentMA](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliA
+		d.enqueue(opConfigure, types.ChargerConfigure{IinLimit_mA: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_charge_target":
+		p, code := core.As[types.CurrentMA](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliA
+		d.enqueue(opConfigure, types.ChargerConfigure{IChargeTarget_mA: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_bsr_high":
+		p, code := core.As[types.ResistanceMicroOhmPerCell](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		u := p.MicroOhmPerCell
+		d.enqueue(opConfigure, types.ChargerConfigure{BSRHigh_uOhmPerCell: &u})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "alerts_mask":
+		m, code := core.As[types.ChargerAlertMask](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		d.enqueue(opConfigure, types.ChargerConfigure{AlertMask: &m})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "config_bits_update":
+		p, code := core.As[types.ChargerConfigBitsUpdate](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		d.enqueue(opConfigure, types.ChargerConfigure{CfgSet: &p.Set, CfgClear: &p.Clear})
+		return core.EnqueueResult{OK: true}, nil
 
 	default:
 		return core.EnqueueResult{OK: false, Error: errcode.Unsupported}, nil
@@ -216,222 +329,401 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 
 // ---- Worker ----
 
+// enqueue posts a request without blocking the caller.
+func (d *Device) enqueue(op opCode, arg any) {
+	if !d.alive.Load() || d.ctx == nil {
+		return
+	}
+	select {
+	case <-d.ctx.Done():
+		return
+	default:
+	}
+	select {
+	case d.reqCh <- request{op: op, arg: arg}:
+	default:
+	}
+}
+
 func (d *Device) worker(ctx context.Context) {
-	defer func() { d.alive.Store(false) }()
+	defer close(d.done)
 
-	// Construct driver and do all configuration here (single owner).
-	d.configureDevice()
+	// Construct driver and configure baseline.
+	cfg := ltc4015.Config{
+		Address:        d.params.Addr,
+		RSNSB_uOhm:     d.params.RSNSB_uOhm,
+		RSNSI_uOhm:     d.params.RSNSI_uOhm,
+		Cells:          d.params.Cells,
+		Chem:           ltc4015.ChemUnknown, // validated below against Params.Chem
+		QCountPrescale: d.params.QCountPrescale,
+	}
+	drv, err := ltc4015.NewAuto(d.i2c, cfg)
+	if err != nil {
+		d.errBoth("ltc4015_init_failed", err)
+		d.cleanup()
+		return
+	}
+	// Safety rails: hardware variant/cell-strap must match explicit Params.
+	if exp, ok := chemParamToExpect(d.params.Chem); !ok {
+		d.errBoth("ltc4015_strapping_mismatch", ltc4015.ErrUnknownChemParam)
+		d.cleanup()
+		return
+	} else if err := drv.ValidateAgainst(exp, d.params.Cells); err != nil {
+		d.errBoth("ltc4015_strapping_mismatch", err)
+		d.cleanup()
+		return
+	}
+	if err := drv.Configure(cfg); err != nil {
+		// Emit degraded status on both capabilities and stop; without configuration we cannot proceed safely.
+		d.errBoth("configure_failed", err)
+		d.cleanup()
+		return
+	}
+	_ = drv.SetConfigBits(ltc4015.ForceMeasSysOn | ltc4015.EnableQCount)
+	d.dev = drv
 
-	// If line already asserted, service once.
+	d.desiredLimit = 0
+	d.desiredState = d.desiredChargerStateMask()
+	d.desiredStatus = d.desiredChargeStatusMask()
+
+	// If line already asserted, service now.
 	if d.dev.AlertActive(func() bool { return d.gpio.Get() }) {
-		d.serviceSMBAlertWhileLow()
+		d.serviceAlertBatch()
 	}
 
-	// Event channel from edge subscription (if present).
+	// Helper to expose timer channel safely to select.
+	retryC := func() <-chan time.Time {
+		if d.retryTimer == nil {
+			return nil
+		}
+		return d.retryTimer.C
+	}
+	// Route edge events through the worker to avoid a separate goroutine.
 	var evCh <-chan core.GPIOEdgeEvent
 	if d.es != nil {
 		evCh = d.es.Events()
 	}
 
-	liveness := time.NewTicker(100 * time.Millisecond)
-	defer liveness.Stop()
-
-	defer close(d.done)
-
 	for {
 		select {
 		case <-ctx.Done():
+			d.alive.Store(false)
 			d.cleanup()
 			return
 
+		case <-evCh:
+			// SMBALERT# edge observed; drain/handle a batch.
+			d.serviceAlertBatch()
+
+		case <-retryC():
+			// Timer fired to revisit a still-asserted ALERT# condition.
+			d.enqueue(opServiceAlert, nil)
+
 		case req := <-d.reqCh:
 			switch req.op {
-			case opSampleAll, opReadCharger:
+			case opRead:
 				d.sampleAndPublish()
-			case opEnableCharging:
-				if v, ok := req.arg.(types.ChargerEnable); ok {
-					d.setEnable(v.On)
+
+			case opConfigure:
+				if c, _ := req.arg.(types.ChargerConfigure); (c != types.ChargerConfigure{}) {
+					d.applyConfigure(c)
+					// After any configure: re-arm (opposite edge) then publish.
+					d.rearm()
+					d.sampleAndPublish()
 				}
-			case opSetIinLimit:
-				if v, ok := req.arg.(types.SetInputLimit); ok {
-					d.setIinLimit(v.MilliA)
-				}
-			case opSetIChargeTarget:
-				if v, ok := req.arg.(types.SetChargeTarget); ok {
-					d.setIChargeTarget(v.MilliA)
-				}
-			case opSetVinWindow:
-				if v, ok := req.arg.(types.SetVinWindow); ok {
-					d.setVinWindow(v.Lo_mV, v.Hi_mV)
-				}
+
+			case opServiceAlert:
+				d.serviceAlertBatch()
+
 			case opStop:
+				d.alive.Store(false)
 				d.cleanup()
 				return
 			}
+		}
+	}
+}
 
-		case _, ok := <-evCh:
-			if !ok {
-				evCh = nil
-				break
+func (d *Device) cleanup() {
+	// Close edge stream and release claims.
+	if d.es != nil {
+		d.es.Close()
+		d.res.Reg.UnsubscribeGPIOEdges(d.id, d.pin)
+		d.es = nil
+	}
+	d.res.Reg.ReleasePin(d.id, d.pin)
+	d.res.Reg.ReleaseI2C(d.id, core.ResourceID(d.params.Bus))
+	if d.cancel != nil {
+		d.cancel()
+	}
+	// Stop retry timer safely after resources are released.
+	if d.retryTimer != nil {
+		if !d.retryTimer.Stop() {
+			select {
+			case <-d.retryTimer.C:
+			default:
 			}
-			d.serviceSMBAlertWhileLow()
+		}
+		d.retryTimer = nil
+	}
+}
 
-		case <-d.retryC():
-			// Timer fired to revisit a still-asserted ALERT#.
-			d.serviceSMBAlertWhileLow()
+// ---------- Configure application ----------
 
-		case <-liveness.C: // THIS IS NOT A PERFECT CHECK FOR LIVENESS - IT WILL FAIL IF WE PURPOSEFULLY SET MEAS SYS OFF
-			if ok, err := d.dev.MeasSystemValid(); err == nil && !ok {
-				d.configureDevice()
-				// Queue a sample to reseed retained values.
-				select {
-				case d.reqCh <- request{op: opSampleAll}:
-				default:
-				}
+func (d *Device) applyConfigure(c types.ChargerConfigure) {
+	// CONFIG bits (set/clear/update)
+	if c.CfgSet != nil || c.CfgClear != nil {
+		var set, clr ltc4015.ConfigBits
+		if c.CfgSet != nil {
+			set = ltc4015.ConfigBits(*c.CfgSet)
+		}
+		if c.CfgClear != nil {
+			clr = ltc4015.ConfigBits(*c.CfgClear)
+		}
+		_ = d.dev.UpdateConfig(set, clr)
+	}
+	if c.Enable != nil {
+		if *c.Enable {
+			_ = d.dev.ClearConfigBits(ltc4015.SuspendCharger)
+		} else {
+			_ = d.dev.SetConfigBits(ltc4015.SuspendCharger)
+		}
+	}
+
+	// Targets and limits
+	if c.IinLimit_mA != nil {
+		_ = d.dev.SetIinLimit_mA(*c.IinLimit_mA)
+	}
+	if c.IChargeTarget_mA != nil {
+		if err := d.dev.SetIChargeTarget_mA(*c.IChargeTarget_mA); err != nil {
+			if err == ltc4015.ErrTargetsReadOnly {
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "targets_read_only"})
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "targets_read_only"})
+			} else {
+				d.errChg("set_charge_target_failed", err)
+			}
+		}
+	}
+	if c.IinHigh_mA != nil {
+		if err := d.dev.SetIINHigh_mA(*c.IinHigh_mA); err == nil {
+			d.desiredLimit |= ltc4015.IINHi
+		} else {
+			d.errChg("set_iin_high_failed", err)
+		}
+	}
+	if c.IbatLow_mA != nil {
+		if err := d.dev.SetIBATLow_mA(*c.IbatLow_mA); err == nil {
+			d.desiredLimit |= ltc4015.IBATLo
+		} else {
+			d.errChg("set_ibat_low_failed", err)
+		}
+	}
+	if c.DieTempHigh_mC != nil {
+		if err := d.dev.SetDieTempHigh_mC(*c.DieTempHigh_mC); err == nil {
+			d.desiredLimit |= ltc4015.DieTempHi
+		} else {
+			d.errChg("set_dietemp_high_failed", err)
+		}
+	}
+	if c.BSRHigh_uOhmPerCell != nil {
+		if err := d.dev.SetBSRHigh_uOhmPerCell(*c.BSRHigh_uOhmPerCell); err == nil {
+			d.desiredLimit |= ltc4015.BSRHi
+		} else {
+			d.errChg("set_bsr_high_failed", err)
+		}
+	}
+
+	// Windows and UVCL (record for opposite-edge re-arming)
+	if c.VinLo_mV != nil || c.VinHi_mV != nil {
+		lo, hi := deref[int32](c.VinLo_mV, 0), deref[int32](c.VinHi_mV, 0)
+		if err := d.dev.SetVINWindowAndClear(lo, hi); err == nil {
+			d.lastVinLo, d.lastVinHi = lo, hi
+		} else {
+			d.errChg("set_vin_window_failed", err)
+		}
+	}
+	if c.VsysLo_mV != nil || c.VsysHi_mV != nil {
+		lo, hi := deref[int32](c.VsysLo_mV, 0), deref[int32](c.VsysHi_mV, 0)
+		if err := d.dev.SetVSYSWindowAndClear(lo, hi); err == nil {
+			d.lastVsysLo, d.lastVsysHi = lo, hi
+		} else {
+			d.errChg("set_vsys_window_failed", err)
+		}
+	}
+	if c.VbatLo_mVPerCell != nil || c.VbatHi_mVPerCell != nil {
+		lo, hi := deref[int32](c.VbatLo_mVPerCell, 0), deref[int32](c.VbatHi_mVPerCell, 0)
+		if err := d.dev.SetVBATWindowPerCellAndClear(lo, hi); err == nil {
+			d.lastVbatLoCell, d.lastVbatHiCell = lo, hi
+		} else {
+			d.errChg("set_vbat_window_failed", err)
+		}
+	}
+	if c.NTCRatioHi != nil || c.NTCRatioLo != nil {
+		hi, lo := deref[uint16](c.NTCRatioHi, 0), deref[uint16](c.NTCRatioLo, 0)
+		if err := d.dev.SetNTCRatioWindowAndClear(hi, lo); err == nil {
+			d.lastNTCHi, d.lastNTCLo = hi, lo
+		} else {
+			d.errChg("set_ntc_ratio_window_failed", err)
+		}
+	}
+	if c.VinUVCL_mV != nil {
+		_ = d.dev.SetVinUvcl_mV(*c.VinUVCL_mV)
+	}
+
+	// User masks set desired sources (auto re-arming still applies).
+	if m := c.AlertMask; m != nil {
+		if m.Limit != nil {
+			d.desiredLimit = ltc4015.LimitEnable(*m.Limit)
+		}
+		if m.ChgState != nil {
+			d.desiredState = ltc4015.ChargerStateEnable(*m.ChgState)
+		}
+		if m.ChgStatus != nil {
+			d.desiredStatus = ltc4015.ChargeStatusEnable(*m.ChgStatus)
+		}
+	}
+}
+
+// tiny generic pointer-deref helper
+func deref[T any](p *T, zero T) T {
+	if p != nil {
+		return *p
+	}
+	return zero
+}
+
+// ---------- Alert service (ARA + drain + opposite-edge re-arming) ----------
+
+func (d *Device) serviceAlertBatch() {
+	const maxIters = 64
+	it := 0
+
+	// Ensure any pending retry is stopped before processing a fresh batch.
+	if d.retryTimer != nil {
+		if !d.retryTimer.Stop() {
+			select {
+			case <-d.retryTimer.C:
+			default:
+			}
+		}
+	}
+
+	// Best-effort: where IRQ is unavailable, callers may still call this to poll.
+	for d.dev.AlertActive(func() bool { return d.gpio.Get() }) && it < maxIters {
+		it++
+
+		// Try the full SMBus ARA path first; if some other device responded or error,
+		// fall back to direct drain (which also clears).
+		var ev ltc4015.AlertEvent
+		if e, ok, err := d.dev.ServiceSMBAlert(); err == nil && ok {
+			ev = e
+		} else {
+			// Not ours or error: attempt a direct drain to snapshot+clear our latches.
+			if de, derr := d.dev.DrainAlerts(); derr == nil {
+				ev = de
+			}
+		}
+		if ev.Empty() {
+			// No latches from us this iteration. Short back-off then re-check.
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+
+		// Translate events to tags.
+		if ev.Limit.Has(ltc4015.VINLo) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_lo"})
+		}
+		if ev.Limit.Has(ltc4015.VINHi) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_hi"})
+		}
+		if ev.Limit.Has(ltc4015.BSRHi) {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: "bsr_high"})
+		}
+		for _, t := range chgStateTags {
+			if ev.ChgState.Has(t.bit) {
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: t.tag})
+			}
+		}
+		for _, t := range chgStatusTags {
+			if ev.ChgStatus.Has(t.bit) {
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: t.tag})
+			}
+		}
+
+		// State-aware opposite-edge re-arming for ALL groups, then publish snapshot.
+		d.rearm()
+		d.sampleAndPublish()
+
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Still asserted? Arm a short retry. Otherwise, ensure the timer is disarmed.
+	if d.alive.Load() && d.dev.AlertActive(func() bool { return d.gpio.Get() }) {
+		if d.retryTimer == nil {
+			d.retryTimer = time.NewTimer(2 * time.Millisecond)
+		} else {
+			d.retryTimer.Reset(2 * time.Millisecond)
+		}
+	} else if d.retryTimer != nil {
+		if !d.retryTimer.Stop() {
+			select {
+			case <-d.retryTimer.C:
+			default:
 			}
 		}
 	}
 }
 
-func (d *Device) retryC() <-chan time.Time {
-	if d.retry == nil {
-		return nil // nil channel blocks forever in select
-	}
-	return d.retry.C
+var chgStateTags = []struct {
+	bit ltc4015.ChargerStateBits
+	tag string
+}{
+	{ltc4015.BatMissingFault, "bat_missing"},
+	{ltc4015.BatShortFault, "bat_short"},
+	{ltc4015.MaxChargeTimeFault, "max_charge_time_fault"},
+	{ltc4015.AbsorbCharge, "absorb"},
+	{ltc4015.EqualizeCharge, "equalize"},
+	{ltc4015.CCCVCharge, "cccv"},
+	{ltc4015.Precharge, "precharge"},
 }
 
-// ---- Worker helpers (single-owner context) ----
-
-func (d *Device) configureDevice() {
-	cfg := ltc4015.Config{
-		Address:         addrOrDefault(d.params.Addr),
-		RSNSB_uOhm:      d.params.RSNSB_uOhm,
-		RSNSI_uOhm:      d.params.RSNSI_uOhm,
-		Cells:           d.params.Cells,
-		QCountPrescale:  d.params.QCountPrescale,
-		TargetsWritable: d.params.TargetsWritable,
-	}
-
-	// Chemistry selection
-	switch d.params.Chem {
-	case "leadacid":
-		cfg.Chem = ltc4015.ChemLeadAcid
-	case "auto", "detect":
-		cfg.Chem = ltc4015.ChemUnknown
-	default:
-		cfg.Chem = ltc4015.ChemLithium
-	}
-
-	drv := ltc4015.New(d.i2c, cfg)
-	if cfg.Chem == ltc4015.ChemUnknown {
-		if c, err := drv.DetectChemistry(); err == nil && c != ltc4015.ChemUnknown {
-			// Fix chemistry once detected.
-			// (It is stored inside the driver; no need to rewrite cfg.)
-		} else if err != nil {
-			d.evtErrBoth("chem_detect_failed", string(errcode.MapDriverErr(err)))
-		}
-	}
-	if err := drv.Configure(cfg); err != nil {
-		d.evtErrBoth("configure_failed", string(errcode.MapDriverErr(err)))
-	}
-
-	// Keep telemetry running; enable coulomb counter.
-	if err := drv.SetConfigBits(ltc4015.ForceMeasSysOn | ltc4015.EnableQCount); err != nil {
-		d.evtErrBoth("set_config_bits_failed", string(errcode.MapDriverErr(err)))
-	}
-
-	// Optional thresholds.
-	if d.params.VinLo_mV != 0 || d.params.VinHi_mV != 0 {
-		if err := drv.SetVINWindow_mV(d.params.VinLo_mV, d.params.VinHi_mV); err != nil {
-			d.evtErrChg("set_vin_window_failed", string(errcode.MapDriverErr(err)))
-		}
-	}
-	if d.params.BSRHi_uOhmPerCell != 0 {
-		if err := drv.SetBSRHigh_uOhmPerCell(d.params.BSRHi_uOhmPerCell); err != nil {
-			d.evtErrBat("set_bsr_high_failed", string(errcode.MapDriverErr(err)))
-		}
-	}
-
-	// Enable key alerts and clear latches.
-	if err := drv.EnableChargerStateAlertsMask(ltc4015.BatMissingFault | ltc4015.BatShortFault | ltc4015.MaxChargeTimeFault); err != nil {
-		d.evtErrChg("enable_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-	if err := drv.ClearChargerStateAlerts(); err != nil {
-		d.evtErrChg("clear_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-
-	// CHARGE_STATUS edge-driven: enable only edges that are not currently asserted.
-	en := baseStatusMask()
-	if cs, err := drv.ChargeStatus(); err == nil {
-		en &^= cs
-	}
-	if err := drv.EnableChargeStatusAlertsMask(en); err != nil {
-		d.evtErrChg("enable_charge_status_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-	if err := drv.ClearChargeStatusAlerts(); err != nil {
-		d.evtErrChg("clear_charge_status_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-
-	// VIN edge-driven mask (persistently include BSRHi).
-	d.initVinMask(drv)
-
-	d.dev = drv
-
-	// Enqueue initial sample to seed retained values
-	select {
-	case d.reqCh <- request{op: opSampleAll}:
-	default:
-		// ignore if queue temporarily full
-	}
+var chgStatusTags = []struct {
+	bit ltc4015.ChargeStatusBits
+	tag string
+}{
+	{ltc4015.IinLimitActive, "iin_limited"},
+	{ltc4015.VinUvclActive, "uvcl_active"},
+	{ltc4015.ConstCurrent, "cc_phase"},
+	{ltc4015.ConstVoltage, "cv_phase"},
 }
 
-func (d *Device) initVinMask(dev *ltc4015.Device) {
-	const defaultHi = 11000 // fallback if no thresholds provided
-	const defaultLo = 9000
-	lo := d.params.VinLo_mV
-	hi := d.params.VinHi_mV
-	if lo == 0 && hi == 0 {
-		lo, hi = defaultLo, defaultHi
-	}
-	if err := dev.SetVINWindow_mV(lo, hi); err != nil {
-		d.evtErrChg("set_vin_window_failed", string(errcode.MapDriverErr(err)))
-		// Continue with conservative mask
-		d.setVinEdgeMask(dev, ltc4015.VINLo|ltc4015.VINHi)
-		return
-	}
-
-	mv, err := dev.VinMilliV()
-	if err != nil {
-		d.setVinEdgeMask(dev, ltc4015.VINLo|ltc4015.VINHi)
-		return
-	}
-	switch {
-	case mv >= hi:
-		d.setVinEdgeMask(dev, ltc4015.VINLo)
-	case mv <= lo:
-		d.setVinEdgeMask(dev, ltc4015.VINHi)
-	default:
-		d.setVinEdgeMask(dev, ltc4015.VINLo|ltc4015.VINHi)
-	}
+// ---- Re-arming (delegated to driver) ----
+func (d *Device) rearm() {
+	_ = d.dev.RearmOppositeEdges(
+		ltc4015.DesiredMasks{
+			Limit:     d.desiredLimit,
+			ChgState:  d.desiredState,
+			ChgStatus: d.desiredStatus,
+		},
+		ltc4015.Windows{
+			VinLo_mV:      d.lastVinLo,
+			VinHi_mV:      d.lastVinHi,
+			VsysLo_mV:     d.lastVsysLo,
+			VsysHi_mV:     d.lastVsysHi,
+			VbatLoCell_mV: d.lastVbatLoCell,
+			VbatHiCell_mV: d.lastVbatHiCell,
+			NTCHi:         d.lastNTCHi,
+			NTCLo:         d.lastNTCLo,
+		},
+	)
 }
 
-func (d *Device) setVinEdgeMask(dev *ltc4015.Device, mask ltc4015.LimitEnable) {
-	mask |= ltc4015.BSRHi // always keep BSR high enabled
-	if err := dev.EnableLimitAlertsMask(mask); err != nil {
-		d.evtErrChg("enable_limit_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-	if err := dev.ClearLimitAlerts(); err != nil {
-		d.evtErrChg("clear_limit_alerts_failed", string(errcode.MapDriverErr(err)))
-	}
-}
+// ---- Telemetry ----
 
 func (d *Device) sampleAndPublish() {
-	// Only publish when measurements are valid; otherwise drive degraded status.
 	ok, err := d.dev.MeasSystemValid()
 	if err != nil {
-		code := string(errcode.MapDriverErr(err))
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
+		d.errBoth("meas_error", err)
 		return
 	}
 	if !ok {
@@ -440,305 +732,91 @@ func (d *Device) sampleAndPublish() {
 		return
 	}
 
-	// Battery group
-	var bv types.BatteryValue
-	if pv, err := d.dev.BatteryMilliVPack(); err == nil {
-		bv.PackMilliV = pv
-	}
-	if cv, err := d.dev.BatteryMilliVPerCell(); err == nil {
-		bv.PerCellMilliV = cv
-	}
-	if ib, err := d.dev.IbatMilliA(); err == nil {
-		bv.IBatMilliA = ib
-	}
-	if mc, err := d.dev.DieMilliC(); err == nil {
-		bv.TempMilliC = mc
-	}
-	if bsr, err := d.dev.BSRMicroOhmPerCell(); err == nil {
-		bv.BSR_uOhmPerCell = bsr
-	}
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Payload: bv})
+	// Use driver snapshot
+	s := d.dev.Snapshot()
 
-	// Charger group
-	var cv types.ChargerValue
-	if vin, err := d.dev.VinMilliV(); err == nil {
-		cv.VIN_mV = vin
-	}
-	if vsys, err := d.dev.VsysMilliV(); err == nil {
-		cv.VSYS_mV = vsys
-	}
-	if iin, err := d.dev.IinMilliA(); err == nil {
-		cv.IIn_mA = iin
-	}
-	if st, err := d.dev.ChargerState(); err == nil {
-		cv.State = uint16(st)
-	}
-	if cs, err := d.dev.ChargeStatus(); err == nil {
-		cv.Status = uint16(cs)
-	}
-	if ss, err := d.dev.SystemStatus(); err == nil {
-		cv.Sys = uint16(ss)
-	}
-	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: cv})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Payload: types.BatteryValue{
+		PackMilliV:      s.Pack_mV,
+		PerCellMilliV:   s.PerCell_mV,
+		IBatMilliA:      s.IBat_mA,
+		TempMilliC:      s.Die_mC,
+		BSR_uOhmPerCell: s.BSR_uOhmPerCell,
+	}})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Payload: types.ChargerValue{
+		VIN_mV:  s.Vin_mV,
+		VSYS_mV: s.Vsys_mV,
+		IIn_mA:  s.IIn_mA,
+		State:   uint16(s.State),
+		Status:  uint16(s.Status),
+		Sys:     uint16(s.System),
+	}})
 
-	if ratio, err := d.dev.NTCRatio(); err != nil {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: string(errcode.MapDriverErr(err))})
-	} else if deciC, ok := ntcRatioToDeciC(ratio, d.params.NTCBiasOhm, d.params.R25Ohm, d.params.BetaK); ok {
-		_ = d.res.Pub.Emit(core.Event{
-			Addr: d.aTmp, Payload: types.TemperatureValue{DeciC: deciC},
-		})
-	} else {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "ntc_ratio_invalid"})
-	}
-}
-
-func (d *Device) serviceSMBAlertWhileLow() {
-	const maxIters = 64
-	iters := 0
-
-	// Ensure any pending retry is stopped; we'll reschedule if still asserted later.
-	if d.retry != nil {
-		if !d.retry.Stop() {
-			select {
-			case <-d.retry.C:
-			default:
-			}
-		}
-	}
-
-	for !d.gpio.Get() && iters < maxIters {
-		iters++
-
-		ev, ok, err := d.dev.ServiceSMBAlert()
-		if err != nil {
-			// Publish degraded statuses and back-off.
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: string(errcode.MapDriverErr(err))})
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: string(errcode.MapDriverErr(err))})
-			// back-off: 2ms << min(iters, 4) → max 32ms
-			time.Sleep(time.Duration(1<<min(iters, 4)) * time.Millisecond)
-			continue
-		}
-		if !ok {
-			// ARA reported another device or no responder; if line still low, retry soon.
-			time.Sleep(2 * time.Millisecond)
-			continue
-		}
-
-		// Translate events.
-		d.translateAlerts(ev)
-
-		// Brief pause between drains to allow latches to settle.
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	// Still asserted after our cap or after servicing? Schedule a retry.
-	if !d.gpio.Get() {
-		if d.retry == nil {
-			d.retry = time.NewTimer(2 * time.Millisecond)
+	// Temperature via NTC ratio (Beta equation)
+	if ratio := s.NTCRatio; ratio != 0 {
+		if deciC, ok := ntcRatioToDeciC(ratio, d.params.NTCBiasOhm, d.params.R25Ohm, d.params.BetaK); ok {
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Payload: types.TemperatureValue{DeciC: deciC}})
 		} else {
-			d.retry.Reset(2 * time.Millisecond)
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "ntc_ratio_invalid"})
 		}
 	}
 }
 
-func (d *Device) translateAlerts(ev ltc4015.AlertEvent) {
+// ---- Errors ----
 
-	// ---- Limit alerts: VIN window and BSR ----
-	if vinBits := ev.Limit & (ltc4015.VINLo | ltc4015.VINHi); vinBits != 0 {
-		// Re-resolve state and re-arm opposite edge.
-		mv, _ := d.dev.VinMilliV()
-		lo := d.params.VinLo_mV
-		hi := d.params.VinHi_mV
-		if lo == 0 && hi == 0 {
-			lo, hi = 9000, 11000
-		}
-		switch {
-		case mv >= hi:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_connected"})
-			d.setVinEdgeMask(d.dev, ltc4015.VINLo)
-		case mv <= lo:
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "vin_disconnected"})
-			d.setVinEdgeMask(d.dev, ltc4015.VINHi)
-		default:
-			d.setVinEdgeMask(d.dev, ltc4015.VINLo|ltc4015.VINHi)
-		}
-	}
-	if ev.Limit.Has(ltc4015.BSRHi) {
-		_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: "bsr_high"})
-	}
-
-	// ---- Charger state: faults and phase edges (events), then re-arm + clear ----
-	if ev.ChgState != 0 {
-		s := ev.ChgState
-		// Emit a tag for each asserted bit we care about.
-		if s.Has(ltc4015.BatMissingFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_missing"})
-		}
-		if s.Has(ltc4015.BatShortFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "bat_short"})
-		}
-		if s.Has(ltc4015.MaxChargeTimeFault) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "max_charge_time_fault"})
-		}
-		if s.Has(ltc4015.AbsorbCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "absorb"})
-		}
-		if s.Has(ltc4015.EqualizeCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "equalize"})
-		}
-		if s.Has(ltc4015.CCCVCharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cccv"})
-		}
-		if s.Has(ltc4015.Precharge) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "precharge"})
-		}
-
-		// Re-arm charger-state edges: enable only bits that are NOT currently asserted.
-		// Include both faults and phases you want edge notifications for.
-		en := ltc4015.BatMissingFault |
-			ltc4015.BatShortFault |
-			ltc4015.MaxChargeTimeFault |
-			ltc4015.AbsorbCharge |
-			ltc4015.EqualizeCharge |
-			ltc4015.CCCVCharge |
-			ltc4015.Precharge
-
-		if cur, err := d.dev.ChargerState(); err == nil {
-			en &^= cur
-			if err := d.dev.EnableChargerStateAlertsMask(en); err != nil {
-				d.evtErrChg("enable_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
-			}
-			if err := d.dev.ClearChargerStateAlerts(); err != nil {
-				d.evtErrChg("clear_chg_state_alerts_failed", string(errcode.MapDriverErr(err)))
-			}
-		} else {
-			d.evtErrChg("read_charger_state_failed", string(errcode.MapDriverErr(err)))
-		}
-	}
-
-	// ---- Charge status edges: events, then re-arm + clear ----
-	if ev.ChgStatus != 0 {
-		s := ev.ChgStatus
-		if s.Has(ltc4015.IinLimitActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "iin_limited"})
-		}
-		if s.Has(ltc4015.VinUvclActive) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "uvcl_active"})
-		}
-		if s.Has(ltc4015.ConstCurrent) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cc_phase"})
-		}
-		if s.Has(ltc4015.ConstVoltage) {
-			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "cv_phase"})
-		}
-
-		en := baseStatusMask()
-		if cur, err := d.dev.ChargeStatus(); err == nil {
-			en &^= cur
-			if err := d.dev.EnableChargeStatusAlertsMask(en); err != nil {
-				d.evtErrChg("enable_charge_status_alerts_failed", string(errcode.MapDriverErr(err)))
-			}
-			if err := d.dev.ClearChargeStatusAlerts(); err != nil {
-				d.evtErrChg("clear_charge_status_alerts_failed", string(errcode.MapDriverErr(err)))
-			}
-		} else {
-			d.evtErrChg("read_charge_status_failed", string(errcode.MapDriverErr(err)))
-		}
-	}
-
-	// ---- Snapshot after handling a batch ----
-	d.sampleAndPublish()
+func (d *Device) errBoth(tag string, err error) {
+	code := string(errcode.MapDriverErr(err))
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: code})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
+}
+func (d *Device) errChg(tag string, err error) {
+	code := string(errcode.MapDriverErr(err))
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: tag})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: code})
 }
 
-func (d *Device) setEnable(on bool) {
-	var err error
-	if on {
-		err = d.dev.ClearConfigBits(ltc4015.SuspendCharger)
-	} else {
-		err = d.dev.SetConfigBits(ltc4015.SuspendCharger)
+// Local helper: translate string param → driver constant.
+func chemParamToExpect(s string) (ltc4015.ExpectChem, bool) {
+	switch s {
+	case "leadacid":
+		return ltc4015.ExpectLeadAcid, true
+	case "lifepo":
+		return ltc4015.ExpectLiFePO4, true
+	case "lithium":
+		return ltc4015.ExpectLithiumIon, true
+	default:
+		return 0, false
 	}
-	if err != nil {
-		d.evtErrChg("set_enable_failed", string(errcode.MapDriverErr(err)))
-		return
-	}
-	// Publish a fresh snapshot.
-	d.sampleAndPublish()
 }
 
-func (d *Device) setIinLimit(mA int32) {
-	if err := d.dev.SetIinLimit_mA(mA); err != nil {
-		d.evtErrChg("set_iin_limit_failed", string(errcode.MapDriverErr(err)))
-		return
-	}
-	d.sampleAndPublish()
-}
+// ---- Maths ----
 
-func (d *Device) setIChargeTarget(mA int32) {
-	if !d.params.TargetsWritable {
-		// Reflect unsupported as degraded event.
-		d.evtErrChg("targets_read_only", "targets_read_only")
-		return
-	}
-	if err := d.dev.SetIChargeTarget_mA(mA); err != nil {
-		d.evtErrChg("set_charge_target_failed", string(errcode.MapDriverErr(err)))
-		return
-	}
-	d.sampleAndPublish()
-}
-
-func (d *Device) setVinWindow(lo, hi int32) {
-	if err := d.dev.SetVINWindow_mV(lo, hi); err != nil {
-		d.evtErrChg("set_vin_window_failed", string(errcode.MapDriverErr(err)))
-		return
-	}
-	// Recompute edge-arming after changing thresholds.
-	d.initVinMask(d.dev)
-}
-
-func (d *Device) cleanup() {
-	// Stop retry timer if any.
-	if d.retry != nil {
-		if !d.retry.Stop() {
-			select {
-			case <-d.retry.C:
-			default:
-			}
-		}
-	}
-	// Close edge stream and release claims from the worker side as well.
-	if d.es != nil {
-		d.es.Close()
-		d.res.Reg.UnsubscribeGPIOEdges(d.id, d.pin)
-		d.es = nil
-	}
-	d.res.Reg.ReleasePin(d.id, d.pin)
-	d.res.Reg.ReleaseI2C(d.id, core.ResourceID(d.params.Bus))
-}
-
-// ratio(1..21844) -> deci-°C using the Beta equation.
 func ntcRatioToDeciC(ratio uint16, rbias, r25, beta uint32) (int16, bool) {
 	if ratio == 0 || ratio >= 21845 || r25 == 0 || beta == 0 {
 		return 0, false
 	}
-
 	Rntc := float64(rbias) * float64(ratio) / float64(21845-ratio)
 	T := 1.0 / (1.0/298.15 + math.Log(Rntc/float64(r25))/float64(beta)) // kelvin
 	Cd := math.Round((T - 273.15) * 10.0)                               // deci-°C
 	return int16(Cd), true
 }
 
-// ---- Helpers ----
+// ---- Desired masks (defaults) ----
 
-func baseStatusMask() ltc4015.ChargeStatusEnable {
-	return ltc4015.VinUvclActive |
-		ltc4015.IinLimitActive |
+func (d *Device) desiredChargeStatusMask() ltc4015.ChargeStatusEnable {
+	return ltc4015.IinLimitActive |
+		ltc4015.VinUvclActive |
 		ltc4015.ConstCurrent |
 		ltc4015.ConstVoltage
 }
 
-func addrOrDefault(a uint16) uint16 {
-	if a == 0 {
-		return ltc4015.AddressDefault
-	}
-	return a
+func (d *Device) desiredChargerStateMask() ltc4015.ChargerStateEnable {
+	return ltc4015.BatMissingFault |
+		ltc4015.BatShortFault |
+		ltc4015.MaxChargeTimeFault |
+		ltc4015.AbsorbCharge |
+		ltc4015.EqualizeCharge |
+		ltc4015.CCCVCharge |
+		ltc4015.Precharge
 }

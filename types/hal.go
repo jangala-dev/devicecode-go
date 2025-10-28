@@ -85,3 +85,8 @@ type Info struct {
 	Driver        string      `json:"driver"`
 	Detail        interface{} `json:"detail,omitempty"` // one of *Info types below
 }
+
+type BootAction struct {
+	Verb    string `json:"verb"`
+	Payload any    `json:"payload,omitempty"`
+}
