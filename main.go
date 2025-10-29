@@ -431,6 +431,7 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 		w.begin()
 		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
 		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
+		w.kvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
 		w.end()
 	}
 }
@@ -798,7 +799,7 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 	switch v := m.Payload.(type) {
 	case types.BatteryValue:
 		log.Print("[value] ", dom, "/", kind, "/", name,
-			" | VBAT=", int(v.PackMilliV), "mV per=", int(v.PerCellMilliV), "mV | IBAT=", int(v.IBatMilliA), "mA")
+			" | VBAT=", int(v.PackMilliV), "mV per=", int(v.PerCellMilliV), "mV | IBAT=", int(v.IBatMilliA), "mA | BSR=", int(v.BSR_uOhmPerCell), "uR")
 		if lastIBat != nil {
 			*lastIBat = v.IBatMilliA
 		}
