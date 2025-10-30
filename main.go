@@ -36,8 +36,9 @@ const (
 
 // Debounce and data freshness
 const (
-	DEBOUNCE_OK = 300 * time.Millisecond
-	STALE_MAX   = 4 * time.Second
+	DEBOUNCE_OK       = 300 * time.Millisecond
+	STALE_MAX         = 4 * time.Second
+	DIE_TEMP_TAKEOVER = 2 * time.Second
 )
 
 // Supervisory cadence
@@ -602,7 +603,8 @@ func main() {
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
 				r.now = time.Now()
 				deci := int(v.DeciC)
-				if !aht20Alive {
+				if !aht20Alive || (r.now.Sub(r.tsTemp) > DIE_TEMP_TAKEOVER) {
+					aht20Alive = false
 					r.lastTDeci = deci
 					r.tsTemp = r.now
 					r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
