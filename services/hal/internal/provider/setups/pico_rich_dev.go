@@ -5,6 +5,7 @@ package setups
 import (
 	"devicecode-go/services/hal/devices/gpio_dout"
 	ltc4015dev "devicecode-go/services/hal/devices/ltc4015"
+	"devicecode-go/services/hal/devices/rp2_temp"
 	serialraw "devicecode-go/services/hal/devices/serial_raw"
 	shtc3dev "devicecode-go/services/hal/devices/shtc3"
 	"devicecode-go/types"
@@ -32,6 +33,8 @@ var SelectedSetup = types.HALConfig{
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
 		{ID: "core", Type: "shtc3", Params: shtc3dev.Params{Bus: "i2c0", Domain: "env", Name: "core"}},
+
+		{ID: "die_temp", Type: "rp2_temp", Params: rp2_temp.Params{Domain: "env", Name: "die"}},
 
 		// Raw serial device bound to uart0 (public address hal/cap/io/serial/uart0/…)
 		{ID: "uart0_raw", Type: "serial_raw", Params: serialraw.Params{
@@ -106,5 +109,6 @@ var SelectedSetup = types.HALConfig{
 		// polling temperature suffices (humidity is emitted by the same read).
 		{Domain: "env", Kind: "temperature", Name: "core", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
 		{Domain: "power", Kind: "battery", Name: "internal", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
+		{Domain: "env", Kind: "temperature", Name: "die", Verb: "read", IntervalMs: 1_000, JitterMs: 100},
 	},
 }
