@@ -696,6 +696,12 @@ func (r *rp2Registry) Close() {
 	r.edge.stop()
 }
 
+// ReadOnDieMilliC exposes a single-shot on-die temperature read.
+// Only defined on rp2040 builds so the device can feature-detect it.
+func (r *rp2Registry) ReadOnDieMilliC() int32 {
+	return machine.ReadTemperature() // milli-celsius
+}
+
 // rp2SerialPort adapts uartx.UART to serialPortX.
 type rp2SerialPort struct{ u *uartx.UART }
 

@@ -36,14 +36,21 @@ const (
 
 // Debounce and data freshness
 const (
-	DEBOUNCE_OK = 300 * time.Millisecond
-	STALE_MAX   = 4 * time.Second
+	DEBOUNCE_OK       = 300 * time.Millisecond
+	STALE_MAX         = 4 * time.Second
+	DIE_TEMP_TAKEOVER = 2 * time.Second
 )
 
 // Supervisory cadence
 const (
 	TICK = 100 * time.Millisecond // balances debounce precision and MCU overhead
 )
+
+// -----------------------------------------------------------------------------
+// AHT20 readiness (for boards where the AHT isn't functioning)
+// -----------------------------------------------------------------------------
+
+var aht20Alive = false
 
 // -----------------------------------------------------------------------------
 // Topics
@@ -56,6 +63,9 @@ var halReadiness = bus.T("hal", "state")
 var (
 	tLEDCtrlSet = bus.T("hal", "cap", "io", string(types.KindLED), "button_led", "control", "set")
 )
+
+// Die
+var tDieTempValue = bus.T("hal", "cap", "env", string(types.KindTemperature), "die", "value")
 
 // Env
 var (
@@ -501,6 +511,7 @@ func main() {
 	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
 	tempSub := uiConn.Subscribe(tTempValue)
+	tempDieSub := uiConn.Subscribe(tDieTempValue)
 	humidSub := uiConn.Subscribe(tHumValue)
 	valSub := uiConn.Subscribe(valTopic)
 	stSub := uiConn.Subscribe(stTopic)
@@ -565,6 +576,9 @@ func main() {
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
+				if !aht20Alive {
+					aht20Alive = true
+				}
 				r.now = time.Now()
 				deci := int(v.DeciC)
 				r.lastTDeci = deci
@@ -581,6 +595,19 @@ func main() {
 					w.begin()
 					w.kvInt("env/humidity/core", int(v.RHx100))
 					w.end()
+				}
+			}
+
+		// ---- Die Temp Backup ----
+		case m := <-tempDieSub.Channel():
+			if v, ok := m.Payload.(types.TemperatureValue); ok {
+				r.now = time.Now()
+				deci := int(v.DeciC)
+				if !aht20Alive || (r.now.Sub(r.tsTemp) > DIE_TEMP_TAKEOVER) {
+					aht20Alive = false
+					r.lastTDeci = deci
+					r.tsTemp = r.now
+					r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
 				}
 			}
 
