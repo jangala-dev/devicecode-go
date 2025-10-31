@@ -306,6 +306,24 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		d.enqueue(opConfigure, types.ChargerConfigure{BSRHigh_uOhmPerCell: &u})
 		return core.EnqueueResult{OK: true}, nil
 
+	case "set_absorb_delta":
+		p, code := core.As[types.VAbsorbDeltaMV](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.MilliVPerCell
+		d.enqueue(opConfigure, types.ChargerConfigure{VAbsorbDelta_mVPerCell: &v})
+		return core.EnqueueResult{OK: true}, nil
+
+	case "set_max_absorb_time":
+		p, code := core.As[types.DurationS](payload)
+		if code != "" {
+			return core.EnqueueResult{OK: false, Error: code}, nil
+		}
+		v := p.Sec
+		d.enqueue(opConfigure, types.ChargerConfigure{MaxAbsorbTime_s: &v})
+		return core.EnqueueResult{OK: true}, nil
+
 	case "alerts_mask":
 		m, code := core.As[types.ChargerAlertMask](payload)
 		if code != "" {
@@ -577,6 +595,76 @@ func (d *Device) applyConfigure(c types.ChargerConfigure) {
 	}
 	if c.VinUVCL_mV != nil {
 		_ = d.dev.SetVinUvcl_mV(*c.VinUVCL_mV)
+	}
+
+	// Absorb delta per cell (chemistry-aware)
+	if c.VAbsorbDelta_mVPerCell != nil {
+		switch d.dev.Chem() {
+		case ltc4015.ChemLeadAcid:
+			if la, _ := d.dev.LeadAcid(); true {
+				if err := la.SetVAbsorbDelta_mVPerCell(*c.VAbsorbDelta_mVPerCell); err != nil {
+					if err == ltc4015.ErrTargetsReadOnly {
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "targets_read_only"})
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "targets_read_only"})
+					} else {
+						d.errChg("set_absorb_delta_failed", err)
+					}
+				}
+			}
+		case ltc4015.ChemLithium:
+			if lp, ok := d.dev.LiFePO4(); ok {
+				if err := lp.SetVAbsorbDelta_mVPerCell(*c.VAbsorbDelta_mVPerCell); err != nil {
+					if err == ltc4015.ErrTargetsReadOnly {
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "targets_read_only"})
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "targets_read_only"})
+					} else {
+						d.errChg("set_absorb_delta_failed", err)
+					}
+				}
+			} else {
+				// Li-ion variant: hardware ignores VABSORB_DELTA
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "absorb_delta_ignored_for_chemistry"})
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "unsupported"})
+			}
+		default:
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "absorb_delta_chem_unknown"})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "unsupported"})
+		}
+	}
+
+	// Max absorb time in seconds (LiFePO4 & Lead-acid; ignored by Li-ion)
+	if c.MaxAbsorbTime_s != nil {
+		switch d.dev.Chem() {
+		case ltc4015.ChemLeadAcid:
+			if la, _ := d.dev.LeadAcid(); true {
+				if err := la.SetMaxAbsorbTime_s(*c.MaxAbsorbTime_s); err != nil {
+					if err == ltc4015.ErrTargetsReadOnly {
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "targets_read_only"})
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "targets_read_only"})
+					} else {
+						d.errChg("set_max_absorb_time_failed", err)
+					}
+				}
+			}
+		case ltc4015.ChemLithium:
+			if lp, ok := d.dev.LiFePO4(); ok {
+				if err := lp.SetMaxAbsorbTime_s(*c.MaxAbsorbTime_s); err != nil {
+					if err == ltc4015.ErrTargetsReadOnly {
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "targets_read_only"})
+						_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "targets_read_only"})
+					} else {
+						d.errChg("set_max_absorb_time_failed", err)
+					}
+				}
+			} else {
+				// Li-ion variant: hardware ignores MAX_ABSORB_TIME
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "max_absorb_time_ignored_for_chemistry"})
+				_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "unsupported"})
+			}
+		default:
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "max_absorb_time_chem_unknown"})
+			_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "unsupported"})
+		}
 	}
 
 	// User masks set desired sources (auto re-arming still applies).

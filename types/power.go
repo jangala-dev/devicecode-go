@@ -71,6 +71,10 @@ type ChargerConfigure struct {
 	NTCRatioLo       *uint16 `json:"ntc_ratio_lo,omitempty"`
 	VinUVCL_mV       *int32  `json:"vin_uvcl_mV,omitempty"`
 
+	// Absorb phase control (LiFePO4 & Lead-acid; ignored by Li-ion)
+	VAbsorbDelta_mVPerCell *int32  `json:"vabsorb_delta_mV_per_cell,omitempty"`
+	MaxAbsorbTime_s        *uint16 `json:"max_absorb_time_s,omitempty"`
+
 	// Optional explicit alert masks (advanced)
 	AlertMask *ChargerAlertMask `json:"alert_mask,omitempty"`
 }
@@ -95,6 +99,10 @@ type NTCRatioWindowRaw struct{ Hi, Lo uint16 }
 type ChargerConfigBitsUpdate struct {
 	Set, Clear uint16
 }
+
+// Convenience payloads for absorb controls
+type VAbsorbDeltaMV struct{ MilliVPerCell int32 } // verb: "set_absorb_delta"
+type DurationS struct{ Sec uint16 }               // verb: "set_max_absorb_time"
 
 // SYSTEM_STATUS (0x39)
 type SystemStatus uint16

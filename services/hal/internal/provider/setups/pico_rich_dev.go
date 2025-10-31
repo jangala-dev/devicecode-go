@@ -70,6 +70,7 @@ var SelectedSetup = types.HALConfig{
 					VinLo_mV: PtrI32(9000), VinHi_mV: PtrI32(11000),
 					BSRHigh_uOhmPerCell: PtrU32(100000), IChargeTarget_mA: PtrI32(2000),
 					LeadAcidTempComp: PtrBool(false),
+					MaxAbsorbTime_s:  PtrU16(65535), VAbsorbDelta_mVPerCell: PtrI32(50),
 					// optional config-bit changes, limits, etc.
 				}},
 				{Verb: "enable"},
