@@ -29,7 +29,7 @@ const (
 	PG_ON_VIN = 12000
 	SAG_VIN   = 10600
 
-	PG_ON_VBAT  = 12200
+	PG_ON_VBAT  = 12400
 	PG_OFF_HYST = 800
 	SAG_VBAT    = 11400
 )
@@ -61,7 +61,9 @@ var halReadiness = bus.T("hal", "state")
 
 // LED
 var (
-	tLEDCtrlSet = bus.T("hal", "cap", "io", string(types.KindLED), "button_led", "control", "set")
+	// tLEDCtrlSet  = bus.T("hal", "cap", "io", string(types.KindLED), "button_led", "control", "set")
+	tPWMCtrlSet  = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "set")
+	tPWMCtrlRamp = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "ramp")
 )
 
 // Die
@@ -173,6 +175,7 @@ func NewReactor(ui *bus.Connection) *Reactor {
 		levelUp: true,
 		state:   stateOff,
 		now:     time.Now(),
+		ledTick: 0,
 	}
 }
 
@@ -266,8 +269,10 @@ func (r *Reactor) advanceSequenceIfDue() {
 	case stateUpSeq:
 		if r.seqIdx >= len(powerSeq) {
 			// finished: all rails are on
-			r.state = stateOn
-			r.seqOnCount = len(powerSeq)
+			// r.state = stateOn
+			// r.seqOnCount = len(powerSeq)
+			r.startDownSeq()
+			r.nextActionDue = r.now.Add(1000 * time.Millisecond)
 			return
 		}
 		step := powerSeq[r.seqIdx]
@@ -281,8 +286,10 @@ func (r *Reactor) advanceSequenceIfDue() {
 	case stateDownSeq:
 		if r.seqIdx < 0 {
 			// finished: all rails are off
-			r.state = stateOff
-			r.seqOnCount = 0
+			// r.state = stateOff
+			// r.seqOnCount = 0
+			r.startUpSeq()
+			r.nextActionDue = r.now.Add(1000 * time.Millisecond)
 			return
 		}
 		step := powerSeq[r.seqIdx]
@@ -323,17 +330,17 @@ func (r *Reactor) stepFSM() {
 		// If actively powering down and inputs become stably good, reverse.
 		if r.state == stateDownSeq && r.pgStable {
 			log.Println("[power] inputs stably good → reverse to UP sequence")
-			r.startUpSeq()
+			// r.startUpSeq()
 			return
 		}
 		if r.state == stateOff && r.pgStable {
-			r.startUpSeq()
+			// r.startUpSeq()
 			return
 		}
 
 	case stateUpSeq, stateOn:
 		if r.mustCutNow() {
-			r.startDownSeq()
+			// r.startDownSeq()
 			return
 		}
 	}
@@ -342,29 +349,20 @@ func (r *Reactor) stepFSM() {
 // ---- LED policy tied to rails state ----
 
 func (r *Reactor) stepLED() {
-	switch r.state {
-	case stateUpSeq, stateOn:
-		r.ledTick = 0
-		if !r.ledSteady {
-			// Steady ON on healthy rails
-			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
-			r.ledSteady = true
-		}
-	default:
-		// Blink at 1 Hz: 100 ms ON, 900 ms OFF (TICK = 100 ms)
-		r.ledSteady = false
-		r.ledTick++
-		phase := r.ledTick % 10
-		switch phase {
-		case 0:
-			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
-		case 1:
-			// keep ON for one more tick? comment/uncomment to lengthen pulse
-			// r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: true}, false))
-		case 2:
-			r.ui.Publish(r.ui.NewMessage(tLEDCtrlSet, types.LEDSet{On: false}, false))
-		}
+	r.ledTick++
+
+	seconds := r.ledTick / 10
+	ledPhase := seconds % 3
+	switch ledPhase {
+	case 0:
+		log.Println("[led***] Ramp Up")
+		r.ui.Publish(r.ui.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: 4095, DurationMs: 1000, Steps: 32, Mode: 0}, false))
+	case 1:
+		// Keep on for a second
+	case 2:
+		r.ui.Publish(r.ui.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: 0, DurationMs: 1000, Steps: 32, Mode: 0}, false))
 	}
+
 }
 
 // ---- public input updaters (emit telemetry) ----
@@ -541,6 +539,8 @@ func main() {
 	ticker := time.NewTicker(TICK)
 	defer ticker.Stop()
 	memTick := 0
+
+	r.startUpSeq()
 
 	log.Println("[main] entering reactor loop …")
 	for {
