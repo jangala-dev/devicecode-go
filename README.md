@@ -28,7 +28,10 @@ The Darwin Kernel requires the debugger to have special permissions before it is
 
 ### Build and debug from VSCode
 
+- Select target from debug dropdown (Pico or Pico2)
 - Press F5 to begin debugging
+
+![alt text](/assets/image.png)
 
 An OpenOCD server will be started, a GDB session started.  Then the project will be built with flags specified in .vscode/tasks.json. Next, the compiled .elf file will be flashed to the MCU. The MCU will then be reset and control is handed over to you for the debug session.
 
