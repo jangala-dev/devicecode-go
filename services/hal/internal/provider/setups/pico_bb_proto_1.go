@@ -6,6 +6,7 @@ import (
 	aht20dev "devicecode-go/services/hal/devices/aht20"
 	"devicecode-go/services/hal/devices/gpio_dout"
 	ltc4015dev "devicecode-go/services/hal/devices/ltc4015"
+	"devicecode-go/services/hal/devices/pwm_out"
 	"devicecode-go/services/hal/devices/rp2_temp"
 	serialraw "devicecode-go/services/hal/devices/serial_raw"
 	"devicecode-go/types"
@@ -26,9 +27,14 @@ var SelectedPlan = ResourcePlan{
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 
-		{ID: "button_led", Type: "gpio_led", Params: gpio_dout.Params{
-			Pin: 11, ActiveLow: false, Initial: true,
-			Domain: "io", Name: "button_led",
+		{ID: "button_led", Type: "pwm_out", Params: pwm_out.Params{
+			Pin:       11,
+			FreqHz:    1000,
+			Top:       4095,
+			ActiveLow: false,
+			Initial:   4095,
+			Domain:    "io",
+			Name:      "button-led",
 		}},
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
