@@ -62,7 +62,6 @@ var halReadiness = bus.T("hal", "state")
 
 // LED
 var (
-	tLEDCtrlSet  = bus.T("hal", "cap", "io", string(types.KindLED), "button_led", "control", "set")
 	tPWMCtrlSet  = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "set")
 	tPWMCtrlRamp = bus.T("hal", "cap", "io", string(types.KindPWM), "button-led", "control", "ramp")
 )
@@ -357,7 +356,7 @@ func (r *Reactor) stepLED() {
 	default:
 		r.ledSteady = false
 		r.ledTick++
-		if r.ledTick%10 == 0 { // 4 * 250 ms = 1 s
+		if r.ledTick%10 == 0 { // 10 * 100 ms = 1 s
 			var target uint16
 			if r.levelUp {
 				target = pwmTop
