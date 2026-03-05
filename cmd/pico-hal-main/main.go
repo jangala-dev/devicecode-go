@@ -101,8 +101,8 @@ func main() {
 	// ---------- PWM topics/subscriptions (onboard) ----------
 	// Using hal/cap/<domain>/<kind>/<name>/...
 	pwmKind := string(types.KindPWM) // ensure types.KindPWM exists
-	tPWMCtrlSet := bus.T("hal", "cap", "io", pwmKind, "button-led", "control", "set")
-	tPWMCtrlRamp := bus.T("hal", "cap", "io", pwmKind, "button-led", "control", "ramp")
+	tPWMCtrlSet := bus.T("hal", "cap", "io", pwmKind, "button_led", "control", "set")
+	tPWMCtrlRamp := bus.T("hal", "cap", "io", pwmKind, "button_led", "control", "ramp")
 
 	// Optional: set an initial level (0)
 	println("[main] setting initial io/pwm/onboard level=0 …")
