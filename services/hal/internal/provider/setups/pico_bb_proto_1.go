@@ -34,7 +34,7 @@ var SelectedSetup = types.HALConfig{
 			ActiveLow: false,
 			Initial:   4095,
 			Domain:    "io",
-			Name:      "button-led",
+			Name:      "button_led",
 		}},
 
 		// Environmental sensor on i2c0 (public addresses under hal/cap/env/*/core/…)
