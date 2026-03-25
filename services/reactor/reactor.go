@@ -374,12 +374,12 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 
 	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
 	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
-		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
-		w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("power/charger/internal/vin", int(v.VIN_mV))
+		w.KvInt("power/charger/internal/vsys", int(v.VSYS_mV))
+		w.KvInt("power/charger/internal/iin", int(v.IIn_mA))
 		// Full bitfield maps (0/1) for LOCF pipelines
 		{
 			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
@@ -389,9 +389,9 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 					break
 				}
 				if set {
-					w.kvInt("power/charger/internal/system/"+bitName, 1)
+					w.KvInt("power/charger/internal/system/"+bitName, 1)
 				} else {
-					w.kvInt("power/charger/internal/system/"+bitName, 0)
+					w.KvInt("power/charger/internal/system/"+bitName, 0)
 				}
 			}
 		}
@@ -403,9 +403,9 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 					break
 				}
 				if set {
-					w.kvInt("power/charger/internal/status/"+bitName, 1)
+					w.KvInt("power/charger/internal/status/"+bitName, 1)
 				} else {
-					w.kvInt("power/charger/internal/status/"+bitName, 0)
+					w.KvInt("power/charger/internal/status/"+bitName, 0)
 				}
 			}
 		}
@@ -417,13 +417,13 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 					break
 				}
 				if set {
-					w.kvInt("power/charger/internal/state/"+bitName, 1)
+					w.KvInt("power/charger/internal/state/"+bitName, 1)
 				} else {
-					w.kvInt("power/charger/internal/state/"+bitName, 0)
+					w.KvInt("power/charger/internal/state/"+bitName, 0)
 				}
 			}
 		}
-		w.end()
+		w.End()
 	}
 }
 
@@ -434,24 +434,24 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 
 	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
 	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
-		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
-		w.kvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
-		w.end()
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("power/battery/internal/vbat", int(v.PackMilliV))
+		w.KvInt("power/battery/internal/ibat", int(v.IBatMilliA))
+		w.KvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
+		w.End()
 	}
 }
 
 func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	log.Deci(label, deci)
 	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt(jsonKey, deci)
-		w.end()
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt(jsonKey, deci)
+		w.End()
 	}
 }
 
@@ -471,11 +471,11 @@ func (r *Reactor) emitMemSnapshot() {
 	)
 	// JSON (minimal to keep overhead low)
 	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("sys/mem/alloc", int(ms.Alloc))
-		w.end()
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("sys/mem/alloc", int(ms.Alloc))
+		w.End()
 	}
 }
 
@@ -560,11 +560,11 @@ func (r *Reactor) Run(ctx context.Context) {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 				// JSON
 				if r.jsonOut != nil {
-					var w jsonw
-					w.write = r.jsonWrite
-					w.begin()
-					w.kvInt("env/humidity/core", int(v.RHx100))
-					w.end()
+					var w utilities.JSONWriter
+					w.Write = r.jsonWrite
+					w.Begin()
+					w.KvInt("env/humidity/core", int(v.RHx100))
+					w.End()
 				}
 			}
 
@@ -607,11 +607,11 @@ func (r *Reactor) Run(ctx context.Context) {
 				name, _ := m.Topic.At(4).(string)
 				tag, _ := m.Topic.At(6).(string)
 				if dom != "" && kind != "" && name != "" && tag != "" {
-					var w jsonw
-					w.write = r.jsonWrite
-					w.begin()
-					w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
-					w.end()
+					var w utilities.JSONWriter
+					w.Write = r.jsonWrite
+					w.Begin()
+					w.KvStr(dom+"/"+kind+"/"+name+"/event", tag)
+					w.End()
 				}
 			}
 
@@ -657,91 +657,6 @@ func (r *Reactor) jsonWrite(b []byte) int {
 		}
 	}
 	return n
-}
-
-
-
-// -----------------------------------------------------------------------------
-// Minimal streaming JSON writer for shmring (no buffers/allocs)
-// -----------------------------------------------------------------------------
-
-type jsonw struct {
-	write func([]byte) int
-	first bool
-}
-
-func (w *jsonw) begin() {
-	w.first = true
-	if w.write != nil {
-		w.write([]byte("{"))
-	}
-}
-func (w *jsonw) end() {
-	if w.write != nil {
-		w.write([]byte("}\n"))
-	}
-}
-func (w *jsonw) comma() {
-	if w.write == nil {
-		return
-	}
-	if !w.first {
-		w.write([]byte(","))
-	} else {
-		w.first = false
-	}
-}
-func (w *jsonw) key(k string) {
-	if w.write == nil {
-		return
-	}
-	w.write([]byte(`"`))
-	w.write([]byte(k))
-	w.write([]byte(`":`))
-}
-func (w *jsonw) kvInt(k string, v int) {
-	w.comma()
-	w.key(k)
-	if w.write != nil {
-		w.write([]byte(strconvx.Itoa(v)))
-	}
-}
-func (w *jsonw) kvStr(k, s string) {
-	w.comma()
-	w.key(k)
-	if w.write == nil {
-		return
-	}
-	w.write([]byte(`"`))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '\\', '"':
-			w.write([]byte{'\\', c})
-		case '\b':
-			w.write([]byte{'\\', 'b'})
-		case '\f':
-			w.write([]byte{'\\', 'f'})
-		case '\n':
-			w.write([]byte{'\\', 'n'})
-		case '\r':
-			w.write([]byte{'\\', 'r'})
-		case '\t':
-			w.write([]byte{'\\', 't'})
-		default:
-			if c < 0x20 {
-				var buf [6]byte
-				buf[0], buf[1], buf[2], buf[3] = '\\', 'u', '0', '0'
-				const hex = "0123456789abcdef"
-				buf[4] = hex[c>>4]
-				buf[5] = hex[c&0xF]
-				w.write(buf[:])
-			} else {
-				w.write([]byte{c})
-			}
-		}
-	}
-	w.write([]byte(`"`))
 }
 
 // -----------------------------------------------------------------------------
