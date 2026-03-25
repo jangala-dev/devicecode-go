@@ -301,45 +301,6 @@ func (r *Reactor) publishSwitch(name string, on bool) {
 	r.uiConn.Publish(r.uiConn.NewMessage(tSwitch(name), types.SwitchSet{On: on}, false))
 }
 
-// ---- state transitions (with symmetric reversal) ----
-
-func (r *Reactor) stepFSM() {
-	r.updateLatchesFromValues()
-
-	switch r.state {
-	case stateOff, stateDownSeq:
-		// Evaluate PG/thermal with debounce
-		if !r.otActive && r.supplyPG() && r.tempOKForTurnOn() {
-			if r.pgSince.IsZero() {
-				r.pgSince = r.now
-				r.pgStable = false
-			} else if !r.pgStable && r.now.Sub(r.pgSince) >= DEBOUNCE_OK {
-				r.pgStable = true
-			}
-		} else {
-			r.pgSince = time.Time{}
-			r.pgStable = false
-		}
-
-		// If actively powering down and inputs become stably good, reverse.
-		if r.state == stateDownSeq && r.pgStable {
-			log.Println("[power] inputs stably good → reverse to UP sequence")
-			r.startUpSeq()
-			return
-		}
-		if r.state == stateOff && r.pgStable {
-			r.startUpSeq()
-			return
-		}
-
-	case stateUpSeq, stateOn:
-		if r.mustCutNow() {
-			r.startDownSeq()
-			return
-		}
-	}
-}
-
 // ---- LED policy tied to rails state ----
 
 func (r *Reactor) stepLED() {
@@ -612,16 +573,13 @@ func (r *Reactor) Run(ctx context.Context) {
 		case <-ticker.C:
 			r.now = time.Now()
 
-			// 1) Run FSM (includes symmetric reversal)
-			// r.stepFSM()
-
-			// 2) Advance sequencing steps if due
+			// 1) Advance sequencing steps if due
 			r.advanceSequenceIfDue()
 
-			// 3) LED behaviour
+			// 2) LED behaviour
 			r.stepLED()
 
-			// 4) Periodic memory snapshot (~3 s)
+			// 3) Periodic memory snapshot (~3 s)
 			memTick++
 			if memTick%30 == 0 { // 30 * 100 ms = 3 s
 				r.emitMemSnapshot()
