@@ -30,7 +30,7 @@
       "postLaunchCommands": ["monitor reset"]
     },
     {
-      "name": "Debug Pico 2 (rp2040,QA)",
+      "name": "Debug Pico (rp2040) QA",
       "type": "cortex-debug",
       "request": "launch",
       "servertype": "openocd",
@@ -44,7 +44,7 @@
       "postLaunchCommands": ["monitor reset"]
     },
     {
-      "name": "Debug Pico 2 (rp2350,QA)",
+      "name": "Debug Pico 2 (rp2350) QA",
       "type": "cortex-debug",
       "request": "launch",
       "servertype": "openocd",
