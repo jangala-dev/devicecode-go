@@ -130,7 +130,7 @@ const (
 )
 
 type Reactor struct {
-	ui *bus.Connection
+	uiConn *bus.Connection
 
 	// UART
 	jsonOut *shmring.Ring // telemetry (JSON UART TX)
@@ -169,9 +169,9 @@ type Reactor struct {
 	droppedUART0Bytes int
 }
 
-func NewReactor(ui *bus.Connection) *Reactor {
+func NewReactor(uiConn *bus.Connection) *Reactor {
 	return &Reactor{
-		ui:      ui,
+		uiConn:      uiConn,
 		levelUp: true,
 		state:   stateOff,
 		now:     time.Now(),
@@ -300,7 +300,7 @@ func (r *Reactor) advanceSequenceIfDue() {
 }
 
 func (r *Reactor) publishSwitch(name string, on bool) {
-	r.ui.Publish(r.ui.NewMessage(tSwitch(name), types.SwitchSet{On: on}, false))
+	r.uiConn.Publish(r.uiConn.NewMessage(tSwitch(name), types.SwitchSet{On: on}, false))
 }
 
 // ---- state transitions (with symmetric reversal) ----
@@ -350,7 +350,7 @@ func (r *Reactor) stepLED() {
 		r.ledTick = 0
 		if !r.ledSteady {
 			// Steady ON on healthy rails
-			r.ui.Publish(r.ui.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
+			r.uiConn.Publish(r.uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
 			r.ledSteady = true
 		}
 	default:
@@ -364,7 +364,7 @@ func (r *Reactor) stepLED() {
 				target = 0
 			}
 			r.levelUp = !r.levelUp
-			r.ui.Publish(r.ui.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
+			r.uiConn.Publish(r.uiConn.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
 		}
 	}
 }
@@ -483,62 +483,34 @@ func (r *Reactor) emitMemSnapshot() {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Main
-// -----------------------------------------------------------------------------
-
-func main() {
-	// Allow early USB/console settle if needed
-	time.Sleep(3 * time.Second)
-	log.SetStart(time.Now())
-
-	ctx := context.Background()
-
-	log.Println("[main] bootstrapping bus …")
-	b := bus.NewBus(3, "+", "#")
-	halConn := b.NewConnection("hal")
-	uiConn := b.NewConnection("ui")
-
-	log.Println("[main] starting hal.Run …")
-	go hal.Run(ctx, halConn)
-
-	// Wait for retained hal/state=ready (or time out)
-	if !waitHALReady(ctx, halConn, halTimeout) {
-		for {
-			log.Println("[main] HAL not ready within timeout")
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	// Subscriptions (env + power)
+func (r *Reactor) Run(ctx context.Context) {
+// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
-	tempSub := uiConn.Subscribe(tTempValue)
-	tempDieSub := uiConn.Subscribe(tDieTempValue)
-	humidSub := uiConn.Subscribe(tHumValue)
-	valSub := uiConn.Subscribe(valTopic)
-	stSub := uiConn.Subscribe(stTopic)
-	evSub := uiConn.Subscribe(evTopic)
+	tempSub := r.uiConn.Subscribe(tTempValue)
+	tempDieSub := r.uiConn.Subscribe(tDieTempValue)
+	humidSub := r.uiConn.Subscribe(tHumValue)
+	valSub := r.uiConn.Subscribe(valTopic)
+	stSub := r.uiConn.Subscribe(stTopic)
+	evSub := r.uiConn.Subscribe(evTopic)
 
 	// UART sessions (TX only needed for our use)
 	const (
 		uartTele = "uart0" // telemetry JSON
 		uartLog  = "uart1" // log mirror
 	)
-	subSessOpenTele := uiConn.Subscribe(tSessOpened(uartTele))
-	subSessOpenLog := uiConn.Subscribe(tSessOpened(uartLog))
-	subSessClosedTele := uiConn.Subscribe(tSessClosed(uartTele))
-	subSessClosedLog := uiConn.Subscribe(tSessClosed(uartLog))
+	subSessOpenTele := r.uiConn.Subscribe(tSessOpened(uartTele))
+	subSessOpenLog := r.uiConn.Subscribe(tSessOpened(uartLog))
+	subSessClosedTele := r.uiConn.Subscribe(tSessClosed(uartTele))
+	subSessClosedLog := r.uiConn.Subscribe(tSessClosed(uartLog))
 
 	// Kick open requests (fire-and-forget; events carry handles)
-	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
 	// Retry back-off guards
 	var retryTeleAt, retryLogAt time.Time
 
-	// Reactor
-	r := NewReactor(uiConn)
-
+	
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
 	defer ticker.Stop()
@@ -563,7 +535,7 @@ func main() {
 			log.Println("[uart0] telemetry session closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryTeleAt) {
-				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 				retryTeleAt = time.Now().Add(2 * time.Second)
 			}
 		case <-subSessClosedLog.Channel():
@@ -571,7 +543,7 @@ func main() {
 			log.Println("[uart1] log session closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryLogAt) {
-				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 				retryLogAt = time.Now().Add(2 * time.Second)
 			}
 
@@ -669,6 +641,37 @@ func main() {
 			return
 		}
 	}
+}
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+
+func main() {
+	// Allow early USB/console settle if needed
+	time.Sleep(3 * time.Second)
+	log.SetStart(time.Now())
+
+	ctx := context.Background()
+
+	log.Println("[main] bootstrapping bus …")
+	b := bus.NewBus(3, "+", "#")
+	halConn := b.NewConnection("hal")
+	uiConn := b.NewConnection("ui")
+
+	log.Println("[main] starting hal.Run …")
+	go hal.Run(ctx, halConn)
+
+	// Wait for retained hal/state=ready (or time out)
+	if !waitHALReady(ctx, halConn, halTimeout) {
+		for {
+			log.Println("[main] HAL not ready within timeout")
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	// Reactor
+	r := NewReactor(uiConn)
+	r.Run(ctx)
 }
 
 // -----------------------------------------------------------------------------
