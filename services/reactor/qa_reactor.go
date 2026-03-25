@@ -343,27 +343,19 @@ func (r *Reactor) stepFSM() {
 // ---- LED policy tied to rails state ----
 
 func (r *Reactor) stepLED() {
-	switch r.state {
-	case stateOn:
-		r.ledTick = 0
-		if !r.ledSteady {
-			// Steady ON on healthy rails
-			r.uiConn.Publish(r.uiConn.NewMessage(tPWMCtrlSet, types.PWMSet{Level: pwmTop}, false))
-			r.ledSteady = true
+	r.ledSteady = false
+	r.ledTick++
+	if r.ledTick%50 == 0 {
+		var target uint16
+		if r.levelUp {
+			target = pwmTop
+			r.startUpSeq()
+		} else {
+			target = 0
+			r.startDownSeq()
 		}
-	default:
-		r.ledSteady = false
-		r.ledTick++
-		if r.ledTick%10 == 0 { // 10 * 100 ms = 1 s
-			var target uint16
-			if r.levelUp {
-				target = pwmTop
-			} else {
-				target = 0
-			}
-			r.levelUp = !r.levelUp
-			r.uiConn.Publish(r.uiConn.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
-		}
+		r.levelUp = !r.levelUp
+		r.uiConn.Publish(r.uiConn.NewMessage(tPWMCtrlRamp, types.PWMRamp{To: target, DurationMs: 1000, Steps: 32, Mode: 0}, false))
 	}
 }
 
@@ -508,7 +500,6 @@ func (r *Reactor) Run(ctx context.Context) {
 	// Retry back-off guards
 	var retryTeleAt, retryLogAt time.Time
 
-	
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
 	defer ticker.Stop()
@@ -622,7 +613,7 @@ func (r *Reactor) Run(ctx context.Context) {
 			r.now = time.Now()
 
 			// 1) Run FSM (includes symmetric reversal)
-			r.stepFSM()
+			// r.stepFSM()
 
 			// 2) Advance sequencing steps if due
 			r.advanceSequenceIfDue()
