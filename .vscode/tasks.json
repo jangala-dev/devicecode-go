@@ -30,6 +30,36 @@
         "-scheduler=tasks"
       ],
       "problemMatcher": []
+    },
+    {
+      "label": "TinyGo Build (rp2040,QA)",
+      "type": "shell",
+      "command": "tinygo",
+      "args": [
+        "build",
+        "-o", "${workspaceFolder}/build/devicecode.elf",
+        "-stack-size=3KB",
+        "-serial=none",
+        "-target=pico",
+        "-tags", "pico_bb_proto_1,qa_reactor",
+        "-scheduler=tasks"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "TinyGo Build (rp2350,QA)",
+      "type": "shell",
+      "command": "tinygo",
+      "args": [
+        "build",
+        "-o", "${workspaceFolder}/build/devicecode.elf",
+        "-stack-size=3KB",
+        "-serial=none",
+        "-target=pico2",
+        "-tags", "pico_bb_proto_1,qa_reactor",
+        "-scheduler=tasks"
+      ],
+      "problemMatcher": []
     }
   ]
 }

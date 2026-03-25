@@ -1,4 +1,4 @@
-//go:build !qa_reactor
+//go:build qa_reactor
 
 package reactor
 
