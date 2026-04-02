@@ -83,6 +83,27 @@ type wireReply struct {
 	Err     string          `json:"err,omitempty"`
 }
 
+// wireMsg is a union struct for single-pass unmarshal in dispatch.
+// Fields are the superset of all message types. Only the fields
+// relevant to the T value are populated; the rest are zero.
+type wireMsg struct {
+	T         string          `json:"t"`
+	Node      string          `json:"node,omitempty"`
+	Peer      string          `json:"peer,omitempty"`
+	SID       string          `json:"sid,omitempty"`
+	Proto     int             `json:"proto,omitempty"`
+	OK        bool            `json:"ok,omitempty"`
+	Caps      *wireCaps       `json:"caps,omitempty"`
+	TS        int64           `json:"ts,omitempty"`
+	Topic     []string        `json:"topic,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	Retain    bool            `json:"retain,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Corr      string          `json:"corr,omitempty"`
+	TimeoutMs int             `json:"timeout_ms,omitempty"`
+	Err       string          `json:"err,omitempty"`
+}
+
 // ---- codec helpers ----
 
 // marshal returns compact JSON with a trailing newline.

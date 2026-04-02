@@ -94,7 +94,6 @@ type session struct {
 	peerNode        string
 	peerSID         string
 	peerProto       int
-	helloSeen       bool
 	lastRxAt        time.Time
 	lastTxAt        time.Time
 	lastPongAt      time.Time
@@ -200,7 +199,6 @@ func (s *session) run(ctx context.Context) {
 	exportTick := time.NewTicker(50 * time.Millisecond)
 	defer exportTick.Stop()
 
-	s.logWaiting()
 	s.publishLinkState("", "")
 	s.log("run start")
 
@@ -312,7 +310,6 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.peerNode = ""
 	s.peerSID = ""
 	s.peerProto = 0
-	s.helloSeen = false
 	s.exportReadyAt = time.Time{}
 	s.exportWaitUntil = time.Time{}
 	s.exportsEnabled = false
@@ -347,29 +344,34 @@ func (s *session) promoteLink(reason string) {
 // ---- dispatch ----
 
 func (s *session) dispatch(line []byte) bool {
-	msgType := wireType(line)
-	switch msgType {
+	var msg wireMsg
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed frame dropped", "err", err.Error())
+		return false
+	}
+	s.markRx()
+	switch msg.T {
 	case msgHello:
-		return s.onHello(line)
+		return s.onHello(&msg)
 	case msgHelloAck:
-		return s.onHelloAck(line)
+		return s.onHelloAck(&msg)
 	case msgPing:
-		return s.onPing(line)
+		return s.onPing(&msg)
 	case msgPong:
-		return s.onPong(line)
+		return s.onPong(&msg)
 	case msgPub:
-		return s.onPub(line)
+		return s.onPub(&msg)
 	case msgUnretain:
-		return s.onUnretain(line)
+		return s.onUnretain(&msg)
 	case msgCall:
-		return s.onCall(line)
+		return s.onCall(&msg)
 	case msgReply:
-		return s.onReply(line)
+		return s.onReply(&msg)
 	default:
-		if msgType == "" {
+		if msg.T == "" {
 			s.log("invalid frame dropped")
 		} else {
-			s.logKV("unknown frame type dropped", "type", msgType)
+			s.logKV("unknown frame type dropped", "type", msg.T)
 		}
 		return false
 	}
@@ -419,13 +421,7 @@ func hasWirePrefix(topic, prefix []string) bool {
 	return true
 }
 
-func (s *session) onHello(line []byte) bool {
-	var msg wireHello
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed hello dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onHello(msg *wireMsg) bool {
 	if msg.Peer != "" && msg.Peer != s.nodeID {
 		s.log("hello dropped: wrong peer")
 		return false
@@ -435,7 +431,6 @@ func (s *session) onHello(line []byte) bool {
 		return false
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
-	s.helloSeen = true
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
 	if !s.writeLine(marshal(wireHelloAck{
@@ -464,36 +459,23 @@ func (s *session) enableExports(reason string) {
 	s.logKV("export replay armed", "reason", reason)
 }
 
-func (s *session) onHelloAck(line []byte) bool {
-	var msg wireHelloAck
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed hello_ack dropped", "err", err.Error())
-		return false
-	}
+func (s *session) onHelloAck(msg *wireMsg) bool {
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
 		s.log("echoed hello_ack ignored")
 		return true
 	}
-	s.markRx()
 	if !msg.OK {
 		s.log("hello_ack rejected by peer")
 		s.handleLinkDown(reasonHelloRejected, "")
 		return true
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
-	s.helloSeen = true
 	s.logKV("hello_ack rx", "peer_sid", msg.SID)
 	s.promoteLink(reason)
 	return true
 }
 
-func (s *session) onPing(line []byte) bool {
-	var msg wirePing
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed ping dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onPing(msg *wireMsg) bool {
 	if s.link != linkUp {
 		s.log("ping dropped: link not up")
 		return true
@@ -516,17 +498,11 @@ func (s *session) onPing(line []byte) bool {
 	return true
 }
 
-func (s *session) onPong(line []byte) bool {
-	var msg wirePong
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed pong dropped", "err", err.Error())
-		return false
-	}
+func (s *session) onPong(msg *wireMsg) bool {
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
 		return true
 	}
-	s.markRx()
 	s.lastPongAt = s.lastRxAt
 	reason := s.notePeerIdentity("", msg.SID, 0)
 	if reason != "" {
@@ -541,13 +517,7 @@ func (s *session) onPong(line []byte) bool {
 	return true
 }
 
-func (s *session) onPub(line []byte) bool {
-	var msg wirePub
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed pub dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onPub(msg *wireMsg) bool {
 	if s.link != linkUp {
 		s.log("pub dropped before handshake")
 		return true
@@ -566,13 +536,7 @@ func (s *session) onPub(line []byte) bool {
 	return true
 }
 
-func (s *session) onUnretain(line []byte) bool {
-	var msg wireUnretain
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed unretain dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onUnretain(msg *wireMsg) bool {
 	if s.link != linkUp {
 		s.log("unretain dropped before handshake")
 		return true
@@ -587,13 +551,7 @@ func (s *session) onUnretain(line []byte) bool {
 	return true
 }
 
-func (s *session) onCall(line []byte) bool {
-	var msg wireCall
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed call dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onCall(msg *wireMsg) bool {
 	if s.link != linkUp {
 		s.log("call dropped before handshake")
 		return true
@@ -620,13 +578,7 @@ func (s *session) onCall(line []byte) bool {
 	return true
 }
 
-func (s *session) onReply(line []byte) bool {
-	var msg wireReply
-	if err := json.Unmarshal(line, &msg); err != nil {
-		s.logKV("malformed reply dropped", "err", err.Error())
-		return false
-	}
-	s.markRx()
+func (s *session) onReply(msg *wireMsg) bool {
 	s.enableExports(exportTriggerReply)
 
 	for i, call := range s.outboundCalls {
@@ -929,7 +881,7 @@ func (s *session) writeLine(data []byte) bool {
 }
 
 func (s *session) logWaiting() {
-	if s.helloSeen {
+	if s.peerSID != "" {
 		return
 	}
 	s.log("waiting for connection start")
