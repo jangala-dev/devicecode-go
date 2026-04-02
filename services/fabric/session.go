@@ -70,6 +70,61 @@ const (
 	reasonTimeout            = "timeout"
 )
 
+// ---- bus topics for config handling ----
+
+var (
+	tConfigHAL    = bus.T("config", "hal")
+	dumpCallTopic = []string{"rpc", "hal", "dump"}
+)
+
+// ---- types ----
+
+type dumpReply struct {
+	OK          bool            `json:"ok"`
+	Method      string          `json:"method"`
+	Echo        any             `json:"echo,omitempty"`
+	HAL         *types.HALState `json:"hal,omitempty"`
+	Applied     bool            `json:"applied"`
+	ConfigCount int             `json:"config_count,omitempty"`
+	ConfigError string          `json:"config_error,omitempty"`
+}
+
+type inboundCall struct {
+	id       string
+	sub      *bus.Subscription
+	deadline time.Time
+}
+
+type outboundCall struct {
+	id       string
+	req      *bus.Message
+	deadline time.Time
+}
+
+type readResult struct {
+	line []byte
+	err  error
+}
+
+type linkStatePayload struct {
+	LinkID            string `json:"link_id"`
+	Status            string `json:"status"`
+	Ready             bool   `json:"ready"`
+	Established       bool   `json:"established"`
+	PeerID            string `json:"peer_id"`
+	LocalSID          string `json:"local_sid"`
+	PeerSID           string `json:"peer_sid,omitempty"`
+	PeerNode          string `json:"peer_node,omitempty"`
+	PeerProto         int    `json:"peer_proto,omitempty"`
+	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
+	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
+	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
+	InboundCalls      int    `json:"inbound_calls"`
+	OutboundCalls     int    `json:"outbound_calls"`
+	Reason            string `json:"reason,omitempty"`
+	Err               string `json:"err,omitempty"`
+}
+
 // session manages the fabric link state machine over a Transport.
 //
 // All bus access happens in the main loop goroutine only. TinyGo's
@@ -113,42 +168,6 @@ func (s *session) log(msg string) {
 
 func (s *session) logKV(msg, key, value string) {
 	println("[fabric]", "sid", s.localSID, msg, key, value)
-}
-
-type inboundCall struct {
-	id       string
-	sub      *bus.Subscription
-	deadline time.Time
-}
-
-type outboundCall struct {
-	id       string
-	req      *bus.Message
-	deadline time.Time
-}
-
-type readResult struct {
-	line []byte
-	err  error
-}
-
-type linkStatePayload struct {
-	LinkID            string `json:"link_id"`
-	Status            string `json:"status"`
-	Ready             bool   `json:"ready"`
-	Established       bool   `json:"established"`
-	PeerID            string `json:"peer_id"`
-	LocalSID          string `json:"local_sid"`
-	PeerSID           string `json:"peer_sid,omitempty"`
-	PeerNode          string `json:"peer_node,omitempty"`
-	PeerProto         int    `json:"peer_proto,omitempty"`
-	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
-	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
-	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
-	InboundCalls      int    `json:"inbound_calls"`
-	OutboundCalls     int    `json:"outbound_calls"`
-	Reason            string `json:"reason,omitempty"`
-	Err               string `json:"err,omitempty"`
 }
 
 // run is the main loop. Blocks until ctx is cancelled.
@@ -218,7 +237,6 @@ func (s *session) run(ctx context.Context) {
 			resetTimer(stale, staleTimeout)
 
 		case <-exportTick.C:
-			s.drainHALState()
 			s.drainExports()
 			s.drainInbound(time.Now())
 			s.drainOutbound(time.Now())
@@ -614,23 +632,6 @@ func mustMarshal(v any) json.RawMessage {
 		return json.RawMessage(`{"error":"marshal_failed"}`)
 	}
 	return json.RawMessage(b)
-}
-
-// ---- config/dump types and helpers ----
-
-var (
-	tConfigHAL    = bus.T("config", "hal")
-	dumpCallTopic = []string{"rpc", "hal", "dump"}
-)
-
-type dumpReply struct {
-	OK          bool            `json:"ok"`
-	Method      string          `json:"method"`
-	Echo        any             `json:"echo,omitempty"`
-	HAL         *types.HALState `json:"hal,omitempty"`
-	Applied     bool            `json:"applied"`
-	ConfigCount int             `json:"config_count,omitempty"`
-	ConfigError string          `json:"config_error,omitempty"`
 }
 
 func topicEquals(t bus.Topic, expected bus.Topic) bool {
