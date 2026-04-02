@@ -337,7 +337,7 @@ func (s *session) promoteLink(reason string) {
 // validateInbound checks whether a message should be processed.
 // Handshake messages (hello, hello_ack) are always accepted.
 // All others require an established link and a matching session ID.
-func (s *session) validateInbound(msg *wireMsg) bool {
+func (s *session) validateInbound(msg *protoMsg) bool {
 	if msg.T == msgHello || msg.T == msgHelloAck {
 		return true
 	}
@@ -353,7 +353,7 @@ func (s *session) validateInbound(msg *wireMsg) bool {
 }
 
 func (s *session) dispatch(line []byte) {
-	var msg wireMsg
+	var msg protoMsg
 	if err := json.Unmarshal(line, &msg); err != nil {
 		s.logKV("malformed frame dropped", "err", err.Error())
 		return
@@ -428,7 +428,7 @@ func hasWirePrefix(topic, prefix []string) bool {
 	return true
 }
 
-func (s *session) onHello(msg *wireMsg) {
+func (s *session) onHello(msg *protoMsg) {
 	if msg.Peer != "" && msg.Peer != s.nodeID {
 		s.log("hello dropped: wrong peer")
 		return
@@ -440,7 +440,7 @@ func (s *session) onHello(msg *wireMsg) {
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
-	if !s.writeLine(marshal(wireHelloAck{
+	if !s.sendFrame(marshal(protoHelloAck{
 		T:     msgHelloAck,
 		Node:  s.nodeID,
 		SID:   s.localSID,
@@ -454,7 +454,7 @@ func (s *session) onHello(msg *wireMsg) {
 	s.promoteLink(reason)
 }
 
-func (s *session) onHelloAck(msg *wireMsg) {
+func (s *session) onHelloAck(msg *protoMsg) {
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
 		s.log("echoed hello_ack ignored")
 		return
@@ -469,15 +469,15 @@ func (s *session) onHelloAck(msg *wireMsg) {
 	s.promoteLink(reason)
 }
 
-func (s *session) onPing(msg *wireMsg) {
+func (s *session) onPing(msg *protoMsg) {
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.writeLine(marshal(wirePong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
+	if !s.sendFrame(marshal(protoPong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return
 	}
 	s.log("pong tx")
 }
 
-func (s *session) onPong(msg *wireMsg) {
+func (s *session) onPong(msg *protoMsg) {
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
 		return
@@ -485,7 +485,7 @@ func (s *session) onPong(msg *wireMsg) {
 	s.lastPongAt = s.lastRxAt
 }
 
-func (s *session) onPub(msg *wireMsg) {
+func (s *session) onPub(msg *protoMsg) {
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
@@ -498,7 +498,7 @@ func (s *session) onPub(msg *wireMsg) {
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 }
 
-func (s *session) onUnretain(msg *wireMsg) {
+func (s *session) onUnretain(msg *protoMsg) {
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming unretain dropped: no_route")
@@ -507,11 +507,11 @@ func (s *session) onUnretain(msg *wireMsg) {
 	s.conn.Publish(s.conn.NewMessage(localTopic, nil, true))
 }
 
-func (s *session) onCall(msg *wireMsg) {
+func (s *session) onCall(msg *protoMsg) {
 	localTopic := importCallTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming call dropped: no_route")
-		s.writeLine(marshal(wireReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
+		s.sendFrame(marshal(protoReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return
 	}
 
@@ -528,7 +528,7 @@ func (s *session) onCall(msg *wireMsg) {
 	})
 }
 
-func (s *session) onReply(msg *wireMsg) {
+func (s *session) onReply(msg *protoMsg) {
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
 			continue
@@ -650,7 +650,7 @@ func (s *session) drainExports() {
 					continue
 				}
 				if m.Retained && m.Payload == nil {
-					if !s.writeLine(marshal(wireUnretain{
+					if !s.sendFrame(marshal(protoUnretain{
 						T:     msgUnretain,
 						Topic: wire,
 					})) {
@@ -664,7 +664,7 @@ func (s *session) drainExports() {
 					s.logKV("export payload dropped", "err", err.Error())
 					continue
 				}
-				if !s.writeLine(marshal(wirePub{
+				if !s.sendFrame(marshal(protoPub{
 					T:       msgPub,
 					Topic:   wire,
 					Payload: payload,
@@ -693,25 +693,25 @@ func (s *session) drainInbound(now time.Time) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil // prevent double-unsubscribe in teardownInbound
 			if !ok || reply == nil {
-				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+				if !s.sendFrame(marshal(protoReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 					return
 				}
 				continue
 			}
 			if errStr := checkBusError(reply.Payload); errStr != "" {
-				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: errStr})) {
+				if !s.sendFrame(marshal(protoReply{T: msgReply, Corr: call.id, OK: false, Err: errStr})) {
 					return
 				}
 				continue
 			}
 			payload, err := marshalPayload(reply.Payload)
 			if err != nil {
-				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
+				if !s.sendFrame(marshal(protoReply{T: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
 					return
 				}
 				continue
 			}
-			if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: true, Payload: payload})) {
+			if !s.sendFrame(marshal(protoReply{T: msgReply, Corr: call.id, OK: true, Payload: payload})) {
 				return
 			}
 			continue
@@ -721,7 +721,7 @@ func (s *session) drainInbound(now time.Time) {
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
-			if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+			if !s.sendFrame(marshal(protoReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 				return
 			}
 			continue
@@ -767,7 +767,7 @@ func (s *session) drainOutbound(now time.Time) {
 							deadline: now.Add(callTimeoutDef),
 						})
 					}
-					if !s.writeLine(marshal(wireCall{
+					if !s.sendFrame(marshal(protoCall{
 						T:         msgCall,
 						ID:        corr,
 						Topic:     wireTopic,
@@ -802,7 +802,7 @@ func (s *session) drainOutbound(now time.Time) {
 
 // ---- transport write ----
 
-func (s *session) writeLine(data []byte) bool {
+func (s *session) sendFrame(data []byte) bool {
 	if len(data) > 0 && data[len(data)-1] == '\n' {
 		data = data[:len(data)-1]
 	}

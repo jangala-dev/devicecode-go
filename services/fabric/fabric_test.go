@@ -64,12 +64,12 @@ func sendMsg(t *testing.T, tr Transport, v any) {
 
 const testCM5SID = "s1"
 
-func bringUp(t *testing.T, cm5 Transport) wireHelloAck {
+func bringUp(t *testing.T, cm5 Transport) protoHelloAck {
 	t.Helper()
-	sendMsg(t, cm5, wireHello{
+	sendMsg(t, cm5, protoHello{
 		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: testCM5SID, Proto: protoVersion,
 	})
-	ack := readMsg[wireHelloAck](t, cm5)
+	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.Node != "mcu-1" || ack.SID == "" || ack.Proto != protoVersion {
 		t.Fatalf("bad hello_ack: %+v", ack)
 	}
@@ -79,8 +79,8 @@ func bringUp(t *testing.T, cm5 Transport) wireHelloAck {
 
 func unlockExports(t *testing.T, cm5 Transport) {
 	t.Helper()
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 77, SID: testCM5SID})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: testCM5SID})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.T != "pong" {
 		t.Fatalf("expected pong, got %q", pong.T)
 	}
@@ -89,7 +89,7 @@ func unlockExports(t *testing.T, cm5 Transport) {
 // ---- codec ----
 
 func TestCodecRoundTrip(t *testing.T) {
-	orig := wireHello{T: "hello", Node: "mcu-1", Peer: "cm5-local", SID: "abc", Proto: protoVersion}
+	orig := protoHello{T: "hello", Node: "mcu-1", Peer: "cm5-local", SID: "abc", Proto: protoVersion}
 	data := marshal(orig)
 	if !bytes.HasSuffix(data, []byte("\n")) {
 		t.Error("marshal should end with newline")
@@ -98,10 +98,10 @@ func TestCodecRoundTrip(t *testing.T) {
 	if bytes.Contains(jsonPart, []byte("\n")) {
 		t.Error("JSON should not contain embedded newlines")
 	}
-	if wireType(jsonPart) != "hello" {
-		t.Errorf("wireType = %q", wireType(jsonPart))
+	if protoType(jsonPart) != "hello" {
+		t.Errorf("protoType = %q", protoType(jsonPart))
 	}
-	var dec wireHello
+	var dec protoHello
 	json.Unmarshal(jsonPart, &dec)
 	if dec != orig {
 		t.Errorf("round-trip: %+v vs %+v", dec, orig)
@@ -113,26 +113,26 @@ func TestCodecAllTypes(t *testing.T) {
 		v    any
 		want string
 	}{
-		{wireHello{T: "hello"}, "hello"},
-		{wireHelloAck{T: "hello_ack"}, "hello_ack"},
-		{wirePing{T: "ping", TS: 1}, "ping"},
-		{wirePong{T: "pong", TS: 2}, "pong"},
-		{wirePub{T: "pub", Topic: []string{"a"}}, "pub"},
-		{wireUnretain{T: "unretain", Topic: []string{"a"}}, "unretain"},
-		{wireCall{T: "call", ID: "c1"}, "call"},
-		{wireReply{T: "reply", Corr: "c1", OK: true}, "reply"},
+		{protoHello{T: "hello"}, "hello"},
+		{protoHelloAck{T: "hello_ack"}, "hello_ack"},
+		{protoPing{T: "ping", TS: 1}, "ping"},
+		{protoPong{T: "pong", TS: 2}, "pong"},
+		{protoPub{T: "pub", Topic: []string{"a"}}, "pub"},
+		{protoUnretain{T: "unretain", Topic: []string{"a"}}, "unretain"},
+		{protoCall{T: "call", ID: "c1"}, "call"},
+		{protoReply{T: "reply", Corr: "c1", OK: true}, "reply"},
 	} {
 		b := marshal(tc.v)
-		if got := wireType(b[:len(b)-1]); got != tc.want {
-			t.Errorf("wireType = %q, want %q", got, tc.want)
+		if got := protoType(b[:len(b)-1]); got != tc.want {
+			t.Errorf("protoType = %q, want %q", got, tc.want)
 		}
 	}
 }
 
 func TestWireTypeBadInput(t *testing.T) {
 	for _, b := range [][]byte{[]byte("not json"), []byte(`{"no_t":true}`), nil} {
-		if got := wireType(b); got != "" {
-			t.Errorf("wireType(%q) = %q, want empty", b, got)
+		if got := protoType(b); got != "" {
+			t.Errorf("protoType(%q) = %q, want empty", b, got)
 		}
 	}
 }
@@ -153,7 +153,7 @@ func TestTransportRoundTrip(t *testing.T) {
 			t.Errorf("got %q", line)
 		}
 	}()
-	sendMsg(t, a, wirePing{T: "ping", TS: 99})
+	sendMsg(t, a, protoPing{T: "ping", TS: 99})
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -311,16 +311,16 @@ func TestHandshake(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
-	sendMsg(t, cm5, wireHello{
+	sendMsg(t, cm5, protoHello{
 		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s1", Proto: protoVersion,
 	})
-	ack := readMsg[wireHelloAck](t, cm5)
+	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.Node != "mcu-1" || ack.SID == "" || ack.Proto != protoVersion {
 		t.Errorf("bad ack: %+v", ack)
 	}
 	time.Sleep(50 * time.Millisecond)
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 99, SID: "s1"})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 99, SID: "s1"})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 99 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
 	}
@@ -334,13 +334,13 @@ func TestSessionReset(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	sendMsg(t, cm5, wireHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
-	ack := readMsg[wireHelloAck](t, cm5)
+	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.SID == "" || ack.Proto != protoVersion {
 		t.Error("hello_ack.OK = false")
 	}
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 55, SID: "s2"})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 55, SID: "s2"})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 55 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
 	}
@@ -353,7 +353,7 @@ func TestRejectsWrongPeer(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
-	sendMsg(t, cm5, wireHello{T: "hello", Node: "cm5-local", Peer: "mcu-999", SID: "s1", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-999", SID: "s1", Proto: protoVersion})
 	gotLine := make(chan readResult, 1)
 	go func() {
 		line, err := cm5.ReadLine()
@@ -364,13 +364,13 @@ func TestRejectsWrongPeer(t *testing.T) {
 		t.Fatal("got response to wrong-peer hello")
 	case <-time.After(200 * time.Millisecond):
 	}
-	sendMsg(t, cm5, wireHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
 	select {
 	case res := <-gotLine:
 		if res.err != nil {
 			t.Fatalf("ReadLine error: %v", res.err)
 		}
-		var ack wireHelloAck
+		var ack protoHelloAck
 		if err := json.Unmarshal(res.line, &ack); err != nil {
 			t.Fatalf("expected hello_ack: %v", err)
 		}
@@ -395,20 +395,20 @@ func TestRejectsMissingNodeWhenPeerPinned(t *testing.T) {
 		gotLine <- readResult{line: line, err: err}
 	}()
 
-	sendMsg(t, cm5, wireHello{T: "hello", Peer: "mcu-1", SID: "s1", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{T: "hello", Peer: "mcu-1", SID: "s1", Proto: protoVersion})
 	select {
 	case <-gotLine:
 		t.Fatal("got response to hello without node")
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	sendMsg(t, cm5, wireHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
 	select {
 	case res := <-gotLine:
 		if res.err != nil {
 			t.Fatalf("ReadLine error: %v", res.err)
 		}
-		var ack wireHelloAck
+		var ack protoHelloAck
 		if err := json.Unmarshal(res.line, &ack); err != nil {
 			t.Fatalf("expected hello_ack: %v", err)
 		}
@@ -427,8 +427,8 @@ func TestPingPong(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	ack := bringUp(t, cm5)
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 42, SID: "s1"})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 42, SID: "s1"})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 42 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
 	}
@@ -458,8 +458,8 @@ func TestUnknownTypeIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte(`{"t":"future_msg"}`))
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 1})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 1})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 1 {
 		t.Errorf("pong.TS = %d", pong.TS)
 	}
@@ -473,8 +473,8 @@ func TestMalformedJSONIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte("not json"))
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 2})
-	pong := readMsg[wirePong](t, cm5)
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 2})
+	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 2 {
 		t.Errorf("pong.TS = %d", pong.TS)
 	}
@@ -677,7 +677,7 @@ func TestPubImport(t *testing.T) {
 	reader := b.NewConnection("test")
 	sub := reader.Subscribe(bus.T("config", "device"))
 
-	sendMsg(t, cm5, wirePub{
+	sendMsg(t, cm5, protoPub{
 		T:       "pub",
 		Topic:   []string{"config", "device"},
 		Payload: json.RawMessage(`{"mode":"normal"}`),
@@ -720,7 +720,7 @@ func TestPubExport(t *testing.T) {
 		true,
 	))
 
-	msg := readMsg[wirePub](t, cm5)
+	msg := readMsg[protoPub](t, cm5)
 	if msg.T != "pub" {
 		t.Fatalf("expected pub, got %q", msg.T)
 	}
@@ -750,7 +750,7 @@ func TestUnretainExport(t *testing.T) {
 		map[string]int{"deci_c": 412},
 		true,
 	))
-	pub := readMsg[wirePub](t, cm5)
+	pub := readMsg[protoPub](t, cm5)
 	if pub.T != "pub" || !pub.Retain {
 		t.Fatalf("expected retained pub, got t=%q retain=%v", pub.T, pub.Retain)
 	}
@@ -761,7 +761,7 @@ func TestUnretainExport(t *testing.T) {
 		nil,
 		true,
 	))
-	unr := readMsg[wireUnretain](t, cm5)
+	unr := readMsg[protoUnretain](t, cm5)
 	if unr.T != "unretain" {
 		t.Fatalf("expected unretain, got %q", unr.T)
 	}
@@ -839,7 +839,7 @@ func TestPubIgnoredBeforeHandshake(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
-	sendMsg(t, cm5, wirePub{
+	sendMsg(t, cm5, protoPub{
 		T: "pub", Topic: []string{"config", "device"},
 		Payload: json.RawMessage(`{"v":1}`), Retain: true,
 	})
@@ -877,7 +877,7 @@ func TestUnretainIgnoredBeforeHandshake(t *testing.T) {
 		t.Fatal("timed out waiting for retained config/device")
 	}
 
-	sendMsg(t, cm5, wireUnretain{T: "unretain", Topic: []string{"config", "device"}})
+	sendMsg(t, cm5, protoUnretain{T: "unretain", Topic: []string{"config", "device"}})
 	select {
 	case m := <-sub.Channel():
 		t.Fatalf("unexpected pre-handshake unretain effect: %+v", m)
@@ -894,12 +894,12 @@ func TestUnretain(t *testing.T) {
 	go Run(ctx, mcu, conn, "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	sendMsg(t, cm5, wirePub{
+	sendMsg(t, cm5, protoPub{
 		T: "pub", Topic: []string{"config", "device"},
 		Payload: json.RawMessage(`{"v":1}`), Retain: true,
 	})
 	time.Sleep(50 * time.Millisecond)
-	sendMsg(t, cm5, wireUnretain{T: "unretain", Topic: []string{"config", "device"}})
+	sendMsg(t, cm5, protoUnretain{T: "unretain", Topic: []string{"config", "device"}})
 	time.Sleep(50 * time.Millisecond)
 
 	reader := b.NewConnection("test")
@@ -927,7 +927,7 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
 	defer handler.Unsubscribe(sub)
 
-	sendMsg(t, cm5, wireCall{
+	sendMsg(t, cm5, protoCall{
 		T: "call", ID: "pre-hello-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
@@ -956,12 +956,12 @@ func TestCallImport(t *testing.T) {
 		}
 	}()
 
-	sendMsg(t, cm5, wireCall{
+	sendMsg(t, cm5, protoCall{
 		T: "call", ID: "test-corr-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
 
-	reply := readMsg[wireReply](t, cm5)
+	reply := readMsg[protoReply](t, cm5)
 	if reply.Corr != "test-corr-1" {
 		t.Errorf("corr = %q", reply.Corr)
 	}
@@ -978,12 +978,12 @@ func TestCallNoRoute(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	sendMsg(t, cm5, wireCall{
+	sendMsg(t, cm5, protoCall{
 		T: "call", ID: "no-route-1", Topic: []string{"unknown", "endpoint"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
 
-	reply := readMsg[wireReply](t, cm5)
+	reply := readMsg[protoReply](t, cm5)
 	if reply.Corr != "no-route-1" {
 		t.Errorf("corr = %q", reply.Corr)
 	}
@@ -1015,12 +1015,12 @@ func TestCallHandlerError(t *testing.T) {
 		}
 	}()
 
-	sendMsg(t, cm5, wireCall{
+	sendMsg(t, cm5, protoCall{
 		T: "call", ID: "err-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
 
-	reply := readMsg[wireReply](t, cm5)
+	reply := readMsg[protoReply](t, cm5)
 	if reply.Corr != "err-1" {
 		t.Errorf("corr = %q", reply.Corr)
 	}
@@ -1050,11 +1050,11 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 		}
 	}()
 
-	sendMsg(t, cm5, wireCall{
+	sendMsg(t, cm5, protoCall{
 		T: "call", ID: "slow-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 77, SID: "s1"})
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: "s1"})
 
 	type readResult struct {
 		line []byte
@@ -1071,10 +1071,10 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("ReadLine: %v", res.err)
 		}
-		if got := wireType(res.line); got != "pong" {
+		if got := protoType(res.line); got != "pong" {
 			t.Fatalf("first response type = %q, want pong", got)
 		}
-		var pong wirePong
+		var pong protoPong
 		if err := json.Unmarshal(res.line, &pong); err != nil {
 			t.Fatalf("Unmarshal pong: %v", err)
 		}
@@ -1085,7 +1085,7 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 		t.Fatal("ping blocked behind slow call")
 	}
 
-	reply := readMsg[wireReply](t, cm5)
+	reply := readMsg[protoReply](t, cm5)
 	if reply.Corr != "slow-1" {
 		t.Errorf("corr = %q", reply.Corr)
 	}
@@ -1119,7 +1119,7 @@ func TestCallExport(t *testing.T) {
 		done <- result{msg: msg, err: err}
 	}()
 
-	call := readMsg[wireCall](t, cm5)
+	call := readMsg[protoCall](t, cm5)
 	if call.T != "call" {
 		t.Fatalf("expected call, got %q", call.T)
 	}
@@ -1135,7 +1135,7 @@ func TestCallExport(t *testing.T) {
 		t.Fatalf("payload.ask = %q, want status", payload["ask"])
 	}
 
-	sendMsg(t, cm5, wireReply{
+	sendMsg(t, cm5, protoReply{
 		T:       "reply",
 		Corr:    call.ID,
 		OK:      true,
@@ -1300,7 +1300,7 @@ func TestDrainPendingCallsReportsMarshalFailure(t *testing.T) {
 	if len(tr.writes) != 1 {
 		t.Fatalf("writes = %d, want 1", len(tr.writes))
 	}
-	var reply wireReply
+	var reply protoReply
 	if err := json.Unmarshal(tr.writes[0], &reply); err != nil {
 		t.Fatalf("Unmarshal reply: %v", err)
 	}
@@ -1442,15 +1442,15 @@ func TestCallExportPeerReset(t *testing.T) {
 		done <- result{msg: msg, err: err}
 	}()
 
-	call := readMsg[wireCall](t, cm5)
+	call := readMsg[protoCall](t, cm5)
 	if call.T != "call" {
 		t.Fatalf("expected call, got %q", call.T)
 	}
 
-	sendMsg(t, cm5, wireHello{
+	sendMsg(t, cm5, protoHello{
 		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "fresh-session", Proto: protoVersion,
 	})
-	_ = readMsg[wireHelloAck](t, cm5)
+	_ = readMsg[protoHelloAck](t, cm5)
 
 	select {
 	case res := <-done:
@@ -1500,17 +1500,17 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 		done <- result{msg: msg, err: err}
 	}()
 
-	call := readMsg[wireCall](t, cm5)
+	call := readMsg[protoCall](t, cm5)
 	if call.T != "call" {
 		t.Fatalf("expected call, got %q", call.T)
 	}
 
 	// Send an echoed hello_ack (our own SID) — should be ignored.
-	sendMsg(t, cm5, wireHelloAck{
+	sendMsg(t, cm5, protoHelloAck{
 		T: "hello_ack", Node: "mcu-1", SID: ack.SID, Proto: protoVersion, OK: true,
 	})
 
-	sendMsg(t, cm5, wireReply{
+	sendMsg(t, cm5, protoReply{
 		T:       "reply",
 		Corr:    call.ID,
 		OK:      true,

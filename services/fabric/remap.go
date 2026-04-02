@@ -20,7 +20,7 @@ import "devicecode-go/bus"
 //   hal/cap/power/# -> ["state","power",...]
 //   hal/state       -> ["state","hal"]
 
-type wireImportRule struct {
+type importRule struct {
 	wire  []string
 	local []string
 }
@@ -31,14 +31,14 @@ type busExportRule struct {
 	suffix       bool
 }
 
-var importPublishRules = []wireImportRule{
+var importPublishRules = []importRule{
 	{
 		wire:  []string{"config", "device"},
 		local: []string{"config", "device"},
 	},
 }
 
-var importCallRules = []wireImportRule{
+var importCallRules = []importRule{
 	{
 		wire:  []string{"rpc", "hal", "dump"},
 		local: []string{"rpc", "hal", "dump"},
@@ -70,11 +70,11 @@ var exportCallRules = []busExportRule{
 }
 
 func importPublishTopic(wire []string) bus.Topic {
-	return wireImport(wire, importPublishRules)
+	return importMatch(wire, importPublishRules)
 }
 
 func importCallTopic(wire []string) bus.Topic {
-	return wireImport(wire, importCallRules)
+	return importMatch(wire, importCallRules)
 }
 
 func exportTopic(t bus.Topic) []string {
@@ -93,7 +93,7 @@ func exportCallPatterns() []bus.Topic {
 	return exportPatternsFor(exportCallRules)
 }
 
-func wireImport(wire []string, rules []wireImportRule) bus.Topic {
+func importMatch(wire []string, rules []importRule) bus.Topic {
 	for _, rule := range rules {
 		if slicesEqualStrings(wire, rule.wire) {
 			return stringsToTopic(rule.local)

@@ -17,23 +17,23 @@ const (
 
 // ---- Wire message structs ----
 
-// wireCaps is carried in hello for forward compatibility. The Lua side
+// protoCaps is carried in hello for forward compatibility. The Lua side
 // sends caps but neither side enforces them in v1.
-type wireCaps struct {
+type protoCaps struct {
 	Pub  bool `json:"pub,omitempty"`
 	Call bool `json:"call,omitempty"`
 }
 
-type wireHello struct {
-	T     string    `json:"t"`
-	Node  string    `json:"node"`
-	Peer  string    `json:"peer"`
-	SID   string    `json:"sid"`
-	Proto int       `json:"proto,omitempty"`
-	Caps  *wireCaps `json:"caps,omitempty"`
+type protoHello struct {
+	T     string     `json:"t"`
+	Node  string     `json:"node"`
+	Peer  string     `json:"peer"`
+	SID   string     `json:"sid"`
+	Proto int        `json:"proto,omitempty"`
+	Caps  *protoCaps `json:"caps,omitempty"`
 }
 
-type wireHelloAck struct {
+type protoHelloAck struct {
 	T     string `json:"t"`
 	Node  string `json:"node"`
 	SID   string `json:"sid,omitempty"`
@@ -41,13 +41,13 @@ type wireHelloAck struct {
 	OK    bool   `json:"ok"`
 }
 
-type wirePing struct {
+type protoPing struct {
 	T   string `json:"t"`
 	TS  int64  `json:"ts"`
 	SID string `json:"sid,omitempty"`
 }
 
-type wirePong struct {
+type protoPong struct {
 	T   string `json:"t"`
 	TS  int64  `json:"ts"`
 	SID string `json:"sid,omitempty"`
@@ -55,19 +55,19 @@ type wirePong struct {
 
 // Not wired yet — defined for forward compatibility.
 
-type wirePub struct {
+type protoPub struct {
 	T       string          `json:"t"`
 	Topic   []string        `json:"topic"`
 	Payload json.RawMessage `json:"payload"`
 	Retain  bool            `json:"retain"`
 }
 
-type wireUnretain struct {
+type protoUnretain struct {
 	T     string   `json:"t"`
 	Topic []string `json:"topic"`
 }
 
-type wireCall struct {
+type protoCall struct {
 	T         string          `json:"t"`
 	ID        string          `json:"id"`
 	Topic     []string        `json:"topic"`
@@ -75,7 +75,7 @@ type wireCall struct {
 	TimeoutMs int             `json:"timeout_ms"`
 }
 
-type wireReply struct {
+type protoReply struct {
 	T       string          `json:"t"`
 	Corr    string          `json:"corr"`
 	OK      bool            `json:"ok"`
@@ -83,17 +83,17 @@ type wireReply struct {
 	Err     string          `json:"err,omitempty"`
 }
 
-// wireMsg is a union struct for single-pass unmarshal in dispatch.
+// protoMsg is a union struct for single-pass unmarshal in dispatch.
 // Fields are the superset of all message types. Only the fields
 // relevant to the T value are populated; the rest are zero.
-type wireMsg struct {
+type protoMsg struct {
 	T         string          `json:"t"`
 	Node      string          `json:"node,omitempty"`
 	Peer      string          `json:"peer,omitempty"`
 	SID       string          `json:"sid,omitempty"`
 	Proto     int             `json:"proto,omitempty"`
 	OK        bool            `json:"ok,omitempty"`
-	Caps      *wireCaps       `json:"caps,omitempty"`
+	Caps      *protoCaps      `json:"caps,omitempty"`
 	TS        int64           `json:"ts,omitempty"`
 	Topic     []string        `json:"topic,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
@@ -116,8 +116,8 @@ func marshal(v any) []byte {
 	return append(b, '\n')
 }
 
-// wireType extracts the "t" field from a JSON line.
-func wireType(line []byte) string {
+// protoType extracts the "t" field from a JSON line.
+func protoType(line []byte) string {
 	var env struct {
 		T string `json:"t"`
 	}
