@@ -51,8 +51,9 @@ const (
 	// exportMaxPerTick caps the total export messages sent per drain
 	// cycle across all subscriptions, keeping UART throughput within
 	// the 115200-baud link capacity.
-	exportMaxPerTick  = 1
-	errPayloadMarshal = "payload_marshal_failed"
+	exportMaxPerTick   = 1
+	exportTickInterval = 50 * time.Millisecond
+	errPayloadMarshal  = "payload_marshal_failed"
 )
 
 // ---- link reasons and error strings ----
@@ -187,7 +188,7 @@ func (s *session) run(ctx context.Context) {
 	// Poll subscription channels periodically. Needed because select
 	// blocks until a line/timer fires; without this, exported bus
 	// messages and async call replies would sit in subscription channels.
-	exportTick := time.NewTicker(50 * time.Millisecond)
+	exportTick := time.NewTicker(exportTickInterval)
 	defer exportTick.Stop()
 
 	s.publishLinkState("", "")
@@ -548,6 +549,10 @@ func (s *session) onReply(msg *wireMsg) {
 }
 
 func checkBusError(payload any) string {
+	if e, ok := payload.(types.ErrorReply); ok && !e.OK && e.Error != "" {
+		return e.Error
+	}
+	// Fall back to JSON probe for handlers that reply with ad-hoc structs.
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return ""
@@ -729,79 +734,70 @@ func (s *session) drainInbound(now time.Time) {
 }
 
 func (s *session) drainOutbound(now time.Time) {
-	s.drainOutboundNew(now)
-	s.drainOutboundPending(now)
-}
+	// Forward new outgoing calls from the local bus onto the wire.
+	if s.link == linkUp && len(s.exportCallSubs) > 0 {
+		for _, sub := range s.exportCallSubs {
+			for {
+				select {
+				case msg, ok := <-sub.Channel():
+					if !ok || msg == nil {
+						goto nextSub
+					}
 
-func (s *session) drainOutboundNew(now time.Time) {
-	if s.link != linkUp || len(s.exportCallSubs) == 0 {
-		return
-	}
+					wireTopic := exportCallTopic(msg.Topic)
+					if wireTopic == nil {
+						continue
+					}
 
-	for _, sub := range s.exportCallSubs {
-		for {
-			select {
-			case msg, ok := <-sub.Channel():
-				if !ok || msg == nil {
+					payload, err := marshalPayload(msg.Payload)
+					if err != nil {
+						s.logKV("outgoing call dropped", "err", err.Error())
+						if msg.CanReply() {
+							s.conn.Reply(msg, types.ErrorReply{OK: false, Error: errPayloadMarshal}, false)
+						}
+						continue
+					}
+					id := s.nextOutboundID
+					s.nextOutboundID++
+					corr := "wire-" + strconvx.Utoa64(id)
+					if msg.CanReply() {
+						s.outboundCalls = append(s.outboundCalls, &outboundCall{
+							id:       corr,
+							req:      msg,
+							deadline: now.Add(callTimeoutDef),
+						})
+					}
+					if !s.writeLine(marshal(wireCall{
+						T:         msgCall,
+						ID:        corr,
+						Topic:     wireTopic,
+						Payload:   payload,
+						TimeoutMs: int(callTimeoutDef / time.Millisecond),
+					})) {
+						return
+					}
+				default:
 					goto nextSub
 				}
-
-				wireTopic := exportCallTopic(msg.Topic)
-				if wireTopic == nil {
-					continue
-				}
-
-				payload, err := marshalPayload(msg.Payload)
-				if err != nil {
-					s.logKV("outgoing call dropped", "err", err.Error())
-					if msg.CanReply() {
-						s.conn.Reply(msg, types.ErrorReply{OK: false, Error: errPayloadMarshal}, false)
-					}
-					continue
-				}
-				id := s.nextOutboundID
-				s.nextOutboundID++
-				corr := "wire-" + strconvx.Utoa64(id)
-				if msg.CanReply() {
-					s.outboundCalls = append(s.outboundCalls, &outboundCall{
-						id:       corr,
-						req:      msg,
-						deadline: now.Add(callTimeoutDef),
-					})
-				}
-				if !s.writeLine(marshal(wireCall{
-					T:         msgCall,
-					ID:        corr,
-					Topic:     wireTopic,
-					Payload:   payload,
-					TimeoutMs: int(callTimeoutDef / time.Millisecond),
-				})) {
-					return
-				}
-			default:
-				goto nextSub
 			}
+		nextSub:
 		}
-	nextSub:
-	}
-}
-
-func (s *session) drainOutboundPending(now time.Time) {
-	if len(s.outboundCalls) == 0 {
-		return
 	}
 
-	keep := s.outboundCalls[:0]
-	for _, call := range s.outboundCalls {
-		if !now.Before(call.deadline) {
-			if call.req != nil && call.req.CanReply() {
-				s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reasonTimeout}, false)
+	// Expire outbound calls that have timed out waiting for a remote reply.
+	if len(s.outboundCalls) > 0 {
+		keep := s.outboundCalls[:0]
+		for _, call := range s.outboundCalls {
+			if !now.Before(call.deadline) {
+				if call.req != nil && call.req.CanReply() {
+					s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reasonTimeout}, false)
+				}
+				continue
 			}
-			continue
+			keep = append(keep, call)
 		}
-		keep = append(keep, call)
+		s.outboundCalls = keep
 	}
-	s.outboundCalls = keep
 }
 
 // ---- transport write ----
@@ -812,6 +808,8 @@ func (s *session) writeLine(data []byte) bool {
 	}
 	if err := s.tr.WriteLine(data); err != nil {
 		if errors.Is(err, ErrLineTooLong) {
+			// Oversized frame is dropped but the transport is still
+			// healthy — return true so the session continues.
 			s.log("oversized write dropped")
 			return true
 		}

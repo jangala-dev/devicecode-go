@@ -1219,7 +1219,7 @@ func TestPendingWireCallsTimeout(t *testing.T) {
 		},
 	}
 
-	s.drainOutboundPending(time.Now())
+	s.drainOutbound(time.Now())
 
 	select {
 	case reply := <-sub.Channel():
@@ -1337,7 +1337,7 @@ func TestDrainOutgoingWireCallsReportsMarshalFailure(t *testing.T) {
 	replySub := reqConn.Request(msg)
 	defer reqConn.Unsubscribe(replySub)
 
-	s.drainOutboundNew(time.Now())
+	s.drainOutbound(time.Now())
 
 	if len(tr.writes) != 0 {
 		t.Fatalf("writes = %d, want 0", len(tr.writes))
@@ -1388,7 +1388,7 @@ func TestDrainOutgoingWireCallsReportsWriteFailure(t *testing.T) {
 	replySub := reqConn.Request(msg)
 	defer reqConn.Unsubscribe(replySub)
 
-	s.drainOutboundNew(time.Now())
+	s.drainOutbound(time.Now())
 
 	if s.link != linkDown {
 		t.Fatalf("link = %v, want %v", s.link, linkDown)
