@@ -19,7 +19,7 @@ import (
 
 const halTimeout = 5 * time.Second
 const pwmTop = 4095
-const fabricSessionWaitLogEvery = 2 * time.Second
+const fabricWaitLogInterval = 2 * time.Second
 
 // Thermal (deci-°C)
 const (
@@ -401,12 +401,9 @@ func (r *Reactor) emitMemSnapshot() {
 // Main
 // -----------------------------------------------------------------------------
 
-const buildTag = "fabric-20260401c"
-
 func main() {
 	// Allow early USB/console settle if needed
 	time.Sleep(3 * time.Second)
-	println("[main] build:", buildTag)
 	log.SetStart(time.Now())
 
 	ctx := context.Background()
@@ -569,7 +566,7 @@ func main() {
 			r.now = time.Now()
 			if !fabricSessionOpen && !r.now.Before(nextFabricWaitLog) {
 				log.Println("[main] waiting for fabric connection start")
-				nextFabricWaitLog = r.now.Add(fabricSessionWaitLogEvery)
+				nextFabricWaitLog = r.now.Add(fabricWaitLogInterval)
 			}
 
 			// 1) Run FSM (includes symmetric reversal)
