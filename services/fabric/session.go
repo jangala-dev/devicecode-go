@@ -91,7 +91,7 @@ type session struct {
 	conn     *bus.Connection
 
 	link          linkState
-	remoteNode    string
+	peerNode    string
 	peerSID       string
 	peerProto     int
 	helloSeen     bool
@@ -142,7 +142,7 @@ type linkStatePayload struct {
 	PeerID            string `json:"peer_id"`
 	LocalSID          string `json:"local_sid"`
 	PeerSID           string `json:"peer_sid,omitempty"`
-	RemoteID          string `json:"remote_id,omitempty"`
+	PeerNode          string `json:"peer_node,omitempty"`
 	PeerProto         int    `json:"peer_proto,omitempty"`
 	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
 	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
@@ -281,7 +281,7 @@ func (s *session) publishLinkState(reason, err string) {
 			PeerID:            s.peerID,
 			LocalSID:          s.localSID,
 			PeerSID:           s.peerSID,
-			RemoteID:          s.remoteNode,
+			PeerNode:          s.peerNode,
 			PeerProto:         s.peerProto,
 			LastRxUnixMilli:   unixMilli(s.lastRxAt),
 			LastTxUnixMilli:   unixMilli(s.lastTxAt),
@@ -309,7 +309,7 @@ func (s *session) handleLinkDown(reason, err string) {
 		pendingReason = reasonLinkDown
 	}
 	s.link = linkDown
-	s.remoteNode = ""
+	s.peerNode = ""
 	s.peerSID = ""
 	s.peerProto = 0
 	s.helloSeen = false
@@ -386,7 +386,7 @@ func (s *session) notePeerIdentity(node, sid string, proto int) string {
 		reason = reasonPeerSessionChanged
 	}
 	if node != "" {
-		s.remoteNode = node
+		s.peerNode = node
 	}
 	if sid != "" {
 		s.peerSID = sid
