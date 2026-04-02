@@ -31,12 +31,11 @@ const (
 // ---- timeouts (local policy) ----
 //
 // Timing relationships:
-//   staleTimeout (45s) > exportWaitFallback (15s) > callTimeoutDef (5s)
+//   staleTimeout (45s) > callTimeoutDef (5s)
 //
 // The CM5 sends pings every 15s of TX inactivity. The MCU marks the
-// peer stale after 45s without any RX, giving a 30s margin. The
-// exportWaitFallback arms exports if no peer traffic arrives within
-// 15s of link-up (normally armed earlier by peer_pub).
+// peer stale after 45s without any RX, giving a 30s margin.
+// Exports are enabled immediately on link-up (after exportStartHoldoff).
 
 const (
 	staleTimeout       = 45 * time.Second
@@ -52,9 +51,8 @@ const (
 	// exportMaxPerTick caps the total export messages sent per drain
 	// cycle across all subscriptions, keeping UART throughput within
 	// the 115200-baud link capacity.
-	exportMaxPerTick   = 1
-	exportWaitFallback = 15 * time.Second
-	errPayloadMarshal  = "payload_marshal_failed"
+	exportMaxPerTick  = 1
+	errPayloadMarshal = "payload_marshal_failed"
 )
 
 // ---- link reasons and error strings ----
@@ -71,20 +69,6 @@ const (
 	reasonTimeout            = "timeout"
 )
 
-// ---- export arm reasons ----
-
-// ---- export trigger reasons (why exports were enabled) ----
-
-const (
-	exportTriggerPub      = "peer_pub"
-	exportTriggerPing     = "peer_ping"
-	exportTriggerPong     = "peer_pong"
-	exportTriggerCall     = "peer_call"
-	exportTriggerReply    = "peer_reply"
-	exportTriggerUnretain = "peer_unretain"
-	exportTriggerFallback = "fallback"
-)
-
 // session manages the fabric link state machine over a Transport.
 //
 // All bus access happens in the main loop goroutine only. TinyGo's
@@ -98,16 +82,15 @@ type session struct {
 	tr       Transport
 	conn     *bus.Connection
 
-	link            linkState
-	peerNode        string
-	peerSID         string
-	peerProto       int
-	lastRxAt        time.Time
-	lastTxAt        time.Time
-	lastPongAt      time.Time
-	exportReadyAt   time.Time
-	exportWaitUntil time.Time
-	exportsEnabled  bool
+	link           linkState
+	peerNode       string
+	peerSID        string
+	peerProto      int
+	lastRxAt       time.Time
+	lastTxAt       time.Time
+	lastPongAt     time.Time
+	exportReadyAt  time.Time
+	exportsEnabled bool
 
 	exportSubs     []*bus.Subscription
 	exportCallSubs []*bus.Subscription
@@ -319,7 +302,6 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.peerSID = ""
 	s.peerProto = 0
 	s.exportReadyAt = time.Time{}
-	s.exportWaitUntil = time.Time{}
 	s.exportsEnabled = false
 	s.teardownExports()
 	s.teardownInbound()
@@ -343,9 +325,10 @@ func (s *session) promoteLink(reason string) {
 		s.teardownOutbound(reason)
 	}
 	s.link = linkUp
-	s.exportReadyAt = time.Time{}
-	s.exportWaitUntil = time.Now().Add(exportWaitFallback)
-	s.exportsEnabled = false
+	s.setupExports()
+	s.exportsEnabled = true
+	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
+	s.log("exports enabled")
 	s.publishLinkState(reason, "")
 }
 
@@ -473,17 +456,6 @@ func (s *session) onHello(msg *wireMsg) bool {
 	return true
 }
 
-func (s *session) enableExports(reason string) {
-	if s.link != linkUp || s.exportsEnabled {
-		return
-	}
-	s.setupExports()
-	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
-	s.exportWaitUntil = time.Time{}
-	s.exportsEnabled = true
-	s.logKV("export replay armed", "reason", reason)
-}
-
 func (s *session) onHelloAck(msg *wireMsg) bool {
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
 		s.log("echoed hello_ack ignored")
@@ -501,7 +473,6 @@ func (s *session) onHelloAck(msg *wireMsg) bool {
 }
 
 func (s *session) onPing(msg *wireMsg) bool {
-	s.enableExports(exportTriggerPing)
 	s.logKV("ping rx", "peer_sid", msg.SID)
 	if !s.writeLine(marshal(wirePong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return true
@@ -516,7 +487,6 @@ func (s *session) onPong(msg *wireMsg) bool {
 		return true
 	}
 	s.lastPongAt = s.lastRxAt
-	s.enableExports(exportTriggerPong)
 	return true
 }
 
@@ -530,7 +500,6 @@ func (s *session) onPub(msg *wireMsg) bool {
 		s.log("incoming pub dropped: no_route")
 		return true
 	}
-	s.enableExports(exportTriggerPub)
 	s.conn.Publish(s.conn.NewMessage(t, msg.Payload, msg.Retain))
 	return true
 }
@@ -541,7 +510,6 @@ func (s *session) onUnretain(msg *wireMsg) bool {
 		s.log("incoming unretain dropped: no_route")
 		return true
 	}
-	s.enableExports(exportTriggerUnretain)
 	s.conn.Publish(s.conn.NewMessage(t, nil, true))
 	return true
 }
@@ -553,7 +521,6 @@ func (s *session) onCall(msg *wireMsg) bool {
 		s.writeLine(marshal(wireReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return true
 	}
-	s.enableExports(exportTriggerCall)
 
 	timeout := callTimeoutDef
 	if msg.TimeoutMs > 0 {
@@ -570,7 +537,6 @@ func (s *session) onCall(msg *wireMsg) bool {
 }
 
 func (s *session) onReply(msg *wireMsg) bool {
-	s.enableExports(exportTriggerReply)
 
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
@@ -669,11 +635,7 @@ func (s *session) drainExports() {
 		return
 	}
 	if !s.exportsEnabled {
-		if !s.exportWaitUntil.IsZero() && !time.Now().Before(s.exportWaitUntil) {
-			s.enableExports(exportTriggerFallback)
-		} else {
-			return
-		}
+		return
 	}
 	if !s.exportReadyAt.IsZero() && time.Now().Before(s.exportReadyAt) {
 		return
