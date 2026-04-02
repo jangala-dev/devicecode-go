@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/fabric"
 	"devicecode-go/services/hal"
 	"devicecode-go/types"
 	"devicecode-go/x/shmring"
@@ -18,6 +19,8 @@ import (
 
 const halTimeout = 5 * time.Second
 const pwmTop = 4095
+const handshakeOnlyOutput = true
+const fabricSessionWaitLogEvery = 2 * time.Second
 
 // Thermal (deci-°C)
 const (
@@ -132,10 +135,6 @@ const (
 type Reactor struct {
 	ui *bus.Connection
 
-	// UART
-	jsonOut *shmring.Ring // telemetry (JSON UART TX)
-	// Logger UART1 already handled by global logger (see SetUART1)
-
 	// inputs (latest)
 	vin_mV, vbat_mV int32
 	iin_mA, ibat_mA int32
@@ -164,9 +163,6 @@ type Reactor struct {
 
 	// misc
 	now time.Time
-
-	// telemetry drop counters (bytes)
-	droppedUART0Bytes int
 }
 
 func NewReactor(ui *bus.Connection) *Reactor {
@@ -209,12 +205,12 @@ func (r *Reactor) updateLatchesFromValues() {
 	// Over-temp latch
 	if r.freshTMP() {
 		if r.lastTDeci >= TEMP_LIMIT {
-			if !r.otActive {
+			if !handshakeOnlyOutput && !r.otActive {
 				log.Println("[thermal] over-temp → latch active")
 			}
 			r.otActive = true
 		} else if r.lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
-			if r.otActive {
+			if !handshakeOnlyOutput && r.otActive {
 				log.Println("[thermal] temp recovered below hysteresis")
 			}
 			r.otActive = false
@@ -235,7 +231,9 @@ func (r *Reactor) updateLatchesFromValues() {
 // ---- sequencing (non-blocking) ----
 
 func (r *Reactor) startUpSeq() {
-	log.Println("[power] PG debounced + Temp OK → rails UP")
+	if !handshakeOnlyOutput {
+		log.Println("[power] PG debounced + Temp OK → rails UP")
+	}
 	r.state = stateUpSeq
 	r.seqIdx = 0            // next to apply
 	r.nextActionDue = r.now // first step fires immediately
@@ -245,7 +243,9 @@ func (r *Reactor) startUpSeq() {
 }
 
 func (r *Reactor) startDownSeq() {
-	log.Println("[power] brownout/stale/over-temp → rails DOWN")
+	if !handshakeOnlyOutput {
+		log.Println("[power] brownout/stale/over-temp → rails DOWN")
+	}
 	r.state = stateDownSeq
 	if r.seqOnCount < 0 {
 		r.seqOnCount = 0
@@ -274,7 +274,9 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		log.Println("[event] powering rail UP: ", step.Name)
+		if !handshakeOnlyOutput {
+			log.Println("[event] powering rail UP: ", step.Name)
+		}
 		r.publishSwitch(step.Name, true)
 		r.seqOnCount++
 		r.seqIdx++
@@ -289,7 +291,9 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		log.Println("[event] powering rail down: ", step.Name)
+		if !handshakeOnlyOutput {
+			log.Println("[event] powering rail down: ", step.Name)
+		}
 		r.publishSwitch(step.Name, false)
 		r.seqOnCount--
 		r.seqIdx--
@@ -325,7 +329,9 @@ func (r *Reactor) stepFSM() {
 
 		// If actively powering down and inputs become stably good, reverse.
 		if r.state == stateDownSeq && r.pgStable {
-			log.Println("[power] inputs stably good → reverse to UP sequence")
+			if !handshakeOnlyOutput {
+				log.Println("[power] inputs stably good → reverse to UP sequence")
+			}
 			r.startUpSeq()
 			return
 		}
@@ -375,97 +381,30 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 	r.vin_mV = v.VIN_mV
 	r.iin_mA = v.IIn_mA
 	r.tsVIN = r.now
-
-	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
-	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("power/charger/internal/vin", int(v.VIN_mV))
-		w.kvInt("power/charger/internal/vsys", int(v.VSYS_mV))
-		w.kvInt("power/charger/internal/iin", int(v.IIn_mA))
-		// Full bitfield maps (0/1) for LOCF pipelines
-		{
-			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.kvInt("power/charger/internal/system/"+bitName, 1)
-				} else {
-					w.kvInt("power/charger/internal/system/"+bitName, 0)
-				}
-			}
-		}
-		{
-			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.kvInt("power/charger/internal/status/"+bitName, 1)
-				} else {
-					w.kvInt("power/charger/internal/status/"+bitName, 0)
-				}
-			}
-		}
-		{
-			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.kvInt("power/charger/internal/state/"+bitName, 1)
-				} else {
-					w.kvInt("power/charger/internal/state/"+bitName, 0)
-				}
-			}
-		}
-		w.end()
-	}
 }
 
 func (r *Reactor) OnBattery(v types.BatteryValue) {
 	r.vbat_mV = v.PackMilliV
 	r.ibat_mA = v.IBatMilliA
 	r.tsVBAT = r.now
-
-	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
-	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("power/battery/internal/vbat", int(v.PackMilliV))
-		w.kvInt("power/battery/internal/ibat", int(v.IBatMilliA))
-		w.kvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
-		w.end()
-	}
 }
 
-func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
-	log.Deci(label, deci)
-	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt(jsonKey, deci)
-		w.end()
+func (r *Reactor) OnTempDeciC(label string, deci int) {
+	if handshakeOnlyOutput {
+		return
 	}
+	log.Deci(label, deci)
 }
 
 // ---- memory snapshot telemetry (every ~2 s in main loop) ----
 
 func (r *Reactor) emitMemSnapshot() {
+	if handshakeOnlyOutput {
+		return
+	}
 	var ms runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
-	// log line
 	log.Println(
 		"[mem] ",
 		"alloc:", int(ms.Alloc), " ",
@@ -473,33 +412,34 @@ func (r *Reactor) emitMemSnapshot() {
 		"mallocs:", int(ms.Mallocs), " ",
 		"frees:", int(ms.Frees),
 	)
-	// JSON (minimal to keep overhead low)
-	if r.jsonOut != nil {
-		var w jsonw
-		w.write = r.jsonWrite
-		w.begin()
-		w.kvInt("sys/mem/alloc", int(ms.Alloc))
-		w.end()
-	}
 }
 
 // -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
+const buildTag = "fabric-20260401c"
+
 func main() {
 	// Allow early USB/console settle if needed
 	time.Sleep(3 * time.Second)
+	println("[main] build:", buildTag)
 	log.SetStart(time.Now())
 
 	ctx := context.Background()
 
-	log.Println("[main] bootstrapping bus …")
+	if !handshakeOnlyOutput {
+		log.Println("[main] bootstrapping bus …")
+	}
 	b := bus.NewBus(3, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
+	bridgeConn := b.NewConnection("fabric-bridge")
 
-	log.Println("[main] starting hal.Run …")
+	if !handshakeOnlyOutput {
+		log.Println("[main] starting hal.Run …")
+	}
+	go fabric.RunBridge(ctx, bridgeConn)
 	go hal.Run(ctx, halConn)
 
 	// Wait for retained hal/state=ready (or time out)
@@ -511,7 +451,9 @@ func main() {
 	}
 
 	// Subscriptions (env + power)
-	log.Println("[main] subscribing env + power …")
+	if !handshakeOnlyOutput {
+		log.Println("[main] subscribing env + power …")
+	}
 	tempSub := uiConn.Subscribe(tTempValue)
 	tempDieSub := uiConn.Subscribe(tDieTempValue)
 	humidSub := uiConn.Subscribe(tHumValue)
@@ -519,22 +461,33 @@ func main() {
 	stSub := uiConn.Subscribe(stTopic)
 	evSub := uiConn.Subscribe(evTopic)
 
-	// UART sessions (TX only needed for our use)
+	// UART sessions
 	const (
-		uartTele = "uart0" // telemetry JSON
-		uartLog  = "uart1" // log mirror
+		uartFabric = "uart1" // fabric link to CM5
 	)
-	subSessOpenTele := uiConn.Subscribe(tSessOpened(uartTele))
-	subSessOpenLog := uiConn.Subscribe(tSessOpened(uartLog))
-	subSessClosedTele := uiConn.Subscribe(tSessClosed(uartTele))
-	subSessClosedLog := uiConn.Subscribe(tSessClosed(uartLog))
+	subSessOpenFabric := uiConn.Subscribe(tSessOpened(uartFabric))
+	subSessClosedFabric := uiConn.Subscribe(tSessClosed(uartFabric))
 
-	// Kick open requests (fire-and-forget; events carry handles)
-	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+	// Kick open requests
+	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 
-	// Retry back-off guards
-	var retryTeleAt, retryLogAt time.Time
+	var retryFabricAt time.Time
+	var fabricCancel context.CancelFunc
+	var fabricDone chan struct{}
+	var fabricSessionOpen bool
+	nextFabricWaitLog := time.Now()
+
+	stopFabricSession := func() {
+		if fabricCancel == nil {
+			return
+		}
+		fabricCancel()
+		fabricCancel = nil
+		if fabricDone != nil {
+			<-fabricDone
+			fabricDone = nil
+		}
+	}
 
 	// Reactor
 	r := NewReactor(uiConn)
@@ -544,35 +497,39 @@ func main() {
 	defer ticker.Stop()
 	memTick := 0
 
-	log.Println("[main] entering reactor loop …")
 	for {
 		select {
 		// ---- UART session opened/closed ----
-		case m := <-subSessOpenTele.Channel():
+		case m := <-subSessOpenFabric.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
-				log.Println("[uart0] telemetry session opened")
+				// Tear down previous fabric session if any.
+				stopFabricSession()
+				rx := shmring.Get(shmring.Handle(ev.RXHandle))
+				tx := shmring.Get(shmring.Handle(ev.TXHandle))
+				tr := fabric.NewShmringTransport(rx, tx)
+				fabricConn := b.NewConnection("fabric")
+				fabricCtx, cancel := context.WithCancel(ctx)
+				done := make(chan struct{})
+				fabricCancel = cancel
+				fabricDone = done
+				fabricSessionOpen = true
+				go func() {
+					defer close(done)
+					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5-local")
+				}()
 			}
-		case m := <-subSessOpenLog.Channel():
-			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				log.SetUART1(shmring.Get(shmring.Handle(ev.TXHandle)))
-				log.Println("[uart1] log session opened")
+		case <-subSessClosedFabric.Channel():
+			// Ignore stale close events — the open handler already
+			// tears down the previous session before starting a new one.
+			if !fabricSessionOpen {
+				continue
 			}
-		case <-subSessClosedTele.Channel():
-			r.jsonOut = nil
-			log.Println("[uart0] telemetry session closed")
-			// Auto-reopen with back-off
-			if time.Now().After(retryTeleAt) {
-				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-				retryTeleAt = time.Now().Add(2 * time.Second)
-			}
-		case <-subSessClosedLog.Channel():
-			log.SetUART1(nil)
-			log.Println("[uart1] log session closed")
-			// Auto-reopen with back-off
-			if time.Now().After(retryLogAt) {
-				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartLog), nil, false))
-				retryLogAt = time.Now().Add(2 * time.Second)
+			stopFabricSession()
+			fabricSessionOpen = false
+			nextFabricWaitLog = time.Now()
+			if time.Now().After(retryFabricAt) {
+				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
+				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
 
 		// ---- Env prints ----
@@ -585,18 +542,12 @@ func main() {
 				deci := int(v.DeciC)
 				r.lastTDeci = deci
 				r.tsTemp = r.now
-				r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
+				r.OnTempDeciC("[value] env/temperature/core °C=", deci)
 			}
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
-				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-				// JSON
-				if r.jsonOut != nil {
-					var w jsonw
-					w.write = r.jsonWrite
-					w.begin()
-					w.kvInt("env/humidity/core", int(v.RHx100))
-					w.end()
+				if !handshakeOnlyOutput {
+					log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 				}
 			}
 
@@ -609,7 +560,7 @@ func main() {
 					aht20Alive = false
 					r.lastTDeci = deci
 					r.tsTemp = r.now
-					r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
+					r.OnTempDeciC("[value] env/temperature/core °C=", deci)
 				}
 			}
 
@@ -624,7 +575,7 @@ func main() {
 				r.OnCharger(v)
 				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.TemperatureValue:
-				r.OnTempDeciC("[value] power/temperature/internal °C=", int(v.DeciC), "power/temperature/internal")
+				r.OnTempDeciC("[value] power/temperature/internal °C=", int(v.DeciC))
 			}
 
 		case m := <-stSub.Channel():
@@ -632,24 +583,14 @@ func main() {
 
 		case m := <-evSub.Channel():
 			printCapEvent(m)
-			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
-			if r.jsonOut != nil {
-				dom, _ := m.Topic.At(2).(string)
-				kind, _ := m.Topic.At(3).(string)
-				name, _ := m.Topic.At(4).(string)
-				tag, _ := m.Topic.At(6).(string)
-				if dom != "" && kind != "" && name != "" && tag != "" {
-					var w jsonw
-					w.write = r.jsonWrite
-					w.begin()
-					w.kvStr(dom+"/"+kind+"/"+name+"/event", tag)
-					w.end()
-				}
-			}
 
 		// ---- Supervisory tick ----
 		case <-ticker.C:
 			r.now = time.Now()
+			if handshakeOnlyOutput && !fabricSessionOpen && !r.now.Before(nextFabricWaitLog) {
+				log.Println("[main] waiting for fabric connection start")
+				nextFabricWaitLog = r.now.Add(fabricSessionWaitLogEvery)
+			}
 
 			// 1) Run FSM (includes symmetric reversal)
 			r.stepFSM()
@@ -698,22 +639,6 @@ func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool 
 // Centralised UART write helpers (handle partial writes)
 // -----------------------------------------------------------------------------
 
-// uart0 (telemetry JSON) — returns bytes written; tracks dropped bytes on partial writes.
-func (r *Reactor) jsonWrite(b []byte) int {
-	if r == nil || r.jsonOut == nil || len(b) == 0 {
-		return 0
-	}
-	n := r.jsonOut.TryWriteFrom(b)
-	if n < len(b) {
-		r.droppedUART0Bytes += (len(b) - n)
-		// Rate-limited note
-		if r.droppedUART0Bytes == (len(b)-n) || (r.droppedUART0Bytes%1024) == 0 {
-			log.Println("[uart0] dropped bytes =", r.droppedUART0Bytes)
-		}
-	}
-	return n
-}
-
 // uart1 (logger mirror) — returns bytes written; tracks dropped bytes on partial writes.
 func (l *Logger) logWrite(b []byte) int {
 	if l == nil || l.target == nil || len(b) == 0 {
@@ -733,93 +658,13 @@ func (l *Logger) logWrite(b []byte) int {
 }
 
 // -----------------------------------------------------------------------------
-// Minimal streaming JSON writer for shmring (no buffers/allocs)
-// -----------------------------------------------------------------------------
-
-type jsonw struct {
-	write func([]byte) int
-	first bool
-}
-
-func (w *jsonw) begin() {
-	w.first = true
-	if w.write != nil {
-		w.write([]byte("{"))
-	}
-}
-func (w *jsonw) end() {
-	if w.write != nil {
-		w.write([]byte("}\n"))
-	}
-}
-func (w *jsonw) comma() {
-	if w.write == nil {
-		return
-	}
-	if !w.first {
-		w.write([]byte(","))
-	} else {
-		w.first = false
-	}
-}
-func (w *jsonw) key(k string) {
-	if w.write == nil {
-		return
-	}
-	w.write([]byte(`"`))
-	w.write([]byte(k))
-	w.write([]byte(`":`))
-}
-func (w *jsonw) kvInt(k string, v int) {
-	w.comma()
-	w.key(k)
-	if w.write != nil {
-		w.write([]byte(strconvx.Itoa(v)))
-	}
-}
-func (w *jsonw) kvStr(k, s string) {
-	w.comma()
-	w.key(k)
-	if w.write == nil {
-		return
-	}
-	w.write([]byte(`"`))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '\\', '"':
-			w.write([]byte{'\\', c})
-		case '\b':
-			w.write([]byte{'\\', 'b'})
-		case '\f':
-			w.write([]byte{'\\', 'f'})
-		case '\n':
-			w.write([]byte{'\\', 'n'})
-		case '\r':
-			w.write([]byte{'\\', 'r'})
-		case '\t':
-			w.write([]byte{'\\', 't'})
-		default:
-			if c < 0x20 {
-				var buf [6]byte
-				buf[0], buf[1], buf[2], buf[3] = '\\', 'u', '0', '0'
-				const hex = "0123456789abcdef"
-				buf[4] = hex[c>>4]
-				buf[5] = hex[c&0xF]
-				w.write(buf[:])
-			} else {
-				w.write([]byte{c})
-			}
-		}
-	}
-	w.write([]byte(`"`))
-}
-
-// -----------------------------------------------------------------------------
 // Printing helpers (via Logger)
 // -----------------------------------------------------------------------------
 
 func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *bool) {
+	if handshakeOnlyOutput {
+		return
+	}
 	// hal/cap/<domain>/<kind>/<name>/value
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
@@ -904,6 +749,9 @@ func (r *Reactor) logPrefixStatus(path, label string) {
 }
 
 func printCapStatus(m *bus.Message) {
+	if handshakeOnlyOutput {
+		return
+	}
 	// hal/cap/<domain>/<kind>/<name>/status
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
@@ -927,6 +775,9 @@ func printCapStatus(m *bus.Message) {
 }
 
 func printCapEvent(m *bus.Message) {
+	if handshakeOnlyOutput {
+		return
+	}
 	// hal/cap/<domain>/<kind>/<name>/event/<tag>
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
