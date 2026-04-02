@@ -20,6 +20,14 @@ const (
 	linkUp
 )
 
+// ---- link status strings (published in link state payload) ----
+
+const (
+	statusReady   = "ready"
+	statusOpening = "opening"
+	statusDown    = "down"
+)
+
 // ---- timeouts (local policy) ----
 //
 // Timing relationships:
@@ -256,9 +264,9 @@ func unixMilli(t time.Time) int64 {
 
 func (s *session) currentStatus() string {
 	if s.link == linkUp {
-		return "ready"
+		return statusReady
 	}
-	return "opening"
+	return statusOpening
 }
 
 func (s *session) publishLinkState(reason, err string) {
@@ -267,7 +275,7 @@ func (s *session) publishLinkState(reason, err string) {
 	}
 	status := s.currentStatus()
 	if s.link != linkUp && (reason != "" || err != "") {
-		status = "down"
+		status = statusDown
 	}
 	s.conn.Publish(s.conn.NewMessage(
 		bus.T("state", "fabric", "link", s.linkID),
@@ -343,6 +351,24 @@ func (s *session) promoteLink(reason string) {
 
 // ---- dispatch ----
 
+// validateInbound checks whether a message should be processed.
+// Handshake messages (hello, hello_ack) are always accepted.
+// All others require an established link and a matching session ID.
+func (s *session) validateInbound(msg *wireMsg) bool {
+	if msg.T == msgHello || msg.T == msgHelloAck {
+		return true
+	}
+	if s.link != linkUp {
+		s.logKV("dropped before handshake", "type", msg.T)
+		return false
+	}
+	if s.peerSID != "" && msg.SID != "" && msg.SID != s.peerSID {
+		s.logKV("dropped: wrong session", "type", msg.T)
+		return false
+	}
+	return true
+}
+
 func (s *session) dispatch(line []byte) bool {
 	var msg wireMsg
 	if err := json.Unmarshal(line, &msg); err != nil {
@@ -350,23 +376,9 @@ func (s *session) dispatch(line []byte) bool {
 		return false
 	}
 	s.markRx()
-
-	// Only hello and hello_ack are accepted before the link is up —
-	// they're the handshake that establishes the session. Everything
-	// else (ping, pong, pub, call, reply, unretain) requires an
-	// established link. Stale traffic from a previous session or
-	// messages from an unrecognised peer are dropped here rather
-	// than scattered across individual handlers.
-	switch msg.T {
-	case msgHello, msgHelloAck:
-		// Handshake messages are always accepted.
-	default:
-		if s.link != linkUp {
-			s.logKV("dropped before handshake", "type", msg.T)
-			return true
-		}
+	if !s.validateInbound(&msg) {
+		return true
 	}
-
 	switch msg.T {
 	case msgHello:
 		return s.onHello(&msg)
@@ -489,21 +501,12 @@ func (s *session) onHelloAck(msg *wireMsg) bool {
 }
 
 func (s *session) onPing(msg *wireMsg) bool {
-	reason := s.notePeerIdentity("", msg.SID, 0)
-	if reason != "" {
-		s.logKV("peer session changed", "reason", reason)
-		s.teardownExports()
-		s.teardownInbound()
-		s.teardownOutbound(reason)
-		s.exportsEnabled = false
-	}
 	s.enableExports(exportTriggerPing)
 	s.logKV("ping rx", "peer_sid", msg.SID)
 	if !s.writeLine(marshal(wirePong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return true
 	}
 	s.log("pong tx")
-	s.publishLinkState(reason, "")
 	return true
 }
 
@@ -513,16 +516,7 @@ func (s *session) onPong(msg *wireMsg) bool {
 		return true
 	}
 	s.lastPongAt = s.lastRxAt
-	reason := s.notePeerIdentity("", msg.SID, 0)
-	if reason != "" {
-		s.logKV("peer session changed", "reason", reason)
-		s.teardownExports()
-		s.teardownInbound()
-		s.teardownOutbound(reason)
-		s.exportsEnabled = false
-	}
 	s.enableExports(exportTriggerPong)
-	s.publishLinkState(reason, "")
 	return true
 }
 

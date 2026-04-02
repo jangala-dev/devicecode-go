@@ -62,10 +62,12 @@ func sendMsg(t *testing.T, tr Transport, v any) {
 	}
 }
 
+const testCM5SID = "s1"
+
 func bringUp(t *testing.T, cm5 Transport) wireHelloAck {
 	t.Helper()
 	sendMsg(t, cm5, wireHello{
-		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s1", Proto: protoVersion,
+		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: testCM5SID, Proto: protoVersion,
 	})
 	ack := readMsg[wireHelloAck](t, cm5)
 	if !ack.OK || ack.Node != "mcu-1" || ack.SID == "" || ack.Proto != protoVersion {
@@ -75,9 +77,9 @@ func bringUp(t *testing.T, cm5 Transport) wireHelloAck {
 	return ack
 }
 
-func unlockExports(t *testing.T, cm5 Transport, sid string) {
+func unlockExports(t *testing.T, cm5 Transport) {
 	t.Helper()
-	sendMsg(t, cm5, wirePing{T: "ping", TS: 77, SID: sid})
+	sendMsg(t, cm5, wirePing{T: "ping", TS: 77, SID: testCM5SID})
 	pong := readMsg[wirePong](t, cm5)
 	if pong.T != "pong" {
 		t.Fatalf("expected pong, got %q", pong.T)
@@ -709,8 +711,8 @@ func TestPubExport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
-	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	bringUp(t, cm5)
+	unlockExports(t, cm5)
 
 	publishConn.Publish(publishConn.NewMessage(
 		bus.T("hal", "cap", "env", "temperature", "core", "value"),
@@ -739,8 +741,8 @@ func TestUnretainExport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
-	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	bringUp(t, cm5)
+	unlockExports(t, cm5)
 
 	// Publish retained value first.
 	publishConn.Publish(publishConn.NewMessage(
@@ -1100,8 +1102,8 @@ func TestCallExport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
-	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	bringUp(t, cm5)
+	unlockExports(t, cm5)
 
 	type result struct {
 		msg *bus.Message
@@ -1171,8 +1173,8 @@ func TestCallExportOnlyConfiguredRule(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
-	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	bringUp(t, cm5)
+	unlockExports(t, cm5)
 
 	// Use an unconfigured topic — only fabric/out/rpc/hal/dump is routed.
 	reqCtx, reqCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -1423,8 +1425,8 @@ func TestCallExportPeerReset(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
-	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	bringUp(t, cm5)
+	unlockExports(t, cm5)
 
 	type result struct {
 		msg *bus.Message
@@ -1482,7 +1484,7 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
 	ack := bringUp(t, cm5)
-	unlockExports(t, cm5, ack.SID)
+	unlockExports(t, cm5)
 
 	type result struct {
 		msg *bus.Message
@@ -1503,6 +1505,7 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 		t.Fatalf("expected call, got %q", call.T)
 	}
 
+	// Send an echoed hello_ack (our own SID) — should be ignored.
 	sendMsg(t, cm5, wireHelloAck{
 		T: "hello_ack", Node: "mcu-1", SID: ack.SID, Proto: protoVersion, OK: true,
 	})
