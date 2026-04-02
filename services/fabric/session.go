@@ -485,8 +485,8 @@ func (s *session) onPong(msg *wireMsg) {
 }
 
 func (s *session) onPub(msg *wireMsg) {
-	t := importPublishTopic(msg.Topic)
-	if t == nil {
+	localTopic := importPublishTopic(msg.Topic)
+	if localTopic == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
 			s.log("echoed state pub ignored")
 			return
@@ -494,21 +494,21 @@ func (s *session) onPub(msg *wireMsg) {
 		s.log("incoming pub dropped: no_route")
 		return
 	}
-	s.conn.Publish(s.conn.NewMessage(t, msg.Payload, msg.Retain))
+	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 }
 
 func (s *session) onUnretain(msg *wireMsg) {
-	t := importPublishTopic(msg.Topic)
-	if t == nil {
+	localTopic := importPublishTopic(msg.Topic)
+	if localTopic == nil {
 		s.log("incoming unretain dropped: no_route")
 		return
 	}
-	s.conn.Publish(s.conn.NewMessage(t, nil, true))
+	s.conn.Publish(s.conn.NewMessage(localTopic, nil, true))
 }
 
 func (s *session) onCall(msg *wireMsg) {
-	t := importCallTopic(msg.Topic)
-	if t == nil {
+	localTopic := importCallTopic(msg.Topic)
+	if localTopic == nil {
 		s.log("incoming call dropped: no_route")
 		s.writeLine(marshal(wireReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return
@@ -518,7 +518,7 @@ func (s *session) onCall(msg *wireMsg) {
 	if msg.TimeoutMs > 0 {
 		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
 	}
-	busMsg := s.conn.NewMessage(t, msg.Payload, false)
+	busMsg := s.conn.NewMessage(localTopic, msg.Payload, false)
 	sub := s.conn.Request(busMsg)
 	s.inboundCalls = append(s.inboundCalls, &inboundCall{
 		id:       msg.ID,
@@ -528,7 +528,6 @@ func (s *session) onCall(msg *wireMsg) {
 }
 
 func (s *session) onReply(msg *wireMsg) {
-
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
 			continue
