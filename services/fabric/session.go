@@ -206,9 +206,8 @@ func (s *session) run(ctx context.Context) {
 				s.handleLinkDown(reasonTransportDown, res.err.Error())
 				return
 			}
-			if s.dispatch(res.line) {
-				resetTimer(stale, staleTimeout)
-			}
+			s.dispatch(res.line)
+			resetTimer(stale, staleTimeout)
 
 		case <-exportTick.C:
 			s.drainExports()
@@ -352,36 +351,35 @@ func (s *session) validateInbound(msg *wireMsg) bool {
 	return true
 }
 
-func (s *session) dispatch(line []byte) bool {
+func (s *session) dispatch(line []byte) {
 	var msg wireMsg
 	if err := json.Unmarshal(line, &msg); err != nil {
 		s.logKV("malformed frame dropped", "err", err.Error())
-		return false
+		return
 	}
 	s.markRx()
 	if !s.validateInbound(&msg) {
-		return true
+		return
 	}
 	switch msg.T {
 	case msgHello:
-		return s.onHello(&msg)
+		s.onHello(&msg)
 	case msgHelloAck:
-		return s.onHelloAck(&msg)
+		s.onHelloAck(&msg)
 	case msgPing:
-		return s.onPing(&msg)
+		s.onPing(&msg)
 	case msgPong:
-		return s.onPong(&msg)
+		s.onPong(&msg)
 	case msgPub:
-		return s.onPub(&msg)
+		s.onPub(&msg)
 	case msgUnretain:
-		return s.onUnretain(&msg)
+		s.onUnretain(&msg)
 	case msgCall:
-		return s.onCall(&msg)
+		s.onCall(&msg)
 	case msgReply:
-		return s.onReply(&msg)
+		s.onReply(&msg)
 	default:
 		s.logKV("unknown message type dropped", "type", msg.T)
-		return false
 	}
 }
 
@@ -429,14 +427,14 @@ func hasWirePrefix(topic, prefix []string) bool {
 	return true
 }
 
-func (s *session) onHello(msg *wireMsg) bool {
+func (s *session) onHello(msg *wireMsg) {
 	if msg.Peer != "" && msg.Peer != s.nodeID {
 		s.log("hello dropped: wrong peer")
-		return false
+		return
 	}
 	if s.peerID != "" && msg.Node != s.peerID {
 		s.log("hello dropped: wrong node")
-		return false
+		return
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
@@ -448,78 +446,72 @@ func (s *session) onHello(msg *wireMsg) bool {
 		Proto: protoVersion,
 		OK:    true,
 	})) {
-		return true
+		return
 	}
 	s.log("hello_ack tx")
 	time.Sleep(postHelloAckSettle)
 	s.promoteLink(reason)
-	return true
 }
 
-func (s *session) onHelloAck(msg *wireMsg) bool {
+func (s *session) onHelloAck(msg *wireMsg) {
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
 		s.log("echoed hello_ack ignored")
-		return true
+		return
 	}
 	if !msg.OK {
 		s.log("hello_ack rejected by peer")
 		s.handleLinkDown(reasonHelloRejected, "")
-		return true
+		return
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello_ack rx", "peer_sid", msg.SID)
 	s.promoteLink(reason)
-	return true
 }
 
-func (s *session) onPing(msg *wireMsg) bool {
+func (s *session) onPing(msg *wireMsg) {
 	s.logKV("ping rx", "peer_sid", msg.SID)
 	if !s.writeLine(marshal(wirePong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
-		return true
+		return
 	}
 	s.log("pong tx")
-	return true
 }
 
-func (s *session) onPong(msg *wireMsg) bool {
+func (s *session) onPong(msg *wireMsg) {
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
-		return true
+		return
 	}
 	s.lastPongAt = s.lastRxAt
-	return true
 }
 
-func (s *session) onPub(msg *wireMsg) bool {
+func (s *session) onPub(msg *wireMsg) {
 	t := importPublishTopic(msg.Topic)
 	if t == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
 			s.log("echoed state pub ignored")
-			return true
+			return
 		}
 		s.log("incoming pub dropped: no_route")
-		return true
+		return
 	}
 	s.conn.Publish(s.conn.NewMessage(t, msg.Payload, msg.Retain))
-	return true
 }
 
-func (s *session) onUnretain(msg *wireMsg) bool {
+func (s *session) onUnretain(msg *wireMsg) {
 	t := importPublishTopic(msg.Topic)
 	if t == nil {
 		s.log("incoming unretain dropped: no_route")
-		return true
+		return
 	}
 	s.conn.Publish(s.conn.NewMessage(t, nil, true))
-	return true
 }
 
-func (s *session) onCall(msg *wireMsg) bool {
+func (s *session) onCall(msg *wireMsg) {
 	t := importCallTopic(msg.Topic)
 	if t == nil {
 		s.log("incoming call dropped: no_route")
 		s.writeLine(marshal(wireReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
-		return true
+		return
 	}
 
 	timeout := callTimeoutDef
@@ -533,10 +525,9 @@ func (s *session) onCall(msg *wireMsg) bool {
 		sub:      sub,
 		deadline: time.Now().Add(timeout),
 	})
-	return true
 }
 
-func (s *session) onReply(msg *wireMsg) bool {
+func (s *session) onReply(msg *wireMsg) {
 
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
@@ -544,18 +535,17 @@ func (s *session) onReply(msg *wireMsg) bool {
 		}
 		s.outboundCalls = append(s.outboundCalls[:i], s.outboundCalls[i+1:]...)
 		if !call.req.CanReply() {
-			return true
+			return
 		}
 		if !msg.OK {
 			s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: msg.Err}, false)
-			return true
+			return
 		}
 		s.conn.Reply(call.req, decodePayload(msg.Payload), false)
-		return true
+		return
 	}
 
 	s.logKV("unexpected reply dropped", "corr", msg.Corr)
-	return true
 }
 
 func checkBusError(payload any) string {
