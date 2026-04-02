@@ -807,10 +807,10 @@ func TestDrainExportsWaitsForStartupHoldoff(t *testing.T) {
 	)
 
 	s := session{
-		link:          linkUp,
-		exportsEnabled:  true,
-		exportSubs:    []*bus.Subscription{sub},
-		exportReadyAt: time.Now().Add(time.Second),
+		link:           linkUp,
+		exportsEnabled: true,
+		exportSubs:     []*bus.Subscription{sub},
+		exportReadyAt:  time.Now().Add(time.Second),
 	}
 
 	pub.Publish(msg)

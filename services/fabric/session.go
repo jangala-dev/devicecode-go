@@ -46,7 +46,7 @@ const (
 	// the 115200-baud link capacity.
 	exportMaxPerTick   = 1
 	exportWaitFallback = 15 * time.Second
-	errPayloadMarshal = "payload_marshal_failed"
+	errPayloadMarshal  = "payload_marshal_failed"
 )
 
 // ---- link reasons and error strings ----
@@ -90,23 +90,23 @@ type session struct {
 	tr       Transport
 	conn     *bus.Connection
 
-	link          linkState
-	peerNode    string
-	peerSID       string
-	peerProto     int
-	helloSeen     bool
-	lastRxAt      time.Time
-	lastTxAt      time.Time
-	lastPongAt    time.Time
-	exportReadyAt time.Time
+	link            linkState
+	peerNode        string
+	peerSID         string
+	peerProto       int
+	helloSeen       bool
+	lastRxAt        time.Time
+	lastTxAt        time.Time
+	lastPongAt      time.Time
+	exportReadyAt   time.Time
 	exportWaitUntil time.Time
 	exportsEnabled  bool
 
-	exportSubs       []*bus.Subscription
-	exportCallSubs   []*bus.Subscription
-	inboundCalls     []*inboundCall
-	outboundCalls []*outboundCall
-	nextOutboundID   uint64
+	exportSubs     []*bus.Subscription
+	exportCallSubs []*bus.Subscription
+	inboundCalls   []*inboundCall
+	outboundCalls  []*outboundCall
+	nextOutboundID uint64
 }
 
 func (s *session) log(msg string) {
@@ -147,8 +147,8 @@ type linkStatePayload struct {
 	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
 	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
 	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
-	InboundCalls  int `json:"inbound_calls"`
-	OutboundCalls int `json:"outbound_calls"`
+	InboundCalls      int    `json:"inbound_calls"`
+	OutboundCalls     int    `json:"outbound_calls"`
 	Reason            string `json:"reason,omitempty"`
 	Err               string `json:"err,omitempty"`
 }
@@ -287,7 +287,7 @@ func (s *session) publishLinkState(reason, err string) {
 			LastTxUnixMilli:   unixMilli(s.lastTxAt),
 			LastPongUnixMilli: unixMilli(s.lastPongAt),
 			InboundCalls:      len(s.inboundCalls),
-			OutboundCalls:  len(s.outboundCalls),
+			OutboundCalls:     len(s.outboundCalls),
 			Reason:            reason,
 			Err:               err,
 		},
