@@ -10,10 +10,10 @@ import "devicecode-go/bus"
 // config side.
 //
 // CM5 -> MCU wire publish:
-//   ["config","device"] -> config/device
+//   ["config","device"] -> config/hal (with Lua empty-table normalization)
 //
 // CM5 -> MCU wire call:
-//   ["rpc","hal","dump"] -> rpc/hal/dump
+//   ["rpc","hal","dump"] -> handled directly by session (not via import rules)
 //
 // MCU local bus publish -> wire:
 //   hal/cap/env/#   -> ["state","env",...]
@@ -34,16 +34,12 @@ type busExportRule struct {
 var importPublishRules = []importRule{
 	{
 		wire:  []string{"config", "device"},
-		local: []string{"config", "device"},
+		local: []string{"config", "hal"},
 	},
 }
 
-var importCallRules = []importRule{
-	{
-		wire:  []string{"rpc", "hal", "dump"},
-		local: []string{"rpc", "hal", "dump"},
-	},
-}
+// rpc/hal/dump is handled directly by onCall, not via import rules.
+var importCallRules = []importRule{}
 
 var exportPublishRules = []busExportRule{
 	{

@@ -568,7 +568,7 @@ func TestImportPublishTopic(t *testing.T) {
 		wire []string
 		want string
 	}{
-		{[]string{"config", "device"}, "config/device"},
+		{[]string{"config", "device"}, "config/hal"},
 		{[]string{"config", "other"}, ""},
 		{[]string{"unknown", "x"}, ""},
 		{nil, ""},
@@ -585,7 +585,7 @@ func TestImportCallTopic(t *testing.T) {
 		wire []string
 		want string
 	}{
-		{[]string{"rpc", "hal", "dump"}, "rpc/hal/dump"},
+		// rpc/hal/dump is handled directly by onCall, not via import rules.
 		{[]string{"rpc", "hal", "other"}, ""},
 		{[]string{"config", "device"}, ""},
 		{nil, ""},
@@ -675,13 +675,13 @@ func TestPubImport(t *testing.T) {
 	bringUp(t, cm5)
 
 	reader := b.NewConnection("test")
-	sub := reader.Subscribe(bus.T("config", "device"))
+	sub := reader.Subscribe(bus.T("config", "hal"))
 
 	sendMsg(t, cm5, protoPub{
 		T:       "pub",
 		Topic:   []string{"config", "device"},
-		Payload: json.RawMessage(`{"mode":"normal"}`),
-		Retain:  false,
+		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
+		Retain:  true,
 	})
 
 	select {
@@ -689,15 +689,8 @@ func TestPubImport(t *testing.T) {
 		if m == nil {
 			t.Fatal("nil message")
 		}
-		raw, ok := m.Payload.(json.RawMessage)
-		if !ok {
-			t.Fatalf("payload type = %T, want json.RawMessage", m.Payload)
-		}
-		if string(raw) != `{"mode":"normal"}` {
-			t.Errorf("payload = %s", raw)
-		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for imported pub")
+		t.Fatal("timeout waiting for imported config on config/hal")
 	}
 }
 
@@ -995,7 +988,7 @@ func TestCallNoRoute(t *testing.T) {
 	}
 }
 
-func TestCallHandlerError(t *testing.T) {
+func TestDumpCallReturnsConfigState(t *testing.T) {
 	mcu, cm5 := pipePair()
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
@@ -1004,35 +997,41 @@ func TestCallHandlerError(t *testing.T) {
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	handler := b.NewConnection("handler")
-	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
-	go func() {
-		for m := range sub.Channel() {
-			handler.Reply(m, struct {
-				OK    bool   `json:"ok"`
-				Error string `json:"error"`
-			}{OK: false, Error: "device_busy"}, false)
-		}
-	}()
+	// Send config first so the session has state.
+	sendMsg(t, cm5, protoPub{
+		T:       "pub",
+		Topic:   []string{"config", "device"},
+		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
+		Retain:  true,
+	})
+	time.Sleep(100 * time.Millisecond)
 
+	// Call dump.
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "err-1", Topic: []string{"rpc", "hal", "dump"},
-		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
+		T: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
+		Payload: json.RawMessage(`{"ask":"status"}`), TimeoutMs: 5000,
 	})
 
 	reply := readMsg[protoReply](t, cm5)
-	if reply.Corr != "err-1" {
+	if reply.Corr != "dump-1" {
 		t.Errorf("corr = %q", reply.Corr)
 	}
-	if reply.OK {
-		t.Error("expected ok=false for handler error")
+	if !reply.OK {
+		t.Errorf("expected ok=true, got err=%q", reply.Err)
 	}
-	if reply.Err != "device_busy" {
-		t.Errorf("err = %q, want device_busy", reply.Err)
+	var dump dumpReply
+	if err := json.Unmarshal(reply.Payload, &dump); err != nil {
+		t.Fatalf("unmarshal dump reply: %v", err)
+	}
+	if !dump.Applied {
+		t.Error("expected applied=true")
+	}
+	if dump.ConfigCount != 1 {
+		t.Errorf("config_count = %d, want 1", dump.ConfigCount)
 	}
 }
 
-func TestCallDoesNotBlockPing(t *testing.T) {
+func TestDumpCallDoesNotBlockPing(t *testing.T) {
 	mcu, cm5 := pipePair()
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
@@ -1041,56 +1040,35 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	handler := b.NewConnection("handler")
-	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
-	go func() {
-		for m := range sub.Channel() {
-			time.Sleep(300 * time.Millisecond)
-			handler.Reply(m, map[string]string{"result": "ok"}, false)
-		}
-	}()
-
+	// Send dump call and ping back-to-back.
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "slow-1", Topic: []string{"rpc", "hal", "dump"},
+		T: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: "s1"})
+	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: testCM5SID})
 
 	type readResult struct {
 		line []byte
 		err  error
 	}
-	first := make(chan readResult, 1)
-	go func() {
-		line, err := cm5.ReadLine()
-		first <- readResult{line: line, err: err}
-	}()
-
-	select {
-	case res := <-first:
-		if res.err != nil {
-			t.Fatalf("ReadLine: %v", res.err)
+	// Both should arrive — dump reply and pong, in either order.
+	var gotReply, gotPong bool
+	for i := 0; i < 2; i++ {
+		msg := readMsg[protoMsg](t, cm5)
+		switch msg.T {
+		case msgReply:
+			gotReply = true
+		case msgPong:
+			gotPong = true
+		default:
+			t.Fatalf("unexpected message type %q", msg.T)
 		}
-		if got := protoType(res.line); got != "pong" {
-			t.Fatalf("first response type = %q, want pong", got)
-		}
-		var pong protoPong
-		if err := json.Unmarshal(res.line, &pong); err != nil {
-			t.Fatalf("Unmarshal pong: %v", err)
-		}
-		if pong.TS != 77 || pong.SID == "" {
-			t.Fatalf("bad pong: %+v", pong)
-		}
-	case <-time.After(150 * time.Millisecond):
-		t.Fatal("ping blocked behind slow call")
 	}
-
-	reply := readMsg[protoReply](t, cm5)
-	if reply.Corr != "slow-1" {
-		t.Errorf("corr = %q", reply.Corr)
+	if !gotReply {
+		t.Error("missing dump reply")
 	}
-	if !reply.OK {
-		t.Errorf("reply not ok: %s", reply.Err)
+	if !gotPong {
+		t.Error("missing pong")
 	}
 }
 

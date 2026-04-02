@@ -417,10 +417,8 @@ func main() {
 	b := bus.NewBus(32, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
-	bridgeConn := b.NewConnection("fabric-bridge")
 
 	log.Println("[main] starting hal.Run …")
-	go fabric.RunBridge(ctx, bridgeConn)
 	go hal.Run(ctx, halConn)
 
 	// Wait for retained hal/state=ready (or time out)

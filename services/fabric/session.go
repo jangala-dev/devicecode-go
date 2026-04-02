@@ -95,9 +95,16 @@ type session struct {
 
 	exportSubs     []*bus.Subscription
 	exportCallSubs []*bus.Subscription
+	halStateSub    *bus.Subscription
 	inboundCalls   []*inboundCall
 	outboundCalls  []*outboundCall
 	nextOutboundID uint64
+
+	// Config state — tracks config/device → config/hal translation.
+	lastHALState  *types.HALState
+	configApplied bool
+	configCount   int
+	lastConfigErr string
 }
 
 func (s *session) log(msg string) {
@@ -211,6 +218,7 @@ func (s *session) run(ctx context.Context) {
 			resetTimer(stale, staleTimeout)
 
 		case <-exportTick.C:
+			s.drainHALState()
 			s.drainExports()
 			s.drainInbound(time.Now())
 			s.drainOutbound(time.Now())
@@ -495,6 +503,23 @@ func (s *session) onPub(msg *protoMsg) {
 		s.log("incoming pub dropped: no_route")
 		return
 	}
+
+	// config/device → config/hal: normalize and track.
+	if topicEquals(localTopic, tConfigHAL) {
+		cfg, err := decodeHALConfig(msg.Payload)
+		if err != "" {
+			s.lastConfigErr = err
+			s.log("config/device rejected: " + err)
+			return
+		}
+		s.configApplied = true
+		s.configCount++
+		s.lastConfigErr = ""
+		s.log("config/device applied to config/hal")
+		s.conn.Publish(s.conn.NewMessage(localTopic, cfg, true))
+		return
+	}
+
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 }
 
@@ -508,6 +533,22 @@ func (s *session) onUnretain(msg *protoMsg) {
 }
 
 func (s *session) onCall(msg *protoMsg) {
+	// rpc/hal/dump: handle directly — reply with config and HAL state.
+	if slicesEqualStrings(msg.Topic, dumpCallTopic) {
+		s.drainHALState()
+		reply := dumpReply{
+			OK:          true,
+			Method:      "dump",
+			Echo:        decodePayload(msg.Payload),
+			HAL:         s.lastHALState,
+			Applied:     s.configApplied,
+			ConfigCount: s.configCount,
+			ConfigError: s.lastConfigErr,
+		}
+		s.sendFrame(marshal(protoReply{T: msgReply, Corr: msg.ID, OK: true, Payload: mustMarshal(reply)}))
+		return
+	}
+
 	localTopic := importCallTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming call dropped: no_route")
@@ -567,6 +608,65 @@ func checkBusError(payload any) string {
 	return ""
 }
 
+func mustMarshal(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{"error":"marshal_failed"}`)
+	}
+	return json.RawMessage(b)
+}
+
+// ---- config/dump types and helpers ----
+
+var (
+	tConfigHAL    = bus.T("config", "hal")
+	dumpCallTopic = []string{"rpc", "hal", "dump"}
+)
+
+type dumpReply struct {
+	OK          bool            `json:"ok"`
+	Method      string          `json:"method"`
+	Echo        any             `json:"echo,omitempty"`
+	HAL         *types.HALState `json:"hal,omitempty"`
+	Applied     bool            `json:"applied"`
+	ConfigCount int             `json:"config_count,omitempty"`
+	ConfigError string          `json:"config_error,omitempty"`
+}
+
+func topicEquals(t bus.Topic, expected bus.Topic) bool {
+	if t.Len() != expected.Len() {
+		return false
+	}
+	for i := 0; i < t.Len(); i++ {
+		a, _ := t.At(i).(string)
+		b, _ := expected.At(i).(string)
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *session) drainHALState() {
+	if s.halStateSub == nil {
+		return
+	}
+	for {
+		select {
+		case msg, ok := <-s.halStateSub.Channel():
+			if !ok || msg == nil {
+				return
+			}
+			if st, ok := decodeHALState(msg.Payload); ok {
+				stCopy := st
+				s.lastHALState = &stCopy
+			}
+		default:
+			return
+		}
+	}
+}
+
 func marshalPayload(payload any) (json.RawMessage, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -590,6 +690,7 @@ func (s *session) setupExports() {
 	for _, p := range exportCallPatterns() {
 		s.exportCallSubs = append(s.exportCallSubs, s.conn.Subscribe(p))
 	}
+	s.halStateSub = s.conn.Subscribe(bus.T("hal", "state"))
 }
 
 func (s *session) teardownExports() {
@@ -601,6 +702,10 @@ func (s *session) teardownExports() {
 		s.conn.Unsubscribe(sub)
 	}
 	s.exportCallSubs = nil
+	if s.halStateSub != nil {
+		s.conn.Unsubscribe(s.halStateSub)
+		s.halStateSub = nil
+	}
 }
 
 func (s *session) teardownInbound() {
