@@ -19,7 +19,6 @@ import (
 
 const halTimeout = 5 * time.Second
 const pwmTop = 4095
-const handshakeOnlyOutput = true
 const fabricSessionWaitLogEvery = 2 * time.Second
 
 // Thermal (deci-°C)
@@ -205,12 +204,12 @@ func (r *Reactor) updateLatchesFromValues() {
 	// Over-temp latch
 	if r.freshTMP() {
 		if r.lastTDeci >= TEMP_LIMIT {
-			if !handshakeOnlyOutput && !r.otActive {
+			if !r.otActive {
 				log.Println("[thermal] over-temp → latch active")
 			}
 			r.otActive = true
 		} else if r.lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
-			if !handshakeOnlyOutput && r.otActive {
+			if r.otActive {
 				log.Println("[thermal] temp recovered below hysteresis")
 			}
 			r.otActive = false
@@ -231,9 +230,7 @@ func (r *Reactor) updateLatchesFromValues() {
 // ---- sequencing (non-blocking) ----
 
 func (r *Reactor) startUpSeq() {
-	if !handshakeOnlyOutput {
-		log.Println("[power] PG debounced + Temp OK → rails UP")
-	}
+	log.Println("[power] PG debounced + Temp OK → rails UP")
 	r.state = stateUpSeq
 	r.seqIdx = 0            // next to apply
 	r.nextActionDue = r.now // first step fires immediately
@@ -243,9 +240,7 @@ func (r *Reactor) startUpSeq() {
 }
 
 func (r *Reactor) startDownSeq() {
-	if !handshakeOnlyOutput {
-		log.Println("[power] brownout/stale/over-temp → rails DOWN")
-	}
+	log.Println("[power] brownout/stale/over-temp → rails DOWN")
 	r.state = stateDownSeq
 	if r.seqOnCount < 0 {
 		r.seqOnCount = 0
@@ -274,9 +269,7 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		if !handshakeOnlyOutput {
-			log.Println("[event] powering rail UP: ", step.Name)
-		}
+		log.Println("[event] powering rail UP: ", step.Name)
 		r.publishSwitch(step.Name, true)
 		r.seqOnCount++
 		r.seqIdx++
@@ -291,9 +284,7 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		if !handshakeOnlyOutput {
-			log.Println("[event] powering rail down: ", step.Name)
-		}
+		log.Println("[event] powering rail down: ", step.Name)
 		r.publishSwitch(step.Name, false)
 		r.seqOnCount--
 		r.seqIdx--
@@ -329,9 +320,7 @@ func (r *Reactor) stepFSM() {
 
 		// If actively powering down and inputs become stably good, reverse.
 		if r.state == stateDownSeq && r.pgStable {
-			if !handshakeOnlyOutput {
-				log.Println("[power] inputs stably good → reverse to UP sequence")
-			}
+			log.Println("[power] inputs stably good → reverse to UP sequence")
 			r.startUpSeq()
 			return
 		}
@@ -390,18 +379,12 @@ func (r *Reactor) OnBattery(v types.BatteryValue) {
 }
 
 func (r *Reactor) OnTempDeciC(label string, deci int) {
-	if handshakeOnlyOutput {
-		return
-	}
 	log.Deci(label, deci)
 }
 
 // ---- memory snapshot telemetry (every ~2 s in main loop) ----
 
 func (r *Reactor) emitMemSnapshot() {
-	if handshakeOnlyOutput {
-		return
-	}
 	var ms runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
@@ -428,9 +411,7 @@ func main() {
 
 	ctx := context.Background()
 
-	if !handshakeOnlyOutput {
-		log.Println("[main] bootstrapping bus …")
-	}
+	log.Println("[main] bootstrapping bus …")
 	// Queue length must cover the retained replay burst when fabric
 	// subscribes to wildcard export patterns (hal/cap/env/#,
 	// hal/cap/power/#). Each capability publishes retained info +
@@ -441,9 +422,7 @@ func main() {
 	uiConn := b.NewConnection("ui")
 	bridgeConn := b.NewConnection("fabric-bridge")
 
-	if !handshakeOnlyOutput {
-		log.Println("[main] starting hal.Run …")
-	}
+	log.Println("[main] starting hal.Run …")
 	go fabric.RunBridge(ctx, bridgeConn)
 	go hal.Run(ctx, halConn)
 
@@ -456,9 +435,7 @@ func main() {
 	}
 
 	// Subscriptions (env + power)
-	if !handshakeOnlyOutput {
-		log.Println("[main] subscribing env + power …")
-	}
+	log.Println("[main] subscribing env + power …")
 	tempSub := uiConn.Subscribe(tTempValue)
 	tempDieSub := uiConn.Subscribe(tDieTempValue)
 	humidSub := uiConn.Subscribe(tHumValue)
@@ -551,9 +528,7 @@ func main() {
 			}
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
-				if !handshakeOnlyOutput {
-					log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-				}
+				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
 			}
 
 		// ---- Die Temp Backup ----
@@ -592,7 +567,7 @@ func main() {
 		// ---- Supervisory tick ----
 		case <-ticker.C:
 			r.now = time.Now()
-			if handshakeOnlyOutput && !fabricSessionOpen && !r.now.Before(nextFabricWaitLog) {
+			if !fabricSessionOpen && !r.now.Before(nextFabricWaitLog) {
 				log.Println("[main] waiting for fabric connection start")
 				nextFabricWaitLog = r.now.Add(fabricSessionWaitLogEvery)
 			}
@@ -667,9 +642,6 @@ func (l *Logger) logWrite(b []byte) int {
 // -----------------------------------------------------------------------------
 
 func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *bool) {
-	if handshakeOnlyOutput {
-		return
-	}
 	// hal/cap/<domain>/<kind>/<name>/value
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
@@ -754,9 +726,6 @@ func (r *Reactor) logPrefixStatus(path, label string) {
 }
 
 func printCapStatus(m *bus.Message) {
-	if handshakeOnlyOutput {
-		return
-	}
 	// hal/cap/<domain>/<kind>/<name>/status
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
@@ -780,9 +749,6 @@ func printCapStatus(m *bus.Message) {
 }
 
 func printCapEvent(m *bus.Message) {
-	if handshakeOnlyOutput {
-		return
-	}
 	// hal/cap/<domain>/<kind>/<name>/event/<tag>
 	dom, _ := m.Topic.At(2).(string)
 	kind, _ := m.Topic.At(3).(string)
