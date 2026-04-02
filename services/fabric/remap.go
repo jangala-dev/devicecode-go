@@ -4,6 +4,11 @@ import "devicecode-go/bus"
 
 // Topic remapping rules matching the shipped Lua fabric link contract.
 //
+// These rules are hardcoded and exact-match for v1. The Lua (CM5) side
+// uses config-driven wildcard rules, but the MCU only needs a fixed set
+// of routes. If new routes are required, add them here and on the Lua
+// config side.
+//
 // CM5 -> MCU wire publish:
 //   ["config","device"] -> config/device
 //

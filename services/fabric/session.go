@@ -21,20 +21,30 @@ const (
 )
 
 // ---- timeouts (local policy) ----
+//
+// Timing relationships:
+//   staleTimeout (45s) > exportWaitFallback (15s) > callTimeoutDef (5s)
+//
+// The CM5 sends pings every 15s of TX inactivity. The MCU marks the
+// peer stale after 45s without any RX, giving a 30s margin. The
+// exportWaitFallback arms exports if no peer traffic arrives within
+// 15s of link-up (normally armed earlier by peer_pub).
 
 const (
 	staleTimeout       = 45 * time.Second
 	callTimeoutDef     = 5 * time.Second
 	waitLogEvery       = 2 * time.Second
 	exportStartHoldoff = 1 * time.Second
-	// Give the serial reactor a chance to drain hello_ack before
-	// promoteLink publishes bus state and starts more work. This avoids
-	// relying on incidental println/GC timing in TinyGo.
+	// postHelloAckSettle gives the serial reactor goroutine a chance
+	// to drain the hello_ack bytes from the TX shmring before
+	// promoteLink publishes bus state and triggers export work.
+	// TinyGo's cooperative scheduler does not preempt, so without
+	// this yield the reactor may not run until the next tick.
 	postHelloAckSettle = 10 * time.Millisecond
 	// exportMaxPerTick caps the total export messages sent per drain
 	// cycle across all subscriptions, keeping UART throughput within
 	// the 115200-baud link capacity.
-	exportMaxPerTick = 1
+	exportMaxPerTick   = 1
 	exportWaitFallback = 15 * time.Second
 	errPayloadMarshal  = "payload_marshal_failed"
 )
@@ -340,6 +350,11 @@ func (s *session) dispatch(line []byte) bool {
 	}
 }
 
+// notePeerIdentity records the remote peer's node, SID, and proto version.
+// If the SID changes mid-session, the returned reason triggers a full
+// teardown of exports and pending calls on the Go side. Note: the Lua
+// side only tears down pending calls on SID change, not exports — this
+// asymmetry is intentional since the CM5 re-subscribes on reconnect.
 func (s *session) notePeerIdentity(node, sid string, proto int) string {
 	reason := ""
 	if s.link == linkUp && s.peerSID != "" && sid != "" && s.peerSID != sid {
@@ -381,8 +396,8 @@ func hasWirePrefix(topic, prefix []string) bool {
 
 func (s *session) onHello(line []byte) bool {
 	var msg wireHello
-	if json.Unmarshal(line, &msg) != nil {
-		s.log("malformed hello dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed hello dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("hello")
@@ -426,8 +441,8 @@ func (s *session) armExports(reason string) {
 
 func (s *session) onHelloAck(line []byte) bool {
 	var msg wireHelloAck
-	if json.Unmarshal(line, &msg) != nil {
-		s.log("malformed hello_ack dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed hello_ack dropped", "err", err.Error())
 		return false
 	}
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
@@ -449,8 +464,8 @@ func (s *session) onHelloAck(line []byte) bool {
 
 func (s *session) onPing(line []byte) bool {
 	var msg wirePing
-	if json.Unmarshal(line, &msg) != nil {
-		s.log("malformed ping dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed ping dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("ping")
@@ -478,8 +493,8 @@ func (s *session) onPing(line []byte) bool {
 
 func (s *session) onPong(line []byte) bool {
 	var msg wirePong
-	if json.Unmarshal(line, &msg) != nil {
-		s.log("malformed pong dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed pong dropped", "err", err.Error())
 		return false
 	}
 	if s.isSelfControlFrame("", msg.SID) {
@@ -502,8 +517,8 @@ func (s *session) onPong(line []byte) bool {
 
 func (s *session) onPub(line []byte) bool {
 	var msg wirePub
-	if json.Unmarshal(line, &msg) != nil {
-		s.log("malformed pub dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed pub dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("pub")
@@ -527,18 +542,18 @@ func (s *session) onPub(line []byte) bool {
 
 func (s *session) onUnretain(line []byte) bool {
 	var msg wireUnretain
-	if json.Unmarshal(line, &msg) != nil {
-		println("[fabric] malformed unretain dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed unretain dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("unretain")
 	if s.link != linkUp {
-		println("[fabric] unretain dropped before handshake")
+		s.log("unretain dropped before handshake")
 		return true
 	}
 	t := importPublishTopic(msg.Topic)
 	if t == nil {
-		println("[fabric] incoming unretain dropped: no_route")
+		s.log("incoming unretain dropped: no_route")
 		return true
 	}
 	s.armExports("peer_unretain")
@@ -548,18 +563,18 @@ func (s *session) onUnretain(line []byte) bool {
 
 func (s *session) onCall(line []byte) bool {
 	var msg wireCall
-	if json.Unmarshal(line, &msg) != nil {
-		println("[fabric] malformed call dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed call dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("call")
 	if s.link != linkUp {
-		println("[fabric] call dropped before handshake")
+		s.log("call dropped before handshake")
 		return true
 	}
 	t := importCallTopic(msg.Topic)
 	if t == nil {
-		println("[fabric] incoming call dropped: no_route")
+		s.log("incoming call dropped: no_route")
 		s.writeLine(marshal(wireReply{T: "reply", Corr: msg.ID, OK: false, Err: "no_route"}))
 		return true
 	}
@@ -581,8 +596,8 @@ func (s *session) onCall(line []byte) bool {
 
 func (s *session) onReply(line []byte) bool {
 	var msg wireReply
-	if json.Unmarshal(line, &msg) != nil {
-		println("[fabric] malformed reply dropped")
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logKV("malformed reply dropped", "err", err.Error())
 		return false
 	}
 	s.noteRx("reply")
@@ -604,7 +619,7 @@ func (s *session) onReply(line []byte) bool {
 		return true
 	}
 
-	println("[fabric] unexpected reply dropped:", msg.Corr)
+	s.logKV("unexpected reply dropped", "corr", msg.Corr)
 	return true
 }
 
@@ -708,7 +723,7 @@ func (s *session) drainExports() {
 				}
 				payload, err := marshalPayload(m.Payload)
 				if err != nil {
-					println("[fabric] export payload dropped:", err.Error())
+					s.logKV("export payload dropped", "err", err.Error())
 					continue
 				}
 				if !s.writeLine(marshal(wirePub{
@@ -803,7 +818,7 @@ func (s *session) drainOutgoingWireCalls(now time.Time) {
 
 				payload, err := marshalPayload(msg.Payload)
 				if err != nil {
-					println("[fabric] outgoing call dropped:", err.Error())
+					s.logKV("outgoing call dropped", "err", err.Error())
 					if msg.CanReply() {
 						s.conn.Reply(msg, types.ErrorReply{OK: false, Error: errPayloadMarshal}, false)
 					}
@@ -861,7 +876,7 @@ func (s *session) writeLine(data []byte) bool {
 		data = data[:len(data)-1]
 	}
 	if err := s.tr.WriteLine(data); err != nil {
-	if errors.Is(err, ErrLineTooLong) {
+		if errors.Is(err, ErrLineTooLong) {
 			s.log("oversized write dropped")
 			return true
 		}

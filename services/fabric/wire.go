@@ -4,6 +4,8 @@ import "encoding/json"
 
 // ---- Wire message types (fabric.md §4) ----
 
+// wireCaps is carried in hello for forward compatibility. The Lua side
+// sends caps but neither side enforces them in v1.
 type wireCaps struct {
 	Pub  bool `json:"pub,omitempty"`
 	Call bool `json:"call,omitempty"`
