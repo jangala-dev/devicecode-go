@@ -583,7 +583,6 @@ func TestImportCallTopic(t *testing.T) {
 		wire []string
 		want string
 	}{
-		{[]string{"rpc", "hal", "read_state"}, "rpc/hal/read_state"},
 		{[]string{"rpc", "hal", "dump"}, "rpc/hal/dump"},
 		{[]string{"rpc", "hal", "other"}, ""},
 		{[]string{"config", "device"}, ""},
@@ -625,8 +624,7 @@ func TestExportCallTopic(t *testing.T) {
 		bus  bus.Topic
 		want []string
 	}{
-		{bus.T("fabric", "out", "rpc", "hal", "read_state"), []string{"rpc", "hal", "read_state"}},
-		{bus.T("fabric", "out", "rpc", "hal", "dump"), nil},
+		{bus.T("fabric", "out", "rpc", "hal", "dump"), []string{"rpc", "hal", "dump"}},
 		{bus.T("fabric", "out", "rpc", "hal"), nil},
 		{bus.T("other", "topic"), nil},
 	} {
@@ -646,8 +644,8 @@ func TestExportCallPatterns(t *testing.T) {
 	if len(patterns) != 1 {
 		t.Fatalf("len(exportCallPatterns()) = %d, want 1", len(patterns))
 	}
-	if got := topicString(patterns[0]); got != "fabric/out/rpc/hal/read_state" {
-		t.Fatalf("exportCallPatterns()[0] = %q, want fabric/out/rpc/hal/read_state", got)
+	if got := topicString(patterns[0]); got != "fabric/out/rpc/hal/dump" {
+		t.Fatalf("exportCallPatterns()[0] = %q, want fabric/out/rpc/hal/dump", got)
 	}
 }
 
@@ -1005,7 +1003,7 @@ func TestCallHandlerError(t *testing.T) {
 	bringUp(t, cm5)
 
 	handler := b.NewConnection("handler")
-	sub := handler.Subscribe(bus.T("rpc", "hal", "read_state"))
+	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
 	go func() {
 		for m := range sub.Channel() {
 			handler.Reply(m, struct {
@@ -1016,7 +1014,7 @@ func TestCallHandlerError(t *testing.T) {
 	}()
 
 	sendMsg(t, cm5, wireCall{
-		T: "call", ID: "err-1", Topic: []string{"rpc", "hal", "read_state"},
+		T: "call", ID: "err-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
 
@@ -1042,7 +1040,7 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 	bringUp(t, cm5)
 
 	handler := b.NewConnection("handler")
-	sub := handler.Subscribe(bus.T("rpc", "hal", "read_state"))
+	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
 	go func() {
 		for m := range sub.Channel() {
 			time.Sleep(300 * time.Millisecond)
@@ -1051,7 +1049,7 @@ func TestCallDoesNotBlockPing(t *testing.T) {
 	}()
 
 	sendMsg(t, cm5, wireCall{
-		T: "call", ID: "slow-1", Topic: []string{"rpc", "hal", "read_state"},
+		T: "call", ID: "slow-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
 	sendMsg(t, cm5, wirePing{T: "ping", TS: 77, SID: "s1"})
@@ -1112,7 +1110,7 @@ func TestCallExport(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		msg, err := reqConn.RequestWait(context.Background(), reqConn.NewMessage(
-			bus.T("fabric", "out", "rpc", "hal", "read_state"),
+			bus.T("fabric", "out", "rpc", "hal", "dump"),
 			map[string]string{"ask": "status"},
 			false,
 		))
@@ -1123,7 +1121,7 @@ func TestCallExport(t *testing.T) {
 	if call.T != "call" {
 		t.Fatalf("expected call, got %q", call.T)
 	}
-	want := []string{"rpc", "hal", "read_state"}
+	want := []string{"rpc", "hal", "dump"}
 	if !slicesEqual(call.Topic, want) {
 		t.Fatalf("topic = %v, want %v", call.Topic, want)
 	}
@@ -1176,11 +1174,12 @@ func TestCallExportOnlyConfiguredRule(t *testing.T) {
 	ack := bringUp(t, cm5)
 	unlockExports(t, cm5, ack.SID)
 
+	// Use an unconfigured topic — only fabric/out/rpc/hal/dump is routed.
 	reqCtx, reqCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer reqCancel()
 	go func() {
 		_, _ = reqConn.RequestWait(reqCtx, reqConn.NewMessage(
-			bus.T("fabric", "out", "rpc", "hal", "dump"),
+			bus.T("fabric", "out", "rpc", "hal", "not_configured"),
 			map[string]string{"ask": "status"},
 			false,
 		))
@@ -1204,7 +1203,7 @@ func TestPendingWireCallsTimeout(t *testing.T) {
 	fabricConn := b.NewConnection("fabric")
 	reqConn := b.NewConnection("caller")
 	msg := reqConn.NewMessage(
-		bus.T("fabric", "out", "rpc", "hal", "read_state"),
+		bus.T("fabric", "out", "rpc", "hal", "dump"),
 		map[string]string{"ask": "status"},
 		false,
 	)
@@ -1268,9 +1267,9 @@ func TestDrainPendingCallsReportsMarshalFailure(t *testing.T) {
 	handlerConn := b.NewConnection("handler")
 	tr := &captureTransport{}
 
-	sub := handlerConn.Subscribe(bus.T("rpc", "hal", "read_state"))
+	sub := handlerConn.Subscribe(bus.T("rpc", "hal", "dump"))
 	defer handlerConn.Unsubscribe(sub)
-	req := fabricConn.NewMessage(bus.T("rpc", "hal", "read_state"), map[string]string{"ask": "status"}, false)
+	req := fabricConn.NewMessage(bus.T("rpc", "hal", "dump"), map[string]string{"ask": "status"}, false)
 	replySub := fabricConn.Request(req)
 
 	var msg *bus.Message
@@ -1329,7 +1328,7 @@ func TestDrainOutgoingWireCallsReportsMarshalFailure(t *testing.T) {
 	defer s.teardownExports()
 
 	msg := reqConn.NewMessage(
-		bus.T("fabric", "out", "rpc", "hal", "read_state"),
+		bus.T("fabric", "out", "rpc", "hal", "dump"),
 		make(chan int),
 		false,
 	)
@@ -1380,7 +1379,7 @@ func TestDrainOutgoingWireCallsReportsWriteFailure(t *testing.T) {
 	defer s.teardownExports()
 
 	msg := reqConn.NewMessage(
-		bus.T("fabric", "out", "rpc", "hal", "read_state"),
+		bus.T("fabric", "out", "rpc", "hal", "dump"),
 		map[string]string{"ask": "status"},
 		false,
 	)
@@ -1434,7 +1433,7 @@ func TestCallExportPeerReset(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		msg, err := reqConn.RequestWait(context.Background(), reqConn.NewMessage(
-			bus.T("fabric", "out", "rpc", "hal", "read_state"),
+			bus.T("fabric", "out", "rpc", "hal", "dump"),
 			map[string]string{"ask": "status"},
 			false,
 		))
@@ -1492,7 +1491,7 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		msg, err := reqConn.RequestWait(context.Background(), reqConn.NewMessage(
-			bus.T("fabric", "out", "rpc", "hal", "read_state"),
+			bus.T("fabric", "out", "rpc", "hal", "dump"),
 			map[string]string{"ask": "status"},
 			false,
 		))

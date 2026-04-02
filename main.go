@@ -431,11 +431,12 @@ func main() {
 	if !handshakeOnlyOutput {
 		log.Println("[main] bootstrapping bus …")
 	}
-	// Queue length must be large enough to hold the retained replay burst
-	// when fabric subscribes to wildcard export patterns (hal/cap/env/#,
-	// hal/cap/power/#). With ~10 retained topics per pattern and a channel
-	// of length N, messages beyond N are dropped during initial subscribe.
-	b := bus.NewBus(16, "+", "#")
+	// Queue length must cover the retained replay burst when fabric
+	// subscribes to wildcard export patterns (hal/cap/env/#,
+	// hal/cap/power/#). Each capability publishes retained info +
+	// status + value; pico_bb_proto_1 has ~26 retained topics across
+	// env and power domains. 32 provides margin for growth.
+	b := bus.NewBus(32, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 	bridgeConn := b.NewConnection("fabric-bridge")

@@ -13,16 +13,12 @@ import "devicecode-go/bus"
 //   ["config","device"] -> config/device
 //
 // CM5 -> MCU wire call:
-//   ["rpc","hal","read_state"] -> rpc/hal/read_state
 //   ["rpc","hal","dump"] -> rpc/hal/dump
 //
 // MCU local bus publish -> wire:
 //   hal/cap/env/#   -> ["state","env",...]
 //   hal/cap/power/# -> ["state","power",...]
 //   hal/state       -> ["state","hal"]
-//
-// MCU local bus call -> wire:
-//   fabric/out/rpc/hal/read_state -> ["rpc","hal","read_state"]
 
 type wireImportRule struct {
 	wire  []string
@@ -43,13 +39,6 @@ var importPublishRules = []wireImportRule{
 }
 
 var importCallRules = []wireImportRule{
-	{
-		// Placeholder: no handler subscribes to rpc/hal/read_state yet.
-		// CM5 calls will forward onto the bus and timeout. Remove or
-		// implement before production use.
-		wire:  []string{"rpc", "hal", "read_state"},
-		local: []string{"rpc", "hal", "read_state"},
-	},
 	{
 		wire:  []string{"rpc", "hal", "dump"},
 		local: []string{"rpc", "hal", "dump"},
@@ -75,8 +64,8 @@ var exportPublishRules = []busExportRule{
 
 var exportCallRules = []busExportRule{
 	{
-		localPrefix:  []string{"fabric", "out", "rpc", "hal", "read_state"},
-		remotePrefix: []string{"rpc", "hal", "read_state"},
+		localPrefix:  []string{"fabric", "out", "rpc", "hal", "dump"},
+		remotePrefix: []string{"rpc", "hal", "dump"},
 	},
 }
 
