@@ -721,6 +721,16 @@ func (s *session) drainExports() {
 				if wire == nil {
 					continue
 				}
+				if m.Retained && m.Payload == nil {
+					if !s.writeLine(marshal(wireUnretain{
+						T:     "unretain",
+						Topic: wire,
+					})) {
+						return
+					}
+					total++
+					continue
+				}
 				payload, err := marshalPayload(m.Payload)
 				if err != nil {
 					s.logKV("export payload dropped", "err", err.Error())

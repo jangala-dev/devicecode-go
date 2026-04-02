@@ -733,6 +733,44 @@ func TestPubExport(t *testing.T) {
 	}
 }
 
+func TestUnretainExport(t *testing.T) {
+	mcu, cm5 := pipePair()
+	b := newBus()
+	fabricConn := b.NewConnection("fabric")
+	publishConn := b.NewConnection("hal")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	ack := bringUp(t, cm5)
+	unlockExports(t, cm5, ack.SID)
+
+	// Publish retained value first.
+	publishConn.Publish(publishConn.NewMessage(
+		bus.T("hal", "cap", "env", "temperature", "core", "value"),
+		map[string]int{"deci_c": 412},
+		true,
+	))
+	pub := readMsg[wirePub](t, cm5)
+	if pub.T != "pub" || !pub.Retain {
+		t.Fatalf("expected retained pub, got t=%q retain=%v", pub.T, pub.Retain)
+	}
+
+	// Clear retained state (retain=true, payload=nil).
+	publishConn.Publish(publishConn.NewMessage(
+		bus.T("hal", "cap", "env", "temperature", "core", "value"),
+		nil,
+		true,
+	))
+	unr := readMsg[wireUnretain](t, cm5)
+	if unr.T != "unretain" {
+		t.Fatalf("expected unretain, got %q", unr.T)
+	}
+	want := []string{"state", "env", "temperature", "core", "value"}
+	if !slicesEqual(unr.Topic, want) {
+		t.Errorf("topic = %v, want %v", unr.Topic, want)
+	}
+}
+
 func TestDrainExportsReturnsWhenSubscriptionClosed(t *testing.T) {
 	b := newBus()
 	conn := b.NewConnection("fabric")
