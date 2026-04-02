@@ -150,13 +150,11 @@ type session struct {
 
 	exportSubs     []*bus.Subscription
 	exportCallSubs []*bus.Subscription
-	halStateSub    *bus.Subscription
 	inboundCalls   []*inboundCall
 	outboundCalls  []*outboundCall
 	nextOutboundID uint64
 
 	// Config state — tracks config/device → config/hal translation.
-	lastHALState  *types.HALState
 	configApplied bool
 	configCount   int
 	lastConfigErr string
@@ -553,12 +551,24 @@ func (s *session) onUnretain(msg *protoMsg) {
 func (s *session) onCall(msg *protoMsg) {
 	// rpc/hal/dump: handle directly — reply with config and HAL state.
 	if slicesEqualStrings(msg.Topic, dumpCallTopic) {
-		s.drainHALState()
+		var halState *types.HALState
+		sub := s.conn.Subscribe(bus.T("hal", "state"))
+		select {
+		case m := <-sub.Channel():
+			if m != nil {
+				if st, ok := decodeHALState(m.Payload); ok {
+					halState = &st
+				}
+			}
+		default:
+		}
+		s.conn.Unsubscribe(sub)
+
 		reply := dumpReply{
 			OK:          true,
 			Method:      "dump",
 			Echo:        decodePayload(msg.Payload),
-			HAL:         s.lastHALState,
+			HAL:         halState,
 			Applied:     s.configApplied,
 			ConfigCount: s.configCount,
 			ConfigError: s.lastConfigErr,
@@ -648,26 +658,6 @@ func topicEquals(t bus.Topic, expected bus.Topic) bool {
 	return true
 }
 
-func (s *session) drainHALState() {
-	if s.halStateSub == nil {
-		return
-	}
-	for {
-		select {
-		case msg, ok := <-s.halStateSub.Channel():
-			if !ok || msg == nil {
-				return
-			}
-			if st, ok := decodeHALState(msg.Payload); ok {
-				stCopy := st
-				s.lastHALState = &stCopy
-			}
-		default:
-			return
-		}
-	}
-}
-
 func marshalPayload(payload any) (json.RawMessage, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -691,7 +681,6 @@ func (s *session) setupExports() {
 	for _, p := range exportCallPatterns() {
 		s.exportCallSubs = append(s.exportCallSubs, s.conn.Subscribe(p))
 	}
-	s.halStateSub = s.conn.Subscribe(bus.T("hal", "state"))
 }
 
 func (s *session) teardownExports() {
@@ -703,10 +692,6 @@ func (s *session) teardownExports() {
 		s.conn.Unsubscribe(sub)
 	}
 	s.exportCallSubs = nil
-	if s.halStateSub != nil {
-		s.conn.Unsubscribe(s.halStateSub)
-		s.halStateSub = nil
-	}
 }
 
 func (s *session) teardownInbound() {
