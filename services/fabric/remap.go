@@ -44,6 +44,9 @@ var importPublishRules = []wireImportRule{
 
 var importCallRules = []wireImportRule{
 	{
+		// Placeholder: no handler subscribes to rpc/hal/read_state yet.
+		// CM5 calls will forward onto the bus and timeout. Remove or
+		// implement before production use.
 		wire:  []string{"rpc", "hal", "read_state"},
 		local: []string{"rpc", "hal", "read_state"},
 	},

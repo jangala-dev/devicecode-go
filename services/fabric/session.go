@@ -676,7 +676,10 @@ func (s *session) teardownExports() {
 
 func (s *session) teardownPendingCalls() {
 	for _, call := range s.pendingCalls {
-		s.conn.Unsubscribe(call.sub)
+		if call.sub != nil {
+			s.conn.Unsubscribe(call.sub)
+			call.sub = nil
+		}
 	}
 	s.pendingCalls = nil
 }
@@ -763,6 +766,7 @@ func (s *session) drainPendingCalls(now time.Time) {
 		select {
 		case reply, ok := <-call.sub.Channel():
 			s.conn.Unsubscribe(call.sub)
+			call.sub = nil // prevent double-unsubscribe in teardownPendingCalls
 			if !ok || reply == nil {
 				if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: "timeout"})) {
 					return
@@ -791,6 +795,7 @@ func (s *session) drainPendingCalls(now time.Time) {
 
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
+			call.sub = nil
 			if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: "timeout"})) {
 				return
 			}
