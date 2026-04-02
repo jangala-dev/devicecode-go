@@ -350,6 +350,23 @@ func (s *session) dispatch(line []byte) bool {
 		return false
 	}
 	s.markRx()
+
+	// Only hello and hello_ack are accepted before the link is up —
+	// they're the handshake that establishes the session. Everything
+	// else (ping, pong, pub, call, reply, unretain) requires an
+	// established link. Stale traffic from a previous session or
+	// messages from an unrecognised peer are dropped here rather
+	// than scattered across individual handlers.
+	switch msg.T {
+	case msgHello, msgHelloAck:
+		// Handshake messages are always accepted.
+	default:
+		if s.link != linkUp {
+			s.logKV("dropped before handshake", "type", msg.T)
+			return true
+		}
+	}
+
 	switch msg.T {
 	case msgHello:
 		return s.onHello(&msg)
@@ -368,11 +385,7 @@ func (s *session) dispatch(line []byte) bool {
 	case msgReply:
 		return s.onReply(&msg)
 	default:
-		if msg.T == "" {
-			s.log("invalid frame dropped")
-		} else {
-			s.logKV("unknown frame type dropped", "type", msg.T)
-		}
+		s.logKV("unknown message type dropped", "type", msg.T)
 		return false
 	}
 }
@@ -476,10 +489,6 @@ func (s *session) onHelloAck(msg *wireMsg) bool {
 }
 
 func (s *session) onPing(msg *wireMsg) bool {
-	if s.link != linkUp {
-		s.log("ping dropped: link not up")
-		return true
-	}
 	reason := s.notePeerIdentity("", msg.SID, 0)
 	if reason != "" {
 		s.logKV("peer session changed", "reason", reason)
@@ -518,10 +527,6 @@ func (s *session) onPong(msg *wireMsg) bool {
 }
 
 func (s *session) onPub(msg *wireMsg) bool {
-	if s.link != linkUp {
-		s.log("pub dropped before handshake")
-		return true
-	}
 	t := importPublishTopic(msg.Topic)
 	if t == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
@@ -537,10 +542,6 @@ func (s *session) onPub(msg *wireMsg) bool {
 }
 
 func (s *session) onUnretain(msg *wireMsg) bool {
-	if s.link != linkUp {
-		s.log("unretain dropped before handshake")
-		return true
-	}
 	t := importPublishTopic(msg.Topic)
 	if t == nil {
 		s.log("incoming unretain dropped: no_route")
@@ -552,10 +553,6 @@ func (s *session) onUnretain(msg *wireMsg) bool {
 }
 
 func (s *session) onCall(msg *wireMsg) bool {
-	if s.link != linkUp {
-		s.log("call dropped before handshake")
-		return true
-	}
 	t := importCallTopic(msg.Topic)
 	if t == nil {
 		s.log("incoming call dropped: no_route")
