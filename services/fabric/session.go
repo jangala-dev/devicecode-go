@@ -46,7 +46,35 @@ const (
 	// the 115200-baud link capacity.
 	exportMaxPerTick   = 1
 	exportWaitFallback = 15 * time.Second
-	errPayloadMarshal  = "payload_marshal_failed"
+	errPayloadMarshal = "payload_marshal_failed"
+)
+
+// ---- link reasons and error strings ----
+
+const (
+	reasonLinkDown           = "link_down"
+	reasonPeerStale          = "peer_stale"
+	reasonPeerReset          = "peer_reset"
+	reasonPeerSessionChanged = "peer_session_changed"
+	reasonHelloRejected      = "hello_rejected"
+	reasonTransportDown      = "transport_down"
+	reasonTransportWrite     = "transport_write_failed"
+	reasonNoRoute            = "no_route"
+	reasonTimeout            = "timeout"
+)
+
+// ---- export arm reasons ----
+
+// ---- export trigger reasons (why exports were enabled) ----
+
+const (
+	exportTriggerPub      = "peer_pub"
+	exportTriggerPing     = "peer_ping"
+	exportTriggerPong     = "peer_pong"
+	exportTriggerCall     = "peer_call"
+	exportTriggerReply    = "peer_reply"
+	exportTriggerUnretain = "peer_unretain"
+	exportTriggerFallback = "fallback"
 )
 
 // session manages the fabric link state machine over a Transport.
@@ -72,13 +100,13 @@ type session struct {
 	lastPongAt    time.Time
 	exportReadyAt time.Time
 	exportWaitUntil time.Time
-	exportsArmed  bool
+	exportsEnabled  bool
 
 	exportSubs       []*bus.Subscription
 	exportCallSubs   []*bus.Subscription
-	pendingCalls     []*pendingCall
-	pendingWireCalls []*pendingWireCall
-	nextWireCallID   uint64
+	inboundCalls     []*inboundCall
+	outboundCalls []*outboundCall
+	nextOutboundID   uint64
 }
 
 func (s *session) log(msg string) {
@@ -89,13 +117,13 @@ func (s *session) logKV(msg, key, value string) {
 	println("[fabric]", "sid", s.localSID, msg, key, value)
 }
 
-type pendingCall struct {
+type inboundCall struct {
 	id       string
 	sub      *bus.Subscription
 	deadline time.Time
 }
 
-type pendingWireCall struct {
+type outboundCall struct {
 	id       string
 	req      *bus.Message
 	deadline time.Time
@@ -119,8 +147,8 @@ type linkStatePayload struct {
 	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
 	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
 	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
-	PendingCalls      int    `json:"pending_calls"`
-	PendingWireCalls  int    `json:"pending_wire_calls"`
+	InboundCalls  int `json:"inbound_calls"`
+	OutboundCalls int `json:"outbound_calls"`
 	Reason            string `json:"reason,omitempty"`
 	Err               string `json:"err,omitempty"`
 }
@@ -156,8 +184,8 @@ func (s *session) run(ctx context.Context) {
 
 	defer s.tr.Close()
 	defer s.teardownExports()
-	defer s.teardownPendingCalls()
-	defer s.teardownPendingWireCalls("link_down")
+	defer s.teardownInbound()
+	defer s.teardownOutbound(reasonLinkDown)
 	defer s.log("run stop")
 
 	stale := time.NewTimer(staleTimeout)
@@ -186,7 +214,7 @@ func (s *session) run(ctx context.Context) {
 				return
 			}
 			if res.err != nil {
-				s.handleLinkDown("transport_down", res.err.Error())
+				s.handleLinkDown(reasonTransportDown, res.err.Error())
 				return
 			}
 			if s.dispatch(res.line) {
@@ -195,15 +223,15 @@ func (s *session) run(ctx context.Context) {
 
 		case <-exportTick.C:
 			s.drainExports()
-			s.drainPendingCalls(time.Now())
-			s.drainWireCalls(time.Now())
+			s.drainInbound(time.Now())
+			s.drainOutbound(time.Now())
 
 		case <-waitTick.C:
 			s.logWaiting()
 
 		case <-stale.C:
 			if s.link == linkUp {
-				s.handleLinkDown("peer_stale", "")
+				s.handleLinkDown(reasonPeerStale, "")
 			} else {
 				stale.Reset(staleTimeout)
 			}
@@ -258,8 +286,8 @@ func (s *session) publishLinkState(reason, err string) {
 			LastRxUnixMilli:   unixMilli(s.lastRxAt),
 			LastTxUnixMilli:   unixMilli(s.lastTxAt),
 			LastPongUnixMilli: unixMilli(s.lastPongAt),
-			PendingCalls:      len(s.pendingCalls),
-			PendingWireCalls:  len(s.pendingWireCalls),
+			InboundCalls:      len(s.inboundCalls),
+			OutboundCalls:  len(s.outboundCalls),
 			Reason:            reason,
 			Err:               err,
 		},
@@ -267,21 +295,18 @@ func (s *session) publishLinkState(reason, err string) {
 	))
 }
 
-func (s *session) noteRx(msgType string) {
+func (s *session) markRx() {
 	s.lastRxAt = time.Now()
-	if msgType == "pong" {
-		s.lastPongAt = s.lastRxAt
-	}
 }
 
-func (s *session) noteTx() {
+func (s *session) markTx() {
 	s.lastTxAt = time.Now()
 }
 
 func (s *session) handleLinkDown(reason, err string) {
 	pendingReason := reason
 	if pendingReason == "" {
-		pendingReason = "link_down"
+		pendingReason = reasonLinkDown
 	}
 	s.link = linkDown
 	s.remoteNode = ""
@@ -290,10 +315,10 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.helloSeen = false
 	s.exportReadyAt = time.Time{}
 	s.exportWaitUntil = time.Time{}
-	s.exportsArmed = false
+	s.exportsEnabled = false
 	s.teardownExports()
-	s.teardownPendingCalls()
-	s.teardownPendingWireCalls(pendingReason)
+	s.teardownInbound()
+	s.teardownOutbound(pendingReason)
 	s.publishLinkState(reason, err)
 	if err != "" {
 		s.logKV("link down", "err", err)
@@ -306,16 +331,16 @@ func (s *session) handleLinkDown(reason, err string) {
 func (s *session) promoteLink(reason string) {
 	if s.link == linkUp {
 		s.teardownExports()
-		s.teardownPendingCalls()
+		s.teardownInbound()
 		if reason == "" {
-			reason = "peer_reset"
+			reason = reasonPeerReset
 		}
-		s.teardownPendingWireCalls(reason)
+		s.teardownOutbound(reason)
 	}
 	s.link = linkUp
 	s.exportReadyAt = time.Time{}
 	s.exportWaitUntil = time.Now().Add(exportWaitFallback)
-	s.exportsArmed = false
+	s.exportsEnabled = false
 	s.publishLinkState(reason, "")
 }
 
@@ -324,21 +349,21 @@ func (s *session) promoteLink(reason string) {
 func (s *session) dispatch(line []byte) bool {
 	msgType := wireType(line)
 	switch msgType {
-	case "hello":
+	case msgHello:
 		return s.onHello(line)
-	case "hello_ack":
+	case msgHelloAck:
 		return s.onHelloAck(line)
-	case "ping":
+	case msgPing:
 		return s.onPing(line)
-	case "pong":
+	case msgPong:
 		return s.onPong(line)
-	case "pub":
+	case msgPub:
 		return s.onPub(line)
-	case "unretain":
+	case msgUnretain:
 		return s.onUnretain(line)
-	case "call":
+	case msgCall:
 		return s.onCall(line)
-	case "reply":
+	case msgReply:
 		return s.onReply(line)
 	default:
 		if msgType == "" {
@@ -358,7 +383,7 @@ func (s *session) dispatch(line []byte) bool {
 func (s *session) notePeerIdentity(node, sid string, proto int) string {
 	reason := ""
 	if s.link == linkUp && s.peerSID != "" && sid != "" && s.peerSID != sid {
-		reason = "peer_session_changed"
+		reason = reasonPeerSessionChanged
 	}
 	if node != "" {
 		s.remoteNode = node
@@ -400,7 +425,7 @@ func (s *session) onHello(line []byte) bool {
 		s.logKV("malformed hello dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("hello")
+	s.markRx()
 	if msg.Peer != "" && msg.Peer != s.nodeID {
 		s.log("hello dropped: wrong peer")
 		return false
@@ -414,7 +439,7 @@ func (s *session) onHello(line []byte) bool {
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
 	if !s.writeLine(marshal(wireHelloAck{
-		T:     "hello_ack",
+		T:     msgHelloAck,
 		Node:  s.nodeID,
 		SID:   s.localSID,
 		Proto: protoVersion,
@@ -428,14 +453,14 @@ func (s *session) onHello(line []byte) bool {
 	return true
 }
 
-func (s *session) armExports(reason string) {
-	if s.link != linkUp || s.exportsArmed {
+func (s *session) enableExports(reason string) {
+	if s.link != linkUp || s.exportsEnabled {
 		return
 	}
 	s.setupExports()
 	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
 	s.exportWaitUntil = time.Time{}
-	s.exportsArmed = true
+	s.exportsEnabled = true
 	s.logKV("export replay armed", "reason", reason)
 }
 
@@ -449,10 +474,10 @@ func (s *session) onHelloAck(line []byte) bool {
 		s.log("echoed hello_ack ignored")
 		return true
 	}
-	s.noteRx("hello_ack")
+	s.markRx()
 	if !msg.OK {
 		s.log("hello_ack rejected by peer")
-		s.handleLinkDown("hello_rejected", "")
+		s.handleLinkDown(reasonHelloRejected, "")
 		return true
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
@@ -468,7 +493,7 @@ func (s *session) onPing(line []byte) bool {
 		s.logKV("malformed ping dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("ping")
+	s.markRx()
 	if s.link != linkUp {
 		s.log("ping dropped: link not up")
 		return true
@@ -477,13 +502,13 @@ func (s *session) onPing(line []byte) bool {
 	if reason != "" {
 		s.logKV("peer session changed", "reason", reason)
 		s.teardownExports()
-		s.teardownPendingCalls()
-		s.teardownPendingWireCalls(reason)
-		s.exportsArmed = false
+		s.teardownInbound()
+		s.teardownOutbound(reason)
+		s.exportsEnabled = false
 	}
-	s.armExports("peer_ping")
+	s.enableExports(exportTriggerPing)
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.writeLine(marshal(wirePong{T: "pong", TS: msg.TS, SID: s.localSID})) {
+	if !s.writeLine(marshal(wirePong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return true
 	}
 	s.log("pong tx")
@@ -501,16 +526,17 @@ func (s *session) onPong(line []byte) bool {
 		s.log("echoed pong ignored")
 		return true
 	}
-	s.noteRx("pong")
+	s.markRx()
+	s.lastPongAt = s.lastRxAt
 	reason := s.notePeerIdentity("", msg.SID, 0)
 	if reason != "" {
 		s.logKV("peer session changed", "reason", reason)
 		s.teardownExports()
-		s.teardownPendingCalls()
-		s.teardownPendingWireCalls(reason)
-		s.exportsArmed = false
+		s.teardownInbound()
+		s.teardownOutbound(reason)
+		s.exportsEnabled = false
 	}
-	s.armExports("peer_pong")
+	s.enableExports(exportTriggerPong)
 	s.publishLinkState(reason, "")
 	return true
 }
@@ -521,7 +547,7 @@ func (s *session) onPub(line []byte) bool {
 		s.logKV("malformed pub dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("pub")
+	s.markRx()
 	if s.link != linkUp {
 		s.log("pub dropped before handshake")
 		return true
@@ -535,7 +561,7 @@ func (s *session) onPub(line []byte) bool {
 		s.log("incoming pub dropped: no_route")
 		return true
 	}
-	s.armExports("peer_pub")
+	s.enableExports(exportTriggerPub)
 	s.conn.Publish(s.conn.NewMessage(t, msg.Payload, msg.Retain))
 	return true
 }
@@ -546,7 +572,7 @@ func (s *session) onUnretain(line []byte) bool {
 		s.logKV("malformed unretain dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("unretain")
+	s.markRx()
 	if s.link != linkUp {
 		s.log("unretain dropped before handshake")
 		return true
@@ -556,7 +582,7 @@ func (s *session) onUnretain(line []byte) bool {
 		s.log("incoming unretain dropped: no_route")
 		return true
 	}
-	s.armExports("peer_unretain")
+	s.enableExports(exportTriggerUnretain)
 	s.conn.Publish(s.conn.NewMessage(t, nil, true))
 	return true
 }
@@ -567,7 +593,7 @@ func (s *session) onCall(line []byte) bool {
 		s.logKV("malformed call dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("call")
+	s.markRx()
 	if s.link != linkUp {
 		s.log("call dropped before handshake")
 		return true
@@ -575,10 +601,10 @@ func (s *session) onCall(line []byte) bool {
 	t := importCallTopic(msg.Topic)
 	if t == nil {
 		s.log("incoming call dropped: no_route")
-		s.writeLine(marshal(wireReply{T: "reply", Corr: msg.ID, OK: false, Err: "no_route"}))
+		s.writeLine(marshal(wireReply{T: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return true
 	}
-	s.armExports("peer_call")
+	s.enableExports(exportTriggerCall)
 
 	timeout := callTimeoutDef
 	if msg.TimeoutMs > 0 {
@@ -586,7 +612,7 @@ func (s *session) onCall(line []byte) bool {
 	}
 	busMsg := s.conn.NewMessage(t, msg.Payload, false)
 	sub := s.conn.Request(busMsg)
-	s.pendingCalls = append(s.pendingCalls, &pendingCall{
+	s.inboundCalls = append(s.inboundCalls, &inboundCall{
 		id:       msg.ID,
 		sub:      sub,
 		deadline: time.Now().Add(timeout),
@@ -600,14 +626,14 @@ func (s *session) onReply(line []byte) bool {
 		s.logKV("malformed reply dropped", "err", err.Error())
 		return false
 	}
-	s.noteRx("reply")
-	s.armExports("peer_reply")
+	s.markRx()
+	s.enableExports(exportTriggerReply)
 
-	for i, call := range s.pendingWireCalls {
+	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
 			continue
 		}
-		s.pendingWireCalls = append(s.pendingWireCalls[:i], s.pendingWireCalls[i+1:]...)
+		s.outboundCalls = append(s.outboundCalls[:i], s.outboundCalls[i+1:]...)
 		if !call.req.CanReply() {
 			return true
 		}
@@ -674,23 +700,23 @@ func (s *session) teardownExports() {
 	s.exportCallSubs = nil
 }
 
-func (s *session) teardownPendingCalls() {
-	for _, call := range s.pendingCalls {
+func (s *session) teardownInbound() {
+	for _, call := range s.inboundCalls {
 		if call.sub != nil {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
 		}
 	}
-	s.pendingCalls = nil
+	s.inboundCalls = nil
 }
 
-func (s *session) teardownPendingWireCalls(reason string) {
-	for _, call := range s.pendingWireCalls {
+func (s *session) teardownOutbound(reason string) {
+	for _, call := range s.outboundCalls {
 		if call.req != nil && call.req.CanReply() {
 			s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reason}, false)
 		}
 	}
-	s.pendingWireCalls = nil
+	s.outboundCalls = nil
 }
 
 // drainExports does a non-blocking read of each export subscription
@@ -699,9 +725,9 @@ func (s *session) drainExports() {
 	if s.link != linkUp {
 		return
 	}
-	if !s.exportsArmed {
+	if !s.exportsEnabled {
 		if !s.exportWaitUntil.IsZero() && !time.Now().Before(s.exportWaitUntil) {
-			s.armExports("fallback")
+			s.enableExports(exportTriggerFallback)
 		} else {
 			return
 		}
@@ -726,7 +752,7 @@ func (s *session) drainExports() {
 				}
 				if m.Retained && m.Payload == nil {
 					if !s.writeLine(marshal(wireUnretain{
-						T:     "unretain",
+						T:     msgUnretain,
 						Topic: wire,
 					})) {
 						return
@@ -740,7 +766,7 @@ func (s *session) drainExports() {
 					continue
 				}
 				if !s.writeLine(marshal(wirePub{
-					T:       "pub",
+					T:       msgPub,
 					Topic:   wire,
 					Payload: payload,
 					Retain:  m.Retained,
@@ -756,37 +782,37 @@ func (s *session) drainExports() {
 	}
 }
 
-func (s *session) drainPendingCalls(now time.Time) {
-	if len(s.pendingCalls) == 0 {
+func (s *session) drainInbound(now time.Time) {
+	if len(s.inboundCalls) == 0 {
 		return
 	}
 
-	keep := s.pendingCalls[:0]
-	for _, call := range s.pendingCalls {
+	keep := s.inboundCalls[:0]
+	for _, call := range s.inboundCalls {
 		select {
 		case reply, ok := <-call.sub.Channel():
 			s.conn.Unsubscribe(call.sub)
-			call.sub = nil // prevent double-unsubscribe in teardownPendingCalls
+			call.sub = nil // prevent double-unsubscribe in teardownInbound
 			if !ok || reply == nil {
-				if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: "timeout"})) {
+				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 					return
 				}
 				continue
 			}
 			if errStr := checkBusError(reply.Payload); errStr != "" {
-				if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: errStr})) {
+				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: errStr})) {
 					return
 				}
 				continue
 			}
 			payload, err := marshalPayload(reply.Payload)
 			if err != nil {
-				if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: errPayloadMarshal})) {
+				if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
 					return
 				}
 				continue
 			}
-			if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: true, Payload: payload})) {
+			if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: true, Payload: payload})) {
 				return
 			}
 			continue
@@ -796,7 +822,7 @@ func (s *session) drainPendingCalls(now time.Time) {
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
-			if !s.writeLine(marshal(wireReply{T: "reply", Corr: call.id, OK: false, Err: "timeout"})) {
+			if !s.writeLine(marshal(wireReply{T: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 				return
 			}
 			continue
@@ -805,15 +831,15 @@ func (s *session) drainPendingCalls(now time.Time) {
 		keep = append(keep, call)
 	}
 
-	s.pendingCalls = keep
+	s.inboundCalls = keep
 }
 
-func (s *session) drainWireCalls(now time.Time) {
-	s.drainOutgoingWireCalls(now)
-	s.drainPendingWireCalls(now)
+func (s *session) drainOutbound(now time.Time) {
+	s.drainOutboundNew(now)
+	s.drainOutboundPending(now)
 }
 
-func (s *session) drainOutgoingWireCalls(now time.Time) {
+func (s *session) drainOutboundNew(now time.Time) {
 	if s.link != linkUp || len(s.exportCallSubs) == 0 {
 		return
 	}
@@ -839,18 +865,18 @@ func (s *session) drainOutgoingWireCalls(now time.Time) {
 					}
 					continue
 				}
-				id := s.nextWireCallID
-				s.nextWireCallID++
+				id := s.nextOutboundID
+				s.nextOutboundID++
 				corr := "wire-" + strconvx.Utoa64(id)
 				if msg.CanReply() {
-					s.pendingWireCalls = append(s.pendingWireCalls, &pendingWireCall{
+					s.outboundCalls = append(s.outboundCalls, &outboundCall{
 						id:       corr,
 						req:      msg,
 						deadline: now.Add(callTimeoutDef),
 					})
 				}
 				if !s.writeLine(marshal(wireCall{
-					T:         "call",
+					T:         msgCall,
 					ID:        corr,
 					Topic:     wireTopic,
 					Payload:   payload,
@@ -866,22 +892,22 @@ func (s *session) drainOutgoingWireCalls(now time.Time) {
 	}
 }
 
-func (s *session) drainPendingWireCalls(now time.Time) {
-	if len(s.pendingWireCalls) == 0 {
+func (s *session) drainOutboundPending(now time.Time) {
+	if len(s.outboundCalls) == 0 {
 		return
 	}
 
-	keep := s.pendingWireCalls[:0]
-	for _, call := range s.pendingWireCalls {
+	keep := s.outboundCalls[:0]
+	for _, call := range s.outboundCalls {
 		if !now.Before(call.deadline) {
 			if call.req != nil && call.req.CanReply() {
-				s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: "timeout"}, false)
+				s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reasonTimeout}, false)
 			}
 			continue
 		}
 		keep = append(keep, call)
 	}
-	s.pendingWireCalls = keep
+	s.outboundCalls = keep
 }
 
 // ---- transport write ----
@@ -895,10 +921,10 @@ func (s *session) writeLine(data []byte) bool {
 			s.log("oversized write dropped")
 			return true
 		}
-		s.handleLinkDown("transport_write_failed", err.Error())
+		s.handleLinkDown(reasonTransportWrite, err.Error())
 		return false
 	}
-	s.noteTx()
+	s.markTx()
 	return true
 }
 

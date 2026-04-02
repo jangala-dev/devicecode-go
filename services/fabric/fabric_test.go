@@ -808,7 +808,7 @@ func TestDrainExportsWaitsForStartupHoldoff(t *testing.T) {
 
 	s := session{
 		link:          linkUp,
-		exportsArmed:  true,
+		exportsEnabled:  true,
 		exportSubs:    []*bus.Subscription{sub},
 		exportReadyAt: time.Now().Add(time.Second),
 	}
@@ -1212,12 +1212,12 @@ func TestPendingWireCallsTimeout(t *testing.T) {
 
 	s := session{
 		conn: fabricConn,
-		pendingWireCalls: []*pendingWireCall{
+		outboundCalls: []*outboundCall{
 			{id: "wire-1", req: msg, deadline: time.Now().Add(-time.Millisecond)},
 		},
 	}
 
-	s.drainPendingWireCalls(time.Now())
+	s.drainOutboundPending(time.Now())
 
 	select {
 	case reply := <-sub.Channel():
@@ -1286,14 +1286,14 @@ func TestDrainPendingCallsReportsMarshalFailure(t *testing.T) {
 	s := session{
 		conn: fabricConn,
 		tr:   tr,
-		pendingCalls: []*pendingCall{{
+		inboundCalls: []*inboundCall{{
 			id:       "call-1",
 			sub:      replySub,
 			deadline: time.Now().Add(time.Second),
 		}},
 	}
 
-	s.drainPendingCalls(time.Now())
+	s.drainInbound(time.Now())
 
 	if len(tr.writes) != 1 {
 		t.Fatalf("writes = %d, want 1", len(tr.writes))
@@ -1335,13 +1335,13 @@ func TestDrainOutgoingWireCallsReportsMarshalFailure(t *testing.T) {
 	replySub := reqConn.Request(msg)
 	defer reqConn.Unsubscribe(replySub)
 
-	s.drainOutgoingWireCalls(time.Now())
+	s.drainOutboundNew(time.Now())
 
 	if len(tr.writes) != 0 {
 		t.Fatalf("writes = %d, want 0", len(tr.writes))
 	}
-	if len(s.pendingWireCalls) != 0 {
-		t.Fatalf("pendingWireCalls = %d, want 0", len(s.pendingWireCalls))
+	if len(s.outboundCalls) != 0 {
+		t.Fatalf("outboundCalls = %d, want 0", len(s.outboundCalls))
 	}
 
 	select {
@@ -1386,13 +1386,13 @@ func TestDrainOutgoingWireCallsReportsWriteFailure(t *testing.T) {
 	replySub := reqConn.Request(msg)
 	defer reqConn.Unsubscribe(replySub)
 
-	s.drainOutgoingWireCalls(time.Now())
+	s.drainOutboundNew(time.Now())
 
 	if s.link != linkDown {
 		t.Fatalf("link = %v, want %v", s.link, linkDown)
 	}
-	if len(s.pendingWireCalls) != 0 {
-		t.Fatalf("pendingWireCalls = %d, want 0", len(s.pendingWireCalls))
+	if len(s.outboundCalls) != 0 {
+		t.Fatalf("outboundCalls = %d, want 0", len(s.outboundCalls))
 	}
 
 	select {

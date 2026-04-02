@@ -2,7 +2,20 @@ package fabric
 
 import "encoding/json"
 
-// ---- Wire message types (fabric.md §4) ----
+// ---- Wire message type identifiers (fabric.md §4) ----
+
+const (
+	msgHello    = "hello"
+	msgHelloAck = "hello_ack"
+	msgPing     = "ping"
+	msgPong     = "pong"
+	msgPub      = "pub"
+	msgUnretain = "unretain"
+	msgCall     = "call"
+	msgReply    = "reply"
+)
+
+// ---- Wire message structs ----
 
 // wireCaps is carried in hello for forward compatibility. The Lua side
 // sends caps but neither side enforces them in v1.
