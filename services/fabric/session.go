@@ -148,11 +148,13 @@ type session struct {
 	exportReadyAt  time.Time
 	exportsEnabled bool
 
-	exportSubs     []*bus.Subscription
-	exportCallSubs []*bus.Subscription
-	inboundCalls   []*inboundCall
-	outboundCalls  []*outboundCall
-	nextOutboundID uint64
+	exportSubs       []*bus.Subscription
+	exportCallSubs   []*bus.Subscription
+	inboundCalls     []*inboundCall
+	outboundCalls    []*outboundCall
+	nextOutboundID   uint64
+	incomingTransfer *incomingTransfer
+	transferFactory  transferFactory
 
 	// Config state — tracks config/device → config/hal translation.
 	configApplied bool
@@ -170,6 +172,10 @@ func (s *session) logKV(msg, key, value string) {
 
 // run is the main loop. Blocks until ctx is cancelled.
 func (s *session) run(ctx context.Context) {
+	if s.transferFactory == nil {
+		s.transferFactory = newTransferFactory()
+	}
+
 	lines := make(chan readResult, 1)
 
 	go func() {
@@ -201,6 +207,7 @@ func (s *session) run(ctx context.Context) {
 	defer s.teardownExports()
 	defer s.teardownInbound()
 	defer s.teardownOutbound(reasonLinkDown)
+	defer s.abortTransfer(reasonLinkDown)
 	defer s.log("run stop")
 
 	stale := time.NewTimer(staleTimeout)
@@ -330,6 +337,7 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.teardownExports()
 	s.teardownInbound()
 	s.teardownOutbound(pendingReason)
+	s.abortTransfer(pendingReason)
 	s.publishLinkState(reason, err)
 	if err != "" {
 		s.logKV("link down", "err", err)
@@ -341,11 +349,12 @@ func (s *session) handleLinkDown(reason, err string) {
 // promoteLink transitions to linkUp, tearing down any prior session state.
 func (s *session) promoteLink(reason string) {
 	if s.link == linkUp {
-		s.teardownExports()
-		s.teardownInbound()
 		if reason == "" {
 			reason = reasonPeerReset
 		}
+		s.abortTransfer(reason)
+		s.teardownExports()
+		s.teardownInbound()
 		s.teardownOutbound(reason)
 	}
 	s.link = linkUp
@@ -403,6 +412,14 @@ func (s *session) dispatch(line []byte) {
 		s.onCall(&msg)
 	case msgReply:
 		s.onReply(&msg)
+	case msgXferBegin:
+		s.onTransferBegin(&msg)
+	case msgXferChunk:
+		s.onTransferChunk(&msg)
+	case msgXferCommit:
+		s.onTransferCommit(&msg)
+	case msgXferAbort:
+		s.onTransferAbort(&msg)
 	default:
 		s.logKV("unknown message type dropped", "type", msg.T)
 	}

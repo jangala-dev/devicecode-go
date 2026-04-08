@@ -5,14 +5,21 @@ import "encoding/json"
 // ---- Wire message type identifiers (fabric.md §4) ----
 
 const (
-	msgHello    = "hello"
-	msgHelloAck = "hello_ack"
-	msgPing     = "ping"
-	msgPong     = "pong"
-	msgPub      = "pub"
-	msgUnretain = "unretain"
-	msgCall     = "call"
-	msgReply    = "reply"
+	msgHello      = "hello"
+	msgHelloAck   = "hello_ack"
+	msgPing       = "ping"
+	msgPong       = "pong"
+	msgPub        = "pub"
+	msgUnretain   = "unretain"
+	msgCall       = "call"
+	msgReply      = "reply"
+	msgXferBegin  = "xfer_begin"
+	msgXferReady  = "xfer_ready"
+	msgXferChunk  = "xfer_chunk"
+	msgXferNeed   = "xfer_need"
+	msgXferCommit = "xfer_commit"
+	msgXferDone   = "xfer_done"
+	msgXferAbort  = "xfer_abort"
 )
 
 // ---- Wire message structs ----
@@ -83,6 +90,66 @@ type protoReply struct {
 	Err     string          `json:"err,omitempty"`
 }
 
+type protoXferBegin struct {
+	T        string          `json:"t"`
+	ID       string          `json:"id"`
+	Kind     string          `json:"kind"`
+	Name     string          `json:"name"`
+	Format   string          `json:"format"`
+	Enc      string          `json:"enc"`
+	Size     uint32          `json:"size"`
+	ChunkRaw uint32          `json:"chunk_raw"`
+	Chunks   uint32          `json:"chunks"`
+	SHA256   string          `json:"sha256"`
+	Meta     json.RawMessage `json:"meta,omitempty"`
+}
+
+type protoXferReady struct {
+	T    string  `json:"t"`
+	ID   string  `json:"id"`
+	OK   bool    `json:"ok"`
+	Next *uint32 `json:"next,omitempty"`
+	Err  string  `json:"err,omitempty"`
+}
+
+type protoXferChunk struct {
+	T     string `json:"t"`
+	ID    string `json:"id"`
+	Seq   uint32 `json:"seq"`
+	Off   uint32 `json:"off"`
+	N     uint32 `json:"n"`
+	CRC32 string `json:"crc32"`
+	Data  string `json:"data"`
+}
+
+type protoXferNeed struct {
+	T    string `json:"t"`
+	ID   string `json:"id"`
+	Next uint32 `json:"next"`
+	Err  string `json:"err,omitempty"`
+}
+
+type protoXferCommit struct {
+	T      string `json:"t"`
+	ID     string `json:"id"`
+	Size   uint32 `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+type protoXferDone struct {
+	T    string          `json:"t"`
+	ID   string          `json:"id"`
+	OK   bool            `json:"ok"`
+	Info json.RawMessage `json:"info,omitempty"`
+	Err  string          `json:"err,omitempty"`
+}
+
+type protoXferAbort struct {
+	T      string `json:"t"`
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
 // protoMsg is a union struct for single-pass unmarshal in dispatch.
 // Fields are the superset of all message types. Only the fields
 // relevant to the T value are populated; the rest are zero.
@@ -102,6 +169,23 @@ type protoMsg struct {
 	Corr      string          `json:"corr,omitempty"`
 	TimeoutMs int             `json:"timeout_ms,omitempty"`
 	Err       string          `json:"err,omitempty"`
+	Kind      string          `json:"kind,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Format    string          `json:"format,omitempty"`
+	Enc       string          `json:"enc,omitempty"`
+	Size      uint32          `json:"size,omitempty"`
+	ChunkRaw  uint32          `json:"chunk_raw,omitempty"`
+	Chunks    uint32          `json:"chunks,omitempty"`
+	SHA256    string          `json:"sha256,omitempty"`
+	Meta      json.RawMessage `json:"meta,omitempty"`
+	Seq       uint32          `json:"seq,omitempty"`
+	Off       uint32          `json:"off,omitempty"`
+	N         uint32          `json:"n,omitempty"`
+	CRC32     string          `json:"crc32,omitempty"`
+	Data      string          `json:"data,omitempty"`
+	Next      uint32          `json:"next,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+	Info      json.RawMessage `json:"info,omitempty"`
 }
 
 // ---- codec helpers ----

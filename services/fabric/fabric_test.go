@@ -121,6 +121,13 @@ func TestCodecAllTypes(t *testing.T) {
 		{protoUnretain{T: "unretain", Topic: []string{"a"}}, "unretain"},
 		{protoCall{T: "call", ID: "c1"}, "call"},
 		{protoReply{T: "reply", Corr: "c1", OK: true}, "reply"},
+		{protoXferBegin{T: "xfer_begin", ID: "x1"}, "xfer_begin"},
+		{protoXferReady{T: "xfer_ready", ID: "x1", OK: true}, "xfer_ready"},
+		{protoXferChunk{T: "xfer_chunk", ID: "x1"}, "xfer_chunk"},
+		{protoXferNeed{T: "xfer_need", ID: "x1"}, "xfer_need"},
+		{protoXferCommit{T: "xfer_commit", ID: "x1"}, "xfer_commit"},
+		{protoXferDone{T: "xfer_done", ID: "x1", OK: true}, "xfer_done"},
+		{protoXferAbort{T: "xfer_abort", ID: "x1", Reason: "aborted"}, "xfer_abort"},
 	} {
 		b := marshal(tc.v)
 		if got := protoType(b[:len(b)-1]); got != tc.want {
