@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"time"
 
+	"ab-bringup/abupdate"
+
 	"devicecode-go/bus"
 	"devicecode-go/services/fabric"
 	"devicecode-go/services/hal"
@@ -412,6 +414,11 @@ func main() {
 	ctx := context.Background()
 
 	log.Println("[main] firmware version ", firmwareVersion)
+	if pp, rc := abupdate.ActivePartition(); rc == 0 {
+		log.Println("[main] active partition ", abupdate.FormatPartition(pp))
+	} else {
+		log.Println("[main] active partition unknown rc=", strconvx.Itoa(int(rc)))
+	}
 	log.Println("[main] bootstrapping bus …")
 	// Queue length must cover the retained replay burst when fabric
 	// subscribes to wildcard export patterns (hal/cap/env/#,
