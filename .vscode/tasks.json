@@ -23,7 +23,7 @@
       "args": [
         "build",
         "-o", "${workspaceFolder}/build/devicecode.elf",
-        "-stack-size=3KB",
+        "-stack-size=8KB",
         "-serial=none",
         "-target=pico2",
         "-tags", "pico_bb_proto_1",
