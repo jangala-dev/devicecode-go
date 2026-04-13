@@ -389,6 +389,17 @@ func (s *session) validateInbound(msg *protoMsg) bool {
 func (s *session) dispatch(line []byte) {
 	var msg protoMsg
 	if err := json.Unmarshal(line, &msg); err != nil {
+		if cur := s.incomingTransfer; cur != nil {
+			println(
+				"[fabric]", "sid", s.localSID,
+				"malformed frame dropped",
+				"transfer_id", cur.meta.ID,
+				"expected_next", strconvx.Itoa(int(cur.expectedNext)),
+				"line_len", strconvx.Itoa(len(line)),
+				"err", err.Error(),
+			)
+			return
+		}
 		s.logKV("malformed frame dropped", "err", err.Error())
 		return
 	}

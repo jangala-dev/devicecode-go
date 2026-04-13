@@ -22,6 +22,7 @@ const pwmTop = 4095
 const fabricWaitLogInterval = 2 * time.Second
 const fabricSerialRXSize = 4096
 const fabricSerialTXSize = 4096
+const firmwareVersion = "2026-04-09-transfer-rxfix-1"
 
 // Thermal (deci-°C)
 const (
@@ -410,6 +411,7 @@ func main() {
 
 	ctx := context.Background()
 
+	log.Println("[main] firmware version ", firmwareVersion)
 	log.Println("[main] bootstrapping bus …")
 	// Queue length must cover the retained replay burst when fabric
 	// subscribes to wildcard export patterns (hal/cap/env/#,
