@@ -26,6 +26,7 @@ const (
 	statusReady   = "ready"
 	statusOpening = "opening"
 	statusDown    = "down"
+	lineQueueSize = 32
 )
 
 // ---- timeouts (local policy) ----
@@ -176,7 +177,7 @@ func (s *session) run(ctx context.Context) {
 		s.transferFactory = newTransferFactory()
 	}
 
-	lines := make(chan readResult, 1)
+	lines := make(chan readResult, lineQueueSize)
 
 	go func() {
 		defer close(lines)
