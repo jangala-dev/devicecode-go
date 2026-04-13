@@ -135,12 +135,13 @@ type linkStatePayload struct {
 // cooperative scheduler panics if multiple goroutines contend on
 // the bus's internal sync.Mutex.
 type session struct {
-	linkID   string
-	nodeID   string
-	peerID   string
-	localSID string
-	tr       Transport
-	conn     *bus.Connection
+	linkID          string
+	nodeID          string
+	peerID          string
+	localSID        string
+	activePartition string
+	tr              Transport
+	conn            *bus.Connection
 
 	link           linkState
 	peerNode       string
@@ -953,5 +954,5 @@ func (s *session) logWaiting() {
 	if s.peerSID != "" {
 		return
 	}
-	s.log("waiting for connection start")
+	s.logKV("waiting for connection start", "partition", s.activePartition)
 }

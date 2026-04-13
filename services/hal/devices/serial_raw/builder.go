@@ -9,6 +9,7 @@ import (
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
 	"devicecode-go/x/shmring"
+	"devicecode-go/x/strconvx"
 )
 
 // ---- Parameters ----
@@ -49,6 +50,18 @@ type session struct {
 	rxRing   *shmring.Ring
 	txHandle shmring.Handle
 	txRing   *shmring.Ring
+
+	// Reactor-owned observability. Single writer (the reactor goroutine),
+	// so plain fields are sufficient; no atomics required.
+	rxBytesTotal   uint64 // cumulative bytes drained from UART RX into rxRing
+	rxRingFullHits uint32 // RX drain breaks because rxRing had no free span
+
+	// Throttle state for the [serial-raw] log emitter.
+	rxLogLastAt           time.Time
+	rxLogLastHits         uint32
+	rxLogLastBytesQuantum uint64
+	rxLogLastHwDrops      uint32
+	rxLogLastSwDrops      uint32
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -311,6 +324,63 @@ func (d *Device) stopSession() {
 
 // ---- Reactor (single goroutine) ----
 
+// rxDropsProvider is implemented by hardware-specific serial ports that can
+// report RX-side drop counts from below the reactor (typically from the UART
+// driver's ISR, before bytes reach the shmring producer).
+type rxDropsProvider interface {
+	RXDrops() (hw, sw uint32)
+}
+
+// logRxCountersIfDue emits a [serial-raw] line summarising the reactor's
+// RX-side counters. When force is false it throttles to at most one line per
+// rxLogMinInterval AND suppresses lines where nothing has changed since the
+// last emit. When force is true it always emits (used for the final snapshot
+// before the reactor exits).
+func (d *Device) logRxCountersIfDue(s *session, force bool) {
+	const (
+		rxLogMinInterval  = 1 * time.Second
+		rxLogBytesQuantum = 64 * 1024
+	)
+
+	hits := s.rxRingFullHits
+	bytes := s.rxBytesTotal
+	quantum := bytes / rxLogBytesQuantum
+
+	var hwDrops, swDrops uint32
+	if rp, ok := d.port.(rxDropsProvider); ok {
+		hwDrops, swDrops = rp.RXDrops()
+	}
+
+	if !force {
+		now := time.Now()
+		if now.Sub(s.rxLogLastAt) < rxLogMinInterval {
+			return
+		}
+		if hits == s.rxLogLastHits &&
+			quantum == s.rxLogLastBytesQuantum &&
+			hwDrops == s.rxLogLastHwDrops &&
+			swDrops == s.rxLogLastSwDrops {
+			return
+		}
+		s.rxLogLastAt = now
+	} else {
+		s.rxLogLastAt = time.Now()
+	}
+
+	println(
+		"[serial-raw]", "rx",
+		"uart", d.a.Name,
+		"bytes_total", strconvx.Utoa64(bytes),
+		"ring_full", strconvx.Utoa64(uint64(hits)),
+		"rx_hw_drops", strconvx.Utoa64(uint64(hwDrops)),
+		"rx_sw_drops", strconvx.Utoa64(uint64(swDrops)),
+	)
+	s.rxLogLastHits = hits
+	s.rxLogLastBytesQuantum = quantum
+	s.rxLogLastHwDrops = hwDrops
+	s.rxLogLastSwDrops = swDrops
+}
+
 func (d *Device) reactor(s *session) {
 	defer close(s.done)
 
@@ -325,6 +395,7 @@ func (d *Device) reactor(s *session) {
 		for {
 			p1, p2 := rxR.WriteAcquire()
 			if len(p1) == 0 {
+				s.rxRingFullHits++
 				break
 			}
 			n1 := u.TryRead(p1)
@@ -333,6 +404,7 @@ func (d *Device) reactor(s *session) {
 			}
 			if n1 < len(p1) {
 				rxR.WriteCommit(n1)
+				s.rxBytesTotal += uint64(n1)
 				made = true
 				continue
 			}
@@ -341,6 +413,7 @@ func (d *Device) reactor(s *session) {
 				n2 = u.TryRead(p2)
 			}
 			rxR.WriteCommit(n1 + n2)
+			s.rxBytesTotal += uint64(n1 + n2)
 			made = true
 		}
 
@@ -372,8 +445,10 @@ func (d *Device) reactor(s *session) {
 		}
 
 		// Idle: wait for any edge, then re-check.
+		d.logRxCountersIfDue(s, false)
 		select {
 		case <-s.ctx.Done():
+			d.logRxCountersIfDue(s, true)
 			return
 		case <-u.Readable():
 		case <-u.Writable():

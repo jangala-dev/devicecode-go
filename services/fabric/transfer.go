@@ -267,6 +267,9 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 			"id", cur.meta.ID,
 			"next", u32s(cur.expectedNext),
 			"err", "decode_failed",
+			"seq", u32s(msg.Seq),
+			"off", u32s(msg.Off),
+			"data_len", u32s(uint32(len(msg.Data))),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "decode_failed")
 		return
@@ -278,7 +281,10 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 			"id", cur.meta.ID,
 			"next", u32s(cur.expectedNext),
 			"err", "size_mismatch",
+			"seq", u32s(msg.Seq),
+			"off", u32s(msg.Off),
 			"n", u32s(msg.N),
+			"data_len", u32s(uint32(len(msg.Data))),
 			"decoded", u32s(uint32(len(raw))),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
