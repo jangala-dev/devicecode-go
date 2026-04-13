@@ -20,6 +20,8 @@ import (
 const halTimeout = 5 * time.Second
 const pwmTop = 4095
 const fabricWaitLogInterval = 2 * time.Second
+const fabricSerialRXSize = 4096
+const fabricSerialTXSize = 4096
 
 // Thermal (deci-°C)
 const (
@@ -444,9 +446,13 @@ func main() {
 	)
 	subSessOpenFabric := uiConn.Subscribe(tSessOpened(uartFabric))
 	subSessClosedFabric := uiConn.Subscribe(tSessClosed(uartFabric))
+	fabricOpenReq := types.SerialSessionOpen{
+		RXSize: fabricSerialRXSize,
+		TXSize: fabricSerialTXSize,
+	}
 
 	// Kick open requests
-	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
+	uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), fabricOpenReq, false))
 
 	var retryFabricAt time.Time
 	var fabricCancel context.CancelFunc
@@ -505,7 +511,7 @@ func main() {
 			fabricSessionOpen = false
 			nextFabricWaitLog = time.Now()
 			if time.Now().After(retryFabricAt) {
-				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
+				uiConn.Publish(uiConn.NewMessage(tSessOpen(uartFabric), fabricOpenReq, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
 
