@@ -2,8 +2,6 @@ package serial_raw
 
 import (
 	"context"
-	"fmt"
-	"hash/crc32"
 	"sync/atomic"
 	"time"
 
@@ -59,9 +57,6 @@ type session struct {
 	rxLogAt      time.Time
 	rxLogHits    uint32
 	rxLogQuantum uint64
-	rxLineCRC    uint32
-	rxLineLen    uint32
-	rxLineCount  uint32
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -330,37 +325,6 @@ func (d *Device) stopSession() {
 
 // ---- Reactor (single goroutine) ----
 
-func (d *Device) noteRXBytes(s *session, chunk []byte) {
-	if len(chunk) == 0 {
-		return
-	}
-	start := 0
-	for i, b := range chunk {
-		if b != '\n' {
-			continue
-		}
-		if i > start {
-			s.rxLineCRC = crc32.Update(s.rxLineCRC, crc32.IEEETable, chunk[start:i])
-			s.rxLineLen += uint32(i - start)
-		}
-		s.rxLineCount++
-		println(
-			"[serial-raw]", "rx_line",
-			"uart", d.a.Name,
-			"line_n", strconvx.Utoa64(uint64(s.rxLineCount)),
-			"line_len", strconvx.Utoa64(uint64(s.rxLineLen)),
-			"line_crc32", fmt.Sprintf("%08x", s.rxLineCRC),
-		)
-		s.rxLineCRC = 0
-		s.rxLineLen = 0
-		start = i + 1
-	}
-	if start < len(chunk) {
-		s.rxLineCRC = crc32.Update(s.rxLineCRC, crc32.IEEETable, chunk[start:])
-		s.rxLineLen += uint32(len(chunk) - start)
-	}
-}
-
 func (d *Device) logRxCountersIfDue(s *session, force bool) {
 	const (
 		rxLogMinInterval  = 1 * time.Second
@@ -416,7 +380,6 @@ func (d *Device) reactor(s *session) {
 				break
 			}
 			if n1 < len(p1) {
-				d.noteRXBytes(s, p1[:n1])
 				rxR.WriteCommit(n1)
 				s.rxBytesTotal += uint64(n1)
 				made = true
@@ -426,8 +389,6 @@ func (d *Device) reactor(s *session) {
 			if len(p2) > 0 {
 				n2 = u.TryRead(p2)
 			}
-			d.noteRXBytes(s, p1[:n1])
-			d.noteRXBytes(s, p2[:n2])
 			rxR.WriteCommit(n1 + n2)
 			s.rxBytesTotal += uint64(n1 + n2)
 			made = true

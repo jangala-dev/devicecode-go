@@ -3,7 +3,6 @@ package fabric
 import (
 	"context"
 	"fmt"
-	"hash/crc32"
 
 	"devicecode-go/x/shmring"
 )
@@ -28,14 +27,6 @@ func NewShmringTransport(rx, tx *shmring.Ring) *ShmringTransport {
 		ctx:    ctx,
 		buf:    make([]byte, 0, 256),
 	}
-}
-
-func logShmringRXLine(data []byte) {
-	println(
-		"[fabric-rx]", "line",
-		"line_len", len(data),
-		"line_crc32", fmt.Sprintf("%08x", crc32.ChecksumIEEE(data)),
-	)
 }
 
 func (t *ShmringTransport) ReadLine() ([]byte, error) {
@@ -69,7 +60,6 @@ func (t *ShmringTransport) ReadLine() ([]byte, error) {
 			}
 			out := make([]byte, len(t.buf))
 			copy(out, t.buf)
-			logShmringRXLine(out)
 			traceLine("rx", out)
 			return out, nil
 		}
@@ -94,7 +84,6 @@ func (t *ShmringTransport) ReadLine() ([]byte, error) {
 			}
 			out := make([]byte, len(t.buf))
 			copy(out, t.buf)
-			logShmringRXLine(out)
 			traceLine("rx", out)
 			return out, nil
 		}
