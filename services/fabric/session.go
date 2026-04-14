@@ -400,11 +400,20 @@ func (s *session) dispatch(line []byte) {
 				"transfer_id", cur.meta.ID,
 				"expected_next", strconvx.Itoa(int(cur.expectedNext)),
 				"line_len", strconvx.Itoa(len(line)),
+				"line_head", tracePreview(line),
+				"line_tail", traceTailPreview(line),
 				"err", err.Error(),
 			)
 			return
 		}
-		s.logKV("malformed frame dropped", "err", err.Error())
+		println(
+			"[fabric]", "sid", s.localSID,
+			"malformed frame dropped",
+			"line_len", strconvx.Itoa(len(line)),
+			"line_head", tracePreview(line),
+			"line_tail", traceTailPreview(line),
+			"err", err.Error(),
+		)
 		return
 	}
 	s.markRx()

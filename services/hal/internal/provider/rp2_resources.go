@@ -705,12 +705,11 @@ func (r *rp2Registry) ReadOnDieMilliC() int32 {
 // rp2SerialPort adapts uartx.UART to serialPortX.
 type rp2SerialPort struct{ u *uartx.UART }
 
-func (p *rp2SerialPort) Readable() <-chan struct{}  { return p.u.Readable() }
-func (p *rp2SerialPort) Writable() <-chan struct{}  { return p.u.Writable() }
-func (p *rp2SerialPort) TryRead(b []byte) int       { return p.u.TryRead(b) }
-func (p *rp2SerialPort) TryWrite(b []byte) int      { return p.u.TryWrite(b) }
-func (p *rp2SerialPort) Flush() error               { return p.u.Flush() }
-func (p *rp2SerialPort) RXDrops() (hw, sw uint32)   { return p.u.RXDrops() }
+func (p *rp2SerialPort) Readable() <-chan struct{} { return p.u.Readable() }
+func (p *rp2SerialPort) Writable() <-chan struct{} { return p.u.Writable() }
+func (p *rp2SerialPort) TryRead(b []byte) int      { return p.u.TryRead(b) }
+func (p *rp2SerialPort) TryWrite(b []byte) int     { return p.u.TryWrite(b) }
+func (p *rp2SerialPort) Flush() error              { return p.u.Flush() }
 
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
 

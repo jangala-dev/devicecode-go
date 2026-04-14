@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash"
 	"hash/crc32"
+	"runtime"
 	"strings"
 	"time"
 
@@ -78,6 +79,14 @@ func readyNext(v uint32) *uint32 {
 
 func u32s(v uint32) string {
 	return strconvx.Itoa(int(v))
+}
+
+func textPreview(s string) string {
+	return tracePreview([]byte(s))
+}
+
+func textTailPreview(s string) string {
+	return traceTailPreview([]byte(s))
 }
 
 func infoPayload(info transferInfo) json.RawMessage {
@@ -270,6 +279,8 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 			"seq", u32s(msg.Seq),
 			"off", u32s(msg.Off),
 			"data_len", u32s(uint32(len(msg.Data))),
+			"data_head", textPreview(msg.Data),
+			"data_tail", textTailPreview(msg.Data),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "decode_failed")
 		return
@@ -286,6 +297,8 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 			"n", u32s(msg.N),
 			"data_len", u32s(uint32(len(msg.Data))),
 			"decoded", u32s(uint32(len(raw))),
+			"data_head", textPreview(msg.Data),
+			"data_tail", textTailPreview(msg.Data),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
 		return
@@ -335,9 +348,12 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 			"seq", u32s(msg.Seq),
 			"off", u32s(msg.Off),
 			"n", u32s(msg.N),
+			"data_len", u32s(uint32(len(msg.Data))),
 			"bytes_written", u32s(cur.bytesWritten),
 		)
 	}
+	raw = nil
+	runtime.GC()
 	s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "")
 }
 

@@ -391,14 +391,13 @@ func (r *Reactor) OnTempDeciC(label string, deci int) {
 
 func (r *Reactor) emitMemSnapshot() {
 	var ms runtime.MemStats
-	runtime.GC()
 	runtime.ReadMemStats(&ms)
-	log.Println(
-		"[mem] ",
-		"alloc:", int(ms.Alloc), " ",
-		"heapSys:", int(ms.HeapSys), " ",
-		"mallocs:", int(ms.Mallocs), " ",
-		"frees:", int(ms.Frees),
+	println(
+		"[mem]",
+		"alloc", int(ms.Alloc),
+		"heapSys", int(ms.HeapSys),
+		"mallocs", int(ms.Mallocs),
+		"frees", int(ms.Frees),
 	)
 }
 
