@@ -28,6 +28,34 @@
       ],
       "interface": "swd",
       "postLaunchCommands": ["monitor reset"]
+    },
+    {
+      "name": "Debug Pico (rp2040) QA",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "openocd",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/devicecode.elf",
+      "preLaunchTask": "TinyGo Build (rp2040,QA)",
+      "configFiles": [
+        "debug/openocd_rp2040.cfg"
+      ],
+      "interface": "swd",
+      "postLaunchCommands": ["monitor reset"]
+    },
+    {
+      "name": "Debug Pico 2 (rp2350) QA",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "openocd",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/devicecode.elf",
+      "preLaunchTask": "TinyGo Build (rp2350,QA)",
+      "configFiles": [
+        "debug/openocd_rp2350.cfg"
+      ],
+      "interface": "swd",
+      "postLaunchCommands": ["monitor reset"]
     }
   ]
 }
