@@ -15,7 +15,7 @@ import (
 	"devicecode-go/x/strconvx"
 )
 
-const postTransferDoneSettle = 10 * time.Millisecond
+const postTransferDoneSettle = 250 * time.Millisecond
 const transferProgressLogEvery = 32
 
 type transferMeta struct {
