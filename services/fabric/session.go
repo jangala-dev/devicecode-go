@@ -135,12 +135,12 @@ type linkStatePayload struct {
 // cooperative scheduler panics if multiple goroutines contend on
 // the bus's internal sync.Mutex.
 type session struct {
-	linkID          string
-	nodeID          string
-	peerID          string
+	linkID   string
+	nodeID   string
+	peerID   string
 	localSID string
 	tr       Transport
-	conn            *bus.Connection
+	conn     *bus.Connection
 
 	link           linkState
 	peerNode       string
@@ -378,48 +378,37 @@ func (s *session) dispatch(line []byte) {
 	switch t {
 	case msgHello:
 		typedDispatch(s, line, s.onHello)
+		return
 	case msgHelloAck:
 		typedDispatch(s, line, s.onHelloAck)
+		return
+	}
+
+	if !s.requireLinkUp(t) {
+		return
+	}
+
+	switch t {
 	case msgPing:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onPing)
-		}
+		typedDispatch(s, line, s.onPing)
 	case msgPong:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onPong)
-		}
+		typedDispatch(s, line, s.onPong)
 	case msgPub:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onPub)
-		}
+		typedDispatch(s, line, s.onPub)
 	case msgUnretain:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onUnretain)
-		}
+		typedDispatch(s, line, s.onUnretain)
 	case msgCall:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onCall)
-		}
+		typedDispatch(s, line, s.onCall)
 	case msgReply:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onReply)
-		}
+		typedDispatch(s, line, s.onReply)
 	case msgXferBegin:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onTransferBegin)
-		}
+		typedDispatch(s, line, s.onTransferBegin)
 	case msgXferChunk:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onTransferChunk)
-		}
+		typedDispatch(s, line, s.onTransferChunk)
 	case msgXferCommit:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onTransferCommit)
-		}
+		typedDispatch(s, line, s.onTransferCommit)
 	case msgXferAbort:
-		if s.requireLinkUp(t) {
-			typedDispatch(s, line, s.onTransferAbort)
-		}
+		typedDispatch(s, line, s.onTransferAbort)
 	default:
 		s.logKV("unknown message type dropped", "type", t)
 	}
