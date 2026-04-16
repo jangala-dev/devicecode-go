@@ -32,12 +32,12 @@ func newLocalSID() string {
 // arrives within the timeout.
 func Run(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID string) {
 	s := session{
-		linkID:          defaultLinkID,
-		nodeID:          nodeID,
-		peerID:          peerID,
-		localSID:        newLocalSID(),
-		tr:   tr,
-		conn: conn,
+		linkID:   defaultLinkID,
+		nodeID:   nodeID,
+		peerID:   peerID,
+		localSID: newLocalSID(),
+		tr:       tr,
+		conn:     conn,
 	}
 	s.run(ctx)
 }
