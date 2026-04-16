@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync/atomic"
 
-	"pico2-a-b/abupdate"
-
 	"devicecode-go/bus"
 	"devicecode-go/x/strconvx"
 )
@@ -38,17 +36,9 @@ func Run(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID
 		nodeID:          nodeID,
 		peerID:          peerID,
 		localSID:        newLocalSID(),
-		activePartition: activePartitionForLogs(),
 		tr:              tr,
 		conn:            conn,
 		transferFactory: newTransferFactory(),
 	}
 	s.run(ctx)
-}
-
-func activePartitionForLogs() string {
-	if pp, rc := abupdate.ActivePartition(); rc == 0 {
-		return abupdate.FormatPartition(pp)
-	}
-	return "unknown"
 }

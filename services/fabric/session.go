@@ -138,9 +138,8 @@ type session struct {
 	linkID          string
 	nodeID          string
 	peerID          string
-	localSID        string
-	activePartition string
-	tr              Transport
+	localSID string
+	tr       Transport
 	conn            *bus.Connection
 
 	link           linkState
@@ -963,5 +962,5 @@ func (s *session) logWaiting() {
 	if s.peerSID != "" {
 		return
 	}
-	s.logKV("waiting for connection start", "partition", s.activePartition)
+	s.log("waiting for connection start")
 }
