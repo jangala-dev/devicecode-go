@@ -17,11 +17,6 @@ import (
 
 const fabricWaitLogInterval = 2 * time.Second
 
-const (
-	fabricSerialRXSize = 4096
-	fabricSerialTXSize = 4096
-)
-
 // -----------------------------------------------------------------------------
 // Thresholds & timing
 // -----------------------------------------------------------------------------
@@ -509,14 +504,9 @@ func (r *Reactor) Run(ctx context.Context) {
 	subSessClosedTele := r.uiConn.Subscribe(tSessClosed(uartTele))
 	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
 
-	fabricOpenReq := types.SerialSessionOpen{
-		RXSize: fabricSerialRXSize,
-		TXSize: fabricSerialTXSize,
-	}
-
 	// Kick open requests (fire-and-forget; events carry handles)
 	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), fabricOpenReq, false))
+	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 
 	// Retry back-off guards
 	var retryTeleAt, retryFabricAt time.Time
@@ -592,7 +582,7 @@ func (r *Reactor) Run(ctx context.Context) {
 			nextFabricWaitLog = time.Now()
 			log.Println("[uart1] fabric session closed")
 			if time.Now().After(retryFabricAt) {
-				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), fabricOpenReq, false))
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
 
