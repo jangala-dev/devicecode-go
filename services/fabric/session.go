@@ -6,8 +6,6 @@ import (
 	"errors"
 	"time"
 
-	"pico2-a-b/abupdate"
-
 	"devicecode-go/bus"
 	"devicecode-go/types"
 	"devicecode-go/x/strconvx"
@@ -90,7 +88,6 @@ type dumpReply struct {
 	Applied     bool            `json:"applied"`
 	ConfigCount int             `json:"config_count,omitempty"`
 	ConfigError string          `json:"config_error,omitempty"`
-	Partition   string          `json:"partition,omitempty"`
 }
 
 type inboundCall struct {
@@ -601,11 +598,6 @@ func (s *session) onCall(msg *protoCall) {
 		}
 		s.conn.Unsubscribe(sub)
 
-		partition := ""
-		if pp, rc := abupdate.ActivePartition(); rc == 0 {
-			partition = abupdate.FormatPartition(pp)
-		}
-
 		reply := dumpReply{
 			OK:          true,
 			Method:      "dump",
@@ -614,7 +606,6 @@ func (s *session) onCall(msg *protoCall) {
 			Applied:     s.configApplied,
 			ConfigCount: s.configCount,
 			ConfigError: s.lastConfigErr,
-			Partition:   partition,
 		}
 		s.sendFrame(marshal(protoReply{T: msgReply, Corr: msg.ID, OK: true, Payload: mustMarshal(reply)}))
 		return
