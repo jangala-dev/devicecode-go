@@ -471,12 +471,13 @@ func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 func (r *Reactor) emitMemSnapshot() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	println(
-		"[mem]",
-		"alloc", int(ms.Alloc),
-		"heapSys", int(ms.HeapSys),
-		"mallocs", int(ms.Mallocs),
-		"frees", int(ms.Frees),
+	// log line
+	log.Println(
+		"[mem] ",
+		"alloc:", int(ms.Alloc), " ",
+		"heapSys:", int(ms.HeapSys), " ",
+		"mallocs:", int(ms.Mallocs), " ",
+		"frees:", int(ms.Frees),
 	)
 	// JSON (minimal to keep overhead low)
 	if r.jsonOut != nil {
