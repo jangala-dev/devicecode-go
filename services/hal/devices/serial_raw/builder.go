@@ -323,7 +323,7 @@ func (d *Device) stopSession() {
 
 // ---- Reactor (single goroutine) ----
 
-func (d *Device) logRxCountersIfDue(s *session, force bool) {
+func (d *Device) logRingFullChange(s *session, force bool) {
 	const rxLogMinInterval = 1 * time.Second
 
 	hits := s.rxRingFull
@@ -411,10 +411,10 @@ func (d *Device) reactor(s *session) {
 		}
 
 		// Idle: wait for any edge, then re-check.
-		d.logRxCountersIfDue(s, false)
+		d.logRingFullChange(s, false)
 		select {
 		case <-s.ctx.Done():
-			d.logRxCountersIfDue(s, true)
+			d.logRingFullChange(s, true)
 			return
 		case <-u.Readable():
 		case <-u.Writable():
