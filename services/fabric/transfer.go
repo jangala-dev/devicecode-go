@@ -81,10 +81,6 @@ func textPreview(s string) string {
 	return tracePreview([]byte(s))
 }
 
-func textTailPreview(s string) string {
-	return traceTailPreview([]byte(s))
-}
-
 func infoPayload(info transferInfo) json.RawMessage {
 	if info.isZero() {
 		return nil
@@ -277,7 +273,6 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 			"off", u32s(msg.Off),
 			"data_len", u32s(uint32(len(msg.Data))),
 			"data_head", textPreview(msg.Data),
-			"data_tail", textTailPreview(msg.Data),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "decode_failed")
 		return
@@ -295,7 +290,6 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 			"data_len", u32s(uint32(len(msg.Data))),
 			"decoded", u32s(uint32(len(raw))),
 			"data_head", textPreview(msg.Data),
-			"data_tail", textTailPreview(msg.Data),
 		)
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
 		return
