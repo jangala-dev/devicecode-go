@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"ab-bringup/abupdate"
+	"pico2-a-b/abupdate"
 )
 
 const rp2350TransferStageSize = 4096

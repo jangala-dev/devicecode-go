@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	"ab-bringup/abupdate"
+	"pico2-a-b/abupdate"
 
 	"devicecode-go/bus"
 	"devicecode-go/x/strconvx"

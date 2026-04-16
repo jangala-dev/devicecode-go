@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"ab-bringup/abupdate"
+	"pico2-a-b/abupdate"
 
 	"devicecode-go/bus"
 	"devicecode-go/types"
