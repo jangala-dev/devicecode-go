@@ -14,8 +14,6 @@ const rp2350TransferStageSize = 4096
 
 var errTransferUnsupported = errors.New("unsupported")
 
-type rp2350TransferFactory struct{}
-
 type rp2350TransferSink struct {
 	updater *abupdate.Updater
 
@@ -26,11 +24,7 @@ type rp2350TransferSink struct {
 	accepted  uint32
 }
 
-func newTransferFactory() transferFactory {
-	return rp2350TransferFactory{}
-}
-
-func (rp2350TransferFactory) Begin(meta transferMeta) (transferSink, error) {
+func beginTransfer(meta transferMeta) (transferSink, error) {
 	if meta.Kind != "firmware.rp2350" || meta.Format != "bin" {
 		return nil, errTransferUnsupported
 	}

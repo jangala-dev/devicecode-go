@@ -158,7 +158,7 @@ type session struct {
 	outboundCalls    []*outboundCall
 	nextOutboundID   uint64
 	incomingTransfer *incomingTransfer
-	transferFactory  transferFactory
+	beginTransfer    func(transferMeta) (transferSink, error)
 
 	// Config state — tracks config/device → config/hal translation.
 	configApplied bool
@@ -176,10 +176,6 @@ func (s *session) logKV(msg, key, value string) {
 
 // run is the main loop. Blocks until ctx is cancelled.
 func (s *session) run(ctx context.Context) {
-	if s.transferFactory == nil {
-		s.transferFactory = newTransferFactory()
-	}
-
 	lines := make(chan readResult, lineQueueSize)
 
 	go func() {

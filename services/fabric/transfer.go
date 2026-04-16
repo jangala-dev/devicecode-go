@@ -40,10 +40,6 @@ func (i transferInfo) isZero() bool {
 	return i.BytesWritten == 0 && i.SlotXIPAddr == 0
 }
 
-type transferFactory interface {
-	Begin(meta transferMeta) (transferSink, error)
-}
-
 type transferSink interface {
 	WriteChunk(seq, off uint32, data []byte) error
 	Commit() (transferInfo, error)
@@ -212,10 +208,11 @@ func (s *session) onTransferBegin(msg *protoMsg) {
 		s.sendTransferReady(meta.ID, false, nil, "unsupported_encoding")
 		return
 	}
-	if s.transferFactory == nil {
-		s.transferFactory = newTransferFactory()
+	beginFn := s.beginTransfer
+	if beginFn == nil {
+		beginFn = beginTransfer
 	}
-	sink, err := s.transferFactory.Begin(meta)
+	sink, err := beginFn(meta)
 	if err != nil {
 		s.sendTransferReady(meta.ID, false, nil, err.Error())
 		return

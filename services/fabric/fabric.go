@@ -36,9 +36,8 @@ func Run(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID
 		nodeID:          nodeID,
 		peerID:          peerID,
 		localSID:        newLocalSID(),
-		tr:              tr,
-		conn:            conn,
-		transferFactory: newTransferFactory(),
+		tr:   tr,
+		conn: conn,
 	}
 	s.run(ctx)
 }

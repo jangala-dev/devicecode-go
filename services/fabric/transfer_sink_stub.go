@@ -6,13 +6,6 @@ import "errors"
 
 var errTransferUnsupported = errors.New("unsupported")
 
-type unsupportedTransferFactory struct{}
-
-func newTransferFactory() transferFactory {
-	return unsupportedTransferFactory{}
-}
-
-func (unsupportedTransferFactory) Begin(meta transferMeta) (transferSink, error) {
-	_ = meta
+func beginTransfer(meta transferMeta) (transferSink, error) {
 	return nil, errTransferUnsupported
 }

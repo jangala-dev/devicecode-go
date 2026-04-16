@@ -13,23 +13,6 @@ import (
 	"devicecode-go/bus"
 )
 
-type fakeTransferFactory struct {
-	beginMeta transferMeta
-	beginErr  error
-	sink      *fakeTransferSink
-}
-
-func (f *fakeTransferFactory) Begin(meta transferMeta) (transferSink, error) {
-	f.beginMeta = meta
-	if f.beginErr != nil {
-		return nil, f.beginErr
-	}
-	if f.sink == nil {
-		f.sink = &fakeTransferSink{}
-	}
-	return f.sink, nil
-}
-
 type fakeTransferSink struct {
 	seqs         []uint32
 	offs         []uint32
@@ -71,15 +54,17 @@ func (s *fakeTransferSink) Abort(reason string) error {
 	return nil
 }
 
-func runSessionWithFactory(ctx context.Context, tr Transport, conn *bus.Connection, factory transferFactory) {
+func runSessionWithSink(ctx context.Context, tr Transport, conn *bus.Connection, sink *fakeTransferSink) {
 	s := session{
-		linkID:          defaultLinkID,
-		nodeID:          "mcu-1",
-		peerID:          "cm5-local",
-		localSID:        "mcu-sid-test",
-		tr:              tr,
-		conn:            conn,
-		transferFactory: factory,
+		linkID:   defaultLinkID,
+		nodeID:   "mcu-1",
+		peerID:   "cm5-local",
+		localSID: "mcu-sid-test",
+		tr:       tr,
+		conn:     conn,
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			return sink, nil
+		},
 	}
 	s.run(ctx)
 }
@@ -131,16 +116,14 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	factory := &fakeTransferFactory{
-		sink: &fakeTransferSink{
-			commitInfo: transferInfo{
-				BytesWritten: 10,
-				SlotXIPAddr:  0x10280000,
-			},
+	sink := &fakeTransferSink{
+		commitInfo: transferInfo{
+			BytesWritten: 10,
+			SlotXIPAddr:  0x10280000,
 		},
 	}
 
-	go runSessionWithFactory(ctx, mcu, b.NewConnection("fabric"), factory)
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
 	bringUp(t, cm5)
 
 	payload := []byte("abcdefghij")
@@ -204,15 +187,15 @@ func TestTransferReceiveSuccess(t *testing.T) {
 		t.Fatalf("bad transfer info: %+v", info)
 	}
 
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(postTransferDoneSettle + 50*time.Millisecond)
 
-	if got := string(factory.sink.writes[0]) + string(factory.sink.writes[1]) + string(factory.sink.writes[2]); got != string(payload) {
+	if got := string(sink.writes[0]) + string(sink.writes[1]) + string(sink.writes[2]); got != string(payload) {
 		t.Fatalf("sink writes = %q, want %q", got, payload)
 	}
-	if !factory.sink.committed {
+	if !sink.committed {
 		t.Fatal("sink.Commit was not called")
 	}
-	if !factory.sink.applied {
+	if !sink.applied {
 		t.Fatal("sink.Apply was not called")
 	}
 }
@@ -223,8 +206,8 @@ func TestTransferChunkBadCRCRequestsResend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	factory := &fakeTransferFactory{sink: &fakeTransferSink{}}
-	go runSessionWithFactory(ctx, mcu, b.NewConnection("fabric"), factory)
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -256,8 +239,8 @@ func TestTransferChunkBadCRCRequestsResend(t *testing.T) {
 	if need.Next != 0 || need.Err != "bad_crc" {
 		t.Fatalf("bad xfer_need: %+v", need)
 	}
-	if len(factory.sink.writes) != 0 {
-		t.Fatalf("sink received %d writes, want 0", len(factory.sink.writes))
+	if len(sink.writes) != 0 {
+		t.Fatalf("sink received %d writes, want 0", len(sink.writes))
 	}
 }
 
@@ -267,8 +250,8 @@ func TestTransferCommitHashMismatchReturnsDoneError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	factory := &fakeTransferFactory{sink: &fakeTransferSink{}}
-	go runSessionWithFactory(ctx, mcu, b.NewConnection("fabric"), factory)
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -308,7 +291,7 @@ func TestTransferCommitHashMismatchReturnsDoneError(t *testing.T) {
 	if done.OK || done.Err != "sha256_mismatch" {
 		t.Fatalf("bad xfer_done: %+v", done)
 	}
-	if len(factory.sink.abortReasons) == 0 {
+	if len(sink.abortReasons) == 0 {
 		t.Fatal("expected sink abort on hash mismatch")
 	}
 }
