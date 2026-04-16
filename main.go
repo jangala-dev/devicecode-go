@@ -4,21 +4,16 @@ import (
 	"context"
 	"time"
 
-	"pico2-a-b/abupdate"
-
 	"devicecode-go/bus"
 	"devicecode-go/services/hal"
 	"devicecode-go/services/reactor"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
-	"devicecode-go/x/strconvx"
 )
 
 // HAL
 const halTimeout = 5 * time.Second
 var halReadiness = bus.T("hal", "state")
-
-const firmwareVersion = "2026-04-09-transfer-rxfix-1"
 
 // -----------------------------------------------------------------------------
 // Main
@@ -50,13 +45,6 @@ func main() {
 			log.Println("[main] HAL not ready within timeout")
 			time.Sleep(2 * time.Second)
 		}
-	}
-
-	log.Println("[main] firmware version ", firmwareVersion)
-	if pp, rc := abupdate.ActivePartition(); rc == 0 {
-		log.Println("[main] active partition ", abupdate.FormatPartition(pp))
-	} else {
-		log.Println("[main] active partition unknown rc=", strconvx.Itoa(int(rc)))
 	}
 
 	// Reactor
