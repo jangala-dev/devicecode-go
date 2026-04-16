@@ -10,16 +10,16 @@ import (
 	"pico2-a-b/abupdate"
 )
 
-const rp2350TransferStageSize = 4096
+const stageSize = 4096
 
 var errTransferUnsupported = errors.New("unsupported")
 
-type rp2350TransferSink struct {
+type transferSinkImpl struct {
 	updater *abupdate.Updater
 
 	// Stage verified transfer bytes in protocol code so flash writes happen in
 	// larger batches instead of directly on every UART chunk.
-	stage     [rp2350TransferStageSize]byte
+	stage     [stageSize]byte
 	stageUsed uint32
 	accepted  uint32
 }
@@ -37,10 +37,10 @@ func beginTransfer(meta transferMeta) (transferSink, error) {
 		return nil, fmt.Errorf("begin_update:%d", rc)
 	}
 
-	return &rp2350TransferSink{updater: &updater}, nil
+	return &transferSinkImpl{updater: &updater}, nil
 }
 
-func (s *rp2350TransferSink) flushStage(seq uint32, force bool) error {
+func (s *transferSinkImpl) flushStage(seq uint32, force bool) error {
 	if s.stageUsed == 0 {
 		return nil
 	}
@@ -74,7 +74,7 @@ func (s *rp2350TransferSink) flushStage(seq uint32, force bool) error {
 	return nil
 }
 
-func (s *rp2350TransferSink) WriteChunk(seq, off uint32, data []byte) error {
+func (s *transferSinkImpl) WriteChunk(seq, off uint32, data []byte) error {
 	if s.accepted != off {
 		return fmt.Errorf("unexpected_offset:%d", s.accepted)
 	}
@@ -113,7 +113,7 @@ func (s *rp2350TransferSink) WriteChunk(seq, off uint32, data []byte) error {
 	return nil
 }
 
-func (s *rp2350TransferSink) Commit() (transferInfo, error) {
+func (s *transferSinkImpl) Commit() (transferInfo, error) {
 	if err := s.flushStage(0, true); err != nil {
 		return transferInfo{}, err
 	}
@@ -126,14 +126,14 @@ func (s *rp2350TransferSink) Commit() (transferInfo, error) {
 	}, nil
 }
 
-func (s *rp2350TransferSink) Apply() error {
+func (s *transferSinkImpl) Apply() error {
 	if rc := s.updater.RebootIntoSlot(); rc != 0 {
 		return fmt.Errorf("reboot:%d", rc)
 	}
 	return nil
 }
 
-func (s *rp2350TransferSink) Abort(reason string) error {
+func (s *transferSinkImpl) Abort(reason string) error {
 	_ = reason
 	s.stageUsed = 0
 	return nil

@@ -69,26 +69,15 @@ func sha256Hex(h hash.Hash) string {
 	return hex.EncodeToString(sum)
 }
 
-func readyNext(v uint32) *uint32 {
-	return &v
-}
-
 func u32s(v uint32) string {
 	return strconvx.Itoa(int(v))
-}
-
-func textPreview(s string) string {
-	return tracePreview([]byte(s))
 }
 
 func infoPayload(info transferInfo) json.RawMessage {
 	if info.isZero() {
 		return nil
 	}
-	b, err := json.Marshal(info)
-	if err != nil {
-		return nil
-	}
+	b, _ := json.Marshal(info)
 	return json.RawMessage(b)
 }
 
@@ -227,7 +216,7 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		"chunks", u32s(meta.Chunks),
 		"chunk_raw", u32s(meta.ChunkRaw),
 	)
-	s.sendTransferReady(meta.ID, true, readyNext(0), "")
+	s.sendTransferReady(meta.ID, true, new(uint32), "")
 }
 
 func (s *session) onTransferChunk(msg *protoXferChunk) {
@@ -237,94 +226,57 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 		return
 	}
 	if msg.Seq != cur.expectedNext {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "unexpected_seq",
-			"seq", u32s(msg.Seq),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "unexpected_seq", "seq", u32s(msg.Seq))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "unexpected_seq")
 		return
 	}
 	if msg.Off != cur.bytesWritten {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "unexpected_offset",
-			"off", u32s(msg.Off),
-			"want_off", u32s(cur.bytesWritten),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "unexpected_offset", "off", u32s(msg.Off), "want_off", u32s(cur.bytesWritten))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "unexpected_offset")
 		return
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(msg.Data)
 	if err != nil {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "decode_failed",
-			"seq", u32s(msg.Seq),
-			"off", u32s(msg.Off),
-			"data_len", u32s(uint32(len(msg.Data))),
-			"data_head", textPreview(msg.Data),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "decode_failed", "seq", u32s(msg.Seq), "off", u32s(msg.Off),
+			"data_len", u32s(uint32(len(msg.Data))))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "decode_failed")
 		return
 	}
 	if uint32(len(raw)) != msg.N || msg.N == 0 {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "size_mismatch",
-			"seq", u32s(msg.Seq),
-			"off", u32s(msg.Off),
-			"n", u32s(msg.N),
-			"data_len", u32s(uint32(len(msg.Data))),
-			"decoded", u32s(uint32(len(raw))),
-			"data_head", textPreview(msg.Data),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "size_mismatch", "seq", u32s(msg.Seq), "off", u32s(msg.Off),
+			"n", u32s(msg.N), "data_len", u32s(uint32(len(msg.Data))), "decoded", u32s(uint32(len(raw))))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
 		return
 	}
 	if crc32Hex(raw) != lowerHex(msg.CRC32) {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "bad_crc",
-			"seq", u32s(msg.Seq),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "bad_crc", "seq", u32s(msg.Seq))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "bad_crc")
 		return
 	}
 	if cur.bytesWritten+uint32(len(raw)) > cur.meta.Size {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_need sent",
-			"id", cur.meta.ID,
-			"next", u32s(cur.expectedNext),
-			"err", "size_mismatch",
-			"bytes_written", u32s(cur.bytesWritten),
-			"raw_len", u32s(uint32(len(raw))),
-			"total", u32s(cur.meta.Size),
-		)
+		println("[fabric]", "sid", s.localSID, "xfer_need sent",
+			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
+			"err", "size_mismatch", "bytes_written", u32s(cur.bytesWritten),
+			"raw_len", u32s(uint32(len(raw))), "total", u32s(cur.meta.Size))
 		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
 		return
 	}
 	if err := cur.sink.WriteChunk(msg.Seq, msg.Off, raw); err != nil {
 		s.logKV("transfer write failed", "err", err.Error())
-		_ = cur.sink.Abort(err.Error())
-		s.clearTransfer()
-		s.sendTransferDone(cur.meta.ID, false, transferInfo{}, err.Error())
+		id := cur.meta.ID
+		reason := err.Error()
+		s.abortTransfer(reason)
+		s.sendTransferDone(id, false, transferInfo{}, reason)
 		return
 	}
 	_, _ = cur.hasher.Write(raw)
@@ -354,38 +306,31 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		s.logKV("xfer_commit dropped", "id", msg.ID)
 		return
 	}
+	id := cur.meta.ID
 	if msg.Size != cur.meta.Size || cur.bytesWritten != cur.meta.Size {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_commit failed",
-			"id", cur.meta.ID,
-			"err", "size_mismatch",
+		println("[fabric]", "sid", s.localSID, "xfer_commit failed",
+			"id", id, "err", "size_mismatch",
 			"bytes_written", u32s(cur.bytesWritten),
-			"msg_size", u32s(msg.Size),
-			"meta_size", u32s(cur.meta.Size),
-		)
-		_ = cur.sink.Abort("size_mismatch")
-		s.clearTransfer()
-		s.sendTransferDone(cur.meta.ID, false, transferInfo{}, "size_mismatch")
+			"msg_size", u32s(msg.Size), "meta_size", u32s(cur.meta.Size))
+		s.abortTransfer("size_mismatch")
+		s.sendTransferDone(id, false, transferInfo{}, "size_mismatch")
 		return
 	}
 	if lowerHex(msg.SHA256) != cur.meta.SHA256 || sha256Hex(cur.hasher) != cur.meta.SHA256 {
-		println("[fabric]", "sid", s.localSID, "xfer_commit failed", "id", cur.meta.ID, "err", "sha256_mismatch")
-		_ = cur.sink.Abort("sha256_mismatch")
-		s.clearTransfer()
-		s.sendTransferDone(cur.meta.ID, false, transferInfo{}, "sha256_mismatch")
+		s.logKV("xfer_commit failed: sha256_mismatch", "id", id)
+		s.abortTransfer("sha256_mismatch")
+		s.sendTransferDone(id, false, transferInfo{}, "sha256_mismatch")
 		return
 	}
 	info, err := cur.sink.Commit()
 	if err != nil {
 		s.logKV("transfer commit failed", "err", err.Error())
-		_ = cur.sink.Abort(err.Error())
-		s.clearTransfer()
-		s.sendTransferDone(cur.meta.ID, false, transferInfo{}, err.Error())
+		reason := err.Error()
+		s.abortTransfer(reason)
+		s.sendTransferDone(id, false, transferInfo{}, reason)
 		return
 	}
 	sink := cur.sink
-	id := cur.meta.ID
 	s.clearTransfer()
 	println(
 		"[fabric]", "sid", s.localSID,
@@ -414,9 +359,6 @@ func (s *session) onTransferAbort(msg *protoXferAbort) {
 	if reason == "" {
 		reason = "remote_abort"
 	}
-	if err := cur.sink.Abort(reason); err != nil {
-		s.logKV("transfer abort failed", "err", err.Error())
-	}
 	println("[fabric]", "sid", s.localSID, "xfer_abort received", "id", cur.meta.ID, "reason", reason)
-	s.clearTransfer()
+	s.abortTransfer(reason)
 }
