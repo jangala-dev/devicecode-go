@@ -18,14 +18,8 @@ import (
 const fabricWaitLogInterval = 2 * time.Second
 
 const (
-	// RX matches the uartx software RX ring so neither becomes the
-	// bottleneck during firmware transfer bursts.
 	fabricSerialRXSize = 4096
-	// TX is sized to hold one max-size wire frame (fabric.maxLineLen
-	// = 2048 + \n). MCU-outbound traffic is dominated by small frames;
-	// the rare 2 KiB frame (e.g. hal/dump reply) drains in ~185 ms at
-	// 115200 baud — well inside the main-loop stall budget.
-	fabricSerialTXSize = 2048
+	fabricSerialTXSize = 4096
 )
 
 // -----------------------------------------------------------------------------
