@@ -1058,10 +1058,12 @@ func TestDumpCallDoesNotBlockPing(t *testing.T) {
 		line []byte
 		err  error
 	}
-	// Both should arrive — dump reply and pong, in either order.
+	type wireHeader struct {
+		T string `json:"t"`
+	}
 	var gotReply, gotPong bool
 	for i := 0; i < 2; i++ {
-		msg := readMsg[protoMsg](t, cm5)
+		msg := readMsg[wireHeader](t, cm5)
 		switch msg.T {
 		case msgReply:
 			gotReply = true

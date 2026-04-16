@@ -149,7 +149,7 @@ func (s *session) abortTransfer(reason string) {
 	}
 }
 
-func validateTransferBegin(msg *protoMsg) (transferMeta, string) {
+func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 	if msg.ID == "" {
 		return transferMeta{}, "xfer_begin.id"
 	}
@@ -191,7 +191,7 @@ func validateTransferBegin(msg *protoMsg) (transferMeta, string) {
 	}, ""
 }
 
-func (s *session) onTransferBegin(msg *protoMsg) {
+func (s *session) onTransferBegin(msg *protoXferBegin) {
 	meta, errStr := validateTransferBegin(msg)
 	if errStr != "" {
 		if msg.ID != "" {
@@ -234,7 +234,7 @@ func (s *session) onTransferBegin(msg *protoMsg) {
 	s.sendTransferReady(meta.ID, true, readyNext(0), "")
 }
 
-func (s *session) onTransferChunk(msg *protoMsg) {
+func (s *session) onTransferChunk(msg *protoXferChunk) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.meta.ID != msg.ID {
 		s.logKV("xfer_chunk dropped", "id", msg.ID)
@@ -354,7 +354,7 @@ func (s *session) onTransferChunk(msg *protoMsg) {
 	s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "")
 }
 
-func (s *session) onTransferCommit(msg *protoMsg) {
+func (s *session) onTransferCommit(msg *protoXferCommit) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.meta.ID != msg.ID {
 		s.logKV("xfer_commit dropped", "id", msg.ID)
@@ -410,7 +410,7 @@ func (s *session) onTransferCommit(msg *protoMsg) {
 	println("[fabric]", "sid", s.localSID, "transfer apply ok", "id", id)
 }
 
-func (s *session) onTransferAbort(msg *protoMsg) {
+func (s *session) onTransferAbort(msg *protoXferAbort) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.meta.ID != msg.ID {
 		s.logKV("xfer_abort dropped", "id", msg.ID)

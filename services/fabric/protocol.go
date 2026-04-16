@@ -150,44 +150,6 @@ type protoXferAbort struct {
 	Reason string `json:"reason"`
 }
 
-// protoMsg is a union struct for single-pass unmarshal in dispatch.
-// Fields are the superset of all message types. Only the fields
-// relevant to the T value are populated; the rest are zero.
-type protoMsg struct {
-	T         string          `json:"t"`
-	Node      string          `json:"node,omitempty"`
-	Peer      string          `json:"peer,omitempty"`
-	SID       string          `json:"sid,omitempty"`
-	Proto     int             `json:"proto,omitempty"`
-	OK        bool            `json:"ok,omitempty"`
-	Caps      *protoCaps      `json:"caps,omitempty"`
-	TS        int64           `json:"ts,omitempty"`
-	Topic     []string        `json:"topic,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
-	Retain    bool            `json:"retain,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Corr      string          `json:"corr,omitempty"`
-	TimeoutMs int             `json:"timeout_ms,omitempty"`
-	Err       string          `json:"err,omitempty"`
-	Kind      string          `json:"kind,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Format    string          `json:"format,omitempty"`
-	Enc       string          `json:"enc,omitempty"`
-	Size      uint32          `json:"size,omitempty"`
-	ChunkRaw  uint32          `json:"chunk_raw,omitempty"`
-	Chunks    uint32          `json:"chunks,omitempty"`
-	SHA256    string          `json:"sha256,omitempty"`
-	Meta      json.RawMessage `json:"meta,omitempty"`
-	Seq       uint32          `json:"seq,omitempty"`
-	Off       uint32          `json:"off,omitempty"`
-	N         uint32          `json:"n,omitempty"`
-	CRC32     string          `json:"crc32,omitempty"`
-	Data      string          `json:"data,omitempty"`
-	Next      uint32          `json:"next,omitempty"`
-	Reason    string          `json:"reason,omitempty"`
-	Info      json.RawMessage `json:"info,omitempty"`
-}
-
 // ---- codec helpers ----
 
 // marshal returns compact JSON with a trailing newline.

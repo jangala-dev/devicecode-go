@@ -367,82 +367,93 @@ func (s *session) promoteLink(reason string) {
 
 // ---- dispatch ----
 
-// validateInbound checks whether a message should be processed.
-// Handshake messages (hello, hello_ack) are always accepted.
-// All others require an established link and a matching session ID.
-func (s *session) validateInbound(msg *protoMsg) bool {
-	if msg.T == msgHello || msg.T == msgHelloAck {
-		return true
+func (s *session) dispatch(line []byte) {
+	t := protoType(line)
+	if t == "" {
+		s.logMalformed(line, nil)
+		return
 	}
+	s.markRx()
+
+	switch t {
+	case msgHello:
+		typedDispatch(s, line, s.onHello)
+	case msgHelloAck:
+		typedDispatch(s, line, s.onHelloAck)
+	case msgPing:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onPing)
+		}
+	case msgPong:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onPong)
+		}
+	case msgPub:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onPub)
+		}
+	case msgUnretain:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onUnretain)
+		}
+	case msgCall:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onCall)
+		}
+	case msgReply:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onReply)
+		}
+	case msgXferBegin:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onTransferBegin)
+		}
+	case msgXferChunk:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onTransferChunk)
+		}
+	case msgXferCommit:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onTransferCommit)
+		}
+	case msgXferAbort:
+		if s.requireLinkUp(t) {
+			typedDispatch(s, line, s.onTransferAbort)
+		}
+	default:
+		s.logKV("unknown message type dropped", "type", t)
+	}
+}
+
+func typedDispatch[T any](s *session, line []byte, handler func(*T)) {
+	var msg T
+	if err := json.Unmarshal(line, &msg); err != nil {
+		s.logMalformed(line, err)
+		return
+	}
+	handler(&msg)
+}
+
+func (s *session) requireLinkUp(t string) bool {
 	if s.link != linkUp {
-		s.logKV("dropped before handshake", "type", msg.T)
-		return false
-	}
-	if s.peerSID != "" && msg.SID != "" && msg.SID != s.peerSID {
-		s.logKV("dropped: wrong session", "type", msg.T)
+		s.logKV("dropped before handshake", "type", t)
 		return false
 	}
 	return true
 }
 
-func (s *session) dispatch(line []byte) {
-	var msg protoMsg
-	if err := json.Unmarshal(line, &msg); err != nil {
-		if cur := s.incomingTransfer; cur != nil {
-			println(
-				"[fabric]", "sid", s.localSID,
-				"malformed frame dropped",
-				"transfer_id", cur.meta.ID,
-				"expected_next", strconvx.Itoa(int(cur.expectedNext)),
-				"line_len", strconvx.Itoa(len(line)),
-				"line_head", tracePreview(line),
-				"line_tail", traceTailPreview(line),
-				"err", err.Error(),
-			)
-			return
-		}
-		println(
-			"[fabric]", "sid", s.localSID,
-			"malformed frame dropped",
-			"line_len", strconvx.Itoa(len(line)),
-			"line_head", tracePreview(line),
-			"line_tail", traceTailPreview(line),
-			"err", err.Error(),
-		)
-		return
+func (s *session) logMalformed(line []byte, err error) {
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
 	}
-	s.markRx()
-	if !s.validateInbound(&msg) {
-		return
-	}
-	switch msg.T {
-	case msgHello:
-		s.onHello(&msg)
-	case msgHelloAck:
-		s.onHelloAck(&msg)
-	case msgPing:
-		s.onPing(&msg)
-	case msgPong:
-		s.onPong(&msg)
-	case msgPub:
-		s.onPub(&msg)
-	case msgUnretain:
-		s.onUnretain(&msg)
-	case msgCall:
-		s.onCall(&msg)
-	case msgReply:
-		s.onReply(&msg)
-	case msgXferBegin:
-		s.onTransferBegin(&msg)
-	case msgXferChunk:
-		s.onTransferChunk(&msg)
-	case msgXferCommit:
-		s.onTransferCommit(&msg)
-	case msgXferAbort:
-		s.onTransferAbort(&msg)
-	default:
-		s.logKV("unknown message type dropped", "type", msg.T)
-	}
+	println(
+		"[fabric]", "sid", s.localSID,
+		"malformed frame dropped",
+		"line_len", strconvx.Itoa(len(line)),
+		"line_head", tracePreview(line),
+		"err", errStr,
+	)
 }
 
 // notePeerIdentity records the remote peer's node, SID, and proto version.
@@ -489,7 +500,7 @@ func hasWirePrefix(topic, prefix []string) bool {
 	return true
 }
 
-func (s *session) onHello(msg *protoMsg) {
+func (s *session) onHello(msg *protoHello) {
 	if msg.Peer != "" && msg.Peer != s.nodeID {
 		s.log("hello dropped: wrong peer")
 		return
@@ -515,7 +526,7 @@ func (s *session) onHello(msg *protoMsg) {
 	s.promoteLink(reason)
 }
 
-func (s *session) onHelloAck(msg *protoMsg) {
+func (s *session) onHelloAck(msg *protoHelloAck) {
 	if s.isSelfControlFrame(msg.Node, msg.SID) {
 		s.log("echoed hello_ack ignored")
 		return
@@ -530,7 +541,7 @@ func (s *session) onHelloAck(msg *protoMsg) {
 	s.promoteLink(reason)
 }
 
-func (s *session) onPing(msg *protoMsg) {
+func (s *session) onPing(msg *protoPing) {
 	s.logKV("ping rx", "peer_sid", msg.SID)
 	if !s.sendFrame(marshal(protoPong{T: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return
@@ -538,7 +549,7 @@ func (s *session) onPing(msg *protoMsg) {
 	s.log("pong tx")
 }
 
-func (s *session) onPong(msg *protoMsg) {
+func (s *session) onPong(msg *protoPong) {
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
 		return
@@ -546,7 +557,7 @@ func (s *session) onPong(msg *protoMsg) {
 	s.lastPongAt = s.lastRxAt
 }
 
-func (s *session) onPub(msg *protoMsg) {
+func (s *session) onPub(msg *protoPub) {
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
@@ -576,7 +587,7 @@ func (s *session) onPub(msg *protoMsg) {
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 }
 
-func (s *session) onUnretain(msg *protoMsg) {
+func (s *session) onUnretain(msg *protoUnretain) {
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming unretain dropped: no_route")
@@ -585,7 +596,7 @@ func (s *session) onUnretain(msg *protoMsg) {
 	s.conn.Publish(s.conn.NewMessage(localTopic, nil, true))
 }
 
-func (s *session) onCall(msg *protoMsg) {
+func (s *session) onCall(msg *protoCall) {
 	// rpc/hal/dump: handle directly — reply with config and HAL state.
 	if slicesEqualStrings(msg.Topic, dumpCallTopic) {
 		var halState *types.HALState
@@ -640,7 +651,7 @@ func (s *session) onCall(msg *protoMsg) {
 	})
 }
 
-func (s *session) onReply(msg *protoMsg) {
+func (s *session) onReply(msg *protoReply) {
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
 			continue
