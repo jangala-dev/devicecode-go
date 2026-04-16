@@ -52,11 +52,9 @@ type session struct {
 	txRing   *shmring.Ring
 
 	// Reactor-owned observability. Single writer only.
-	rxBytesTotal uint64
-	rxRingFull   uint32
-	rxLogAt      time.Time
-	rxLogHits    uint32
-	rxLogQuantum uint64
+	rxRingFull uint32
+	rxLogAt    time.Time
+	rxLogHits  uint32
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -326,21 +324,16 @@ func (d *Device) stopSession() {
 // ---- Reactor (single goroutine) ----
 
 func (d *Device) logRxCountersIfDue(s *session, force bool) {
-	const (
-		rxLogMinInterval  = 1 * time.Second
-		rxLogBytesQuantum = 64 * 1024
-	)
+	const rxLogMinInterval = 1 * time.Second
 
 	hits := s.rxRingFull
-	bytes := s.rxBytesTotal
-	quantum := bytes / rxLogBytesQuantum
 
 	if !force {
 		now := time.Now()
 		if now.Sub(s.rxLogAt) < rxLogMinInterval {
 			return
 		}
-		if hits == s.rxLogHits && quantum == s.rxLogQuantum {
+		if hits == s.rxLogHits {
 			return
 		}
 		s.rxLogAt = now
@@ -349,13 +342,11 @@ func (d *Device) logRxCountersIfDue(s *session, force bool) {
 	}
 
 	println(
-		"[serial-raw]", "rx",
+		"[serial-raw]", "rx_ring_full",
 		"uart", d.a.Name,
-		"bytes_total", strconvx.Utoa64(bytes),
-		"ring_full", strconvx.Utoa64(uint64(hits)),
+		"hits", strconvx.Utoa64(uint64(hits)),
 	)
 	s.rxLogHits = hits
-	s.rxLogQuantum = quantum
 }
 
 func (d *Device) reactor(s *session) {
@@ -381,7 +372,6 @@ func (d *Device) reactor(s *session) {
 			}
 			if n1 < len(p1) {
 				rxR.WriteCommit(n1)
-				s.rxBytesTotal += uint64(n1)
 				made = true
 				continue
 			}
@@ -390,7 +380,6 @@ func (d *Device) reactor(s *session) {
 				n2 = u.TryRead(p2)
 			}
 			rxR.WriteCommit(n1 + n2)
-			s.rxBytesTotal += uint64(n1 + n2)
 			made = true
 		}
 
