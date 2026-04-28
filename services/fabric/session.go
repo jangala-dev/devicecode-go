@@ -156,6 +156,9 @@ type session struct {
 	outboundCalls    []*outboundCall
 	nextOutboundID   uint64
 	nextPingAt       time.Time
+	txControl        txLane
+	txRPC            txLane
+	txBulk           txLane
 	incomingTransfer *incomingTransfer
 	beginTransfer    func(transferMeta) (transferSink, error)
 
@@ -508,7 +511,7 @@ func (s *session) onHello(msg *protoHello) {
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
-	if !s.sendFrame(marshal(protoHelloAck{
+	if !s.sendControl(marshal(protoHelloAck{
 		Type:  msgHelloAck,
 		Node:  s.nodeID,
 		SID:   s.localSID,
@@ -539,7 +542,7 @@ func (s *session) onHelloAck(msg *protoHelloAck) {
 
 func (s *session) onPing(msg *protoPing) {
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.sendFrame(marshal(protoPong{Type: msgPong, TS: msg.TS, SID: s.localSID})) {
+	if !s.sendControl(marshal(protoPong{Type: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return
 	}
 	s.log("pong tx")
@@ -555,7 +558,7 @@ func (s *session) tickPing(now time.Time) {
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
 		return
 	}
-	if !s.sendFrame(marshal(protoPing{Type: msgPing, TS: now.UnixMilli(), SID: s.localSID})) {
+	if !s.sendControl(marshal(protoPing{Type: msgPing, TS: now.UnixMilli(), SID: s.localSID})) {
 		return
 	}
 	s.nextPingAt = now.Add(s.cfg.PingInterval)
@@ -633,20 +636,20 @@ func (s *session) onCall(msg *protoCall) {
 			ConfigCount: s.configCount,
 			ConfigError: s.lastConfigErr,
 		}
-		s.sendFrame(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: true, Value: mustMarshal(reply)}))
+		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: true, Value: mustMarshal(reply)}))
 		return
 	}
 
 	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
 		s.log("incoming call dropped: busy")
-		s.sendFrame(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
+		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
 		return
 	}
 
 	localTopic := importCallTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming call dropped: no_route")
-		s.sendFrame(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
+		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return
 	}
 
@@ -807,7 +810,7 @@ func (s *session) drainExports() {
 					continue
 				}
 				if m.Retained && m.Payload == nil {
-					if !s.sendFrame(marshal(protoUnretain{
+					if !s.sendRPC(marshal(protoUnretain{
 						Type:  msgUnretain,
 						Topic: wire,
 					})) {
@@ -821,7 +824,7 @@ func (s *session) drainExports() {
 					s.logKV("export payload dropped", "err", err.Error())
 					continue
 				}
-				if !s.sendFrame(marshal(protoPub{
+				if !s.sendRPC(marshal(protoPub{
 					Type:    msgPub,
 					Topic:   wire,
 					Payload: payload,
@@ -850,25 +853,25 @@ func (s *session) drainInbound(now time.Time) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil // prevent double-unsubscribe in teardownInbound
 			if !ok || reply == nil {
-				if !s.sendFrame(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 					return
 				}
 				continue
 			}
 			if errStr := checkBusError(reply.Payload); errStr != "" {
-				if !s.sendFrame(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr})) {
+				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr})) {
 					return
 				}
 				continue
 			}
 			payload, err := marshalPayload(reply.Payload)
 			if err != nil {
-				if !s.sendFrame(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
+				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
 					return
 				}
 				continue
 			}
-			if !s.sendFrame(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Value: payload})) {
+			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Value: payload})) {
 				return
 			}
 			continue
@@ -878,7 +881,7 @@ func (s *session) drainInbound(now time.Time) {
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
-			if !s.sendFrame(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 				return
 			}
 			continue
@@ -924,7 +927,7 @@ func (s *session) drainOutbound(now time.Time) {
 							deadline: now.Add(callTimeoutDef),
 						})
 					}
-					if !s.sendFrame(marshal(protoCall{
+					if !s.sendRPC(marshal(protoCall{
 						Type:      msgCall,
 						ID:        corr,
 						Topic:     wireTopic,
@@ -959,23 +962,16 @@ func (s *session) drainOutbound(now time.Time) {
 
 // ---- transport write ----
 
-func (s *session) sendFrame(data []byte) bool {
-	if len(data) > 0 && data[len(data)-1] == '\n' {
-		data = data[:len(data)-1]
-	}
-	if err := s.tr.WriteLine(data); err != nil {
-		if errors.Is(err, ErrLineTooLong) {
-			// Oversized frame is dropped but the transport is still
-			// healthy — return true so the session continues.
-			s.log("oversized write dropped")
-			return true
-		}
-		s.handleLinkDown(reasonTransportWrite, err.Error())
-		return false
-	}
-	s.markTx()
-	return true
-}
+// sendControl, sendRPC, sendBulk are the lane-tagged enqueue entry
+// points used at every send site. They wrap enqueueFrame (defined in
+// writer.go) so the lane intent is explicit at the call site.
+//
+// Lane assignment per protocol.lua's FRAME_CLASS:
+//   control: hello, hello_ack, ping, pong, xfer_{begin,ready,need,commit,done,abort}
+//   rpc:     pub, unretain, call, reply
+//   bulk:    xfer_chunk (MCU does not originate; bulk lane unused on MCU)
+func (s *session) sendControl(data []byte) bool { return s.enqueueFrame(laneControl, data) }
+func (s *session) sendRPC(data []byte) bool     { return s.enqueueFrame(laneRPC, data) }
 
 func (s *session) logWaiting() {
 	if s.peerSID != "" {

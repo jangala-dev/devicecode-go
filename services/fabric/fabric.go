@@ -48,6 +48,11 @@ type LinkConfig struct {
 	// rpc_bridge.lua's `spawn_local_call_helper`. Lua default is 64
 	// (falls back to max_pending_calls); we keep that for parity.
 	MaxInboundHelpers int
+	// RPCQuantum and BulkQuantum control the writer's weighted
+	// round-robin between the rpc and bulk lanes after the control
+	// lane drains. Mirrors writer.lua's lane scheduler. Release: 4 and 1.
+	RPCQuantum  int
+	BulkQuantum int
 }
 
 func DefaultLinkConfig() LinkConfig {
@@ -57,6 +62,8 @@ func DefaultLinkConfig() LinkConfig {
 		PingInterval:      10 * time.Second,
 		LivenessTimeout:   30 * time.Second,
 		MaxInboundHelpers: 64,
+		RPCQuantum:        4,
+		BulkQuantum:       1,
 	}
 }
 
@@ -76,6 +83,12 @@ func (c *LinkConfig) applyDefaults() {
 	}
 	if c.MaxInboundHelpers == 0 {
 		c.MaxInboundHelpers = d.MaxInboundHelpers
+	}
+	if c.RPCQuantum == 0 {
+		c.RPCQuantum = d.RPCQuantum
+	}
+	if c.BulkQuantum == 0 {
+		c.BulkQuantum = d.BulkQuantum
 	}
 }
 

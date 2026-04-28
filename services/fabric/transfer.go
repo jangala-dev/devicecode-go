@@ -66,14 +66,14 @@ func u32s(v uint32) string {
 }
 
 func (s *session) sendTransferReady(id string) bool {
-	return s.sendFrame(marshal(protoXferReady{
+	return s.sendControl(marshal(protoXferReady{
 		Type:   msgXferReady,
 		XferID: id,
 	}))
 }
 
 func (s *session) sendTransferNeed(id string, next uint32) bool {
-	return s.sendFrame(marshal(protoXferNeed{
+	return s.sendControl(marshal(protoXferNeed{
 		Type:   msgXferNeed,
 		XferID: id,
 		Next:   next,
@@ -81,14 +81,14 @@ func (s *session) sendTransferNeed(id string, next uint32) bool {
 }
 
 func (s *session) sendTransferDone(id string) bool {
-	return s.sendFrame(marshal(protoXferDone{
+	return s.sendControl(marshal(protoXferDone{
 		Type:   msgXferDone,
 		XferID: id,
 	}))
 }
 
 func (s *session) sendTransferAbort(id, reason string) bool {
-	return s.sendFrame(marshal(protoXferAbort{
+	return s.sendControl(marshal(protoXferAbort{
 		Type:   msgXferAbort,
 		XferID: id,
 		Err:    reason,

@@ -483,6 +483,47 @@ func TestSessionPingsUnconditionally(t *testing.T) {
 	}
 }
 
+func TestWriterControlPreemptsRPCAndBulk(t *testing.T) {
+	// writer.lua drains the control lane first (no fairness); then
+	// weighted RR between rpc and bulk. Pre-load all three lanes and
+	// assert the drain order is: all control, then 4 rpc, then 1 bulk,
+	// then any remaining rpc/bulk (default rpc_quantum=4, bulk_quantum=1).
+	tr := &captureTransport{}
+	s := session{tr: tr, cfg: DefaultLinkConfig()}
+	s.txBulk.push([]byte(`{"type":"xfer_chunk","i":0}`))
+	s.txBulk.push([]byte(`{"type":"xfer_chunk","i":1}`))
+	for i := 0; i < 5; i++ {
+		s.txRPC.push([]byte(`{"type":"pub","i":` + string(rune('0'+i)) + `}`))
+	}
+	s.txControl.push([]byte(`{"type":"ping"}`))
+	s.txControl.push([]byte(`{"type":"xfer_need"}`))
+
+	if !s.flushWriter() {
+		t.Fatal("flushWriter returned false")
+	}
+	if len(tr.writes) != 9 {
+		t.Fatalf("writes = %d, want 9", len(tr.writes))
+	}
+	// Control drains first.
+	want := []string{
+		`{"type":"ping"}`,
+		`{"type":"xfer_need"}`,
+		// Then RR: 4 rpc, 1 bulk, 1 rpc, 1 bulk, 0 (no more bulk; remaining rpc).
+		`{"type":"pub","i":0}`,
+		`{"type":"pub","i":1}`,
+		`{"type":"pub","i":2}`,
+		`{"type":"pub","i":3}`,
+		`{"type":"xfer_chunk","i":0}`,
+		`{"type":"pub","i":4}`,
+		`{"type":"xfer_chunk","i":1}`,
+	}
+	for i, w := range want {
+		if string(tr.writes[i]) != w {
+			t.Fatalf("write[%d] = %q, want %q", i, tr.writes[i], w)
+		}
+	}
+}
+
 func TestInboundCallBusyAtCapacity(t *testing.T) {
 	// rpc_bridge.lua's spawn_local_call_helper rejects with err="busy"
 	// when inbound_helpers >= max_inbound_helpers, before the route check.
