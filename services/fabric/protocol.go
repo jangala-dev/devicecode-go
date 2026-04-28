@@ -1,9 +1,6 @@
 package fabric
 
-import (
-	"bytes"
-	"encoding/json"
-)
+import "encoding/json"
 
 // ---- Wire message type identifiers ----
 //
@@ -172,64 +169,175 @@ func marshal(v any) []byte {
 	return append(b, '\n')
 }
 
-// protoType extracts the "type" field from a JSON line via a manual
-// byte scan rather than json.Unmarshal. TinyGo's encoding/json reflect
-// path was observed silently dropping the field for envelopes with
-// preceding sibling keys (e.g. {"sid":"…","node":"…","type":"hello"})
-// during real-CM5 traffic — frames parsed cleanly under standard Go
-// in tests but came back with Type="" on hardware. This scan finds the
-// first top-level "type":"…" pair, tolerates whitespace, and assumes
-// the value contains no escape sequences (true for every wire type
-// constant defined above).
+// protoType extracts the wire-discriminator "type" field from a JSON
+// envelope via a depth-aware scan. We avoid json.Unmarshal here because
+// TinyGo's reflect path was observed silently leaving the field empty
+// for tagged anonymous-struct targets when the envelope had preceding
+// sibling keys.
+//
+// Returns the value of the FIRST top-level (object-depth 1) "type" key,
+// ignoring any nested "type" keys inside payload/meta sub-objects —
+// e.g. for `{"payload":{"type":"x"},"type":"pub"}` the result is "pub".
+// Returns "" if the line isn't a JSON object, the top-level "type" key
+// is missing, or its value isn't a string.
 func protoType(line []byte) string {
-	const key = `"type"`
-	rest := line
+	n := len(line)
+	i := skipJSONSpace(line, 0)
+	if i >= n || line[i] != '{' {
+		return ""
+	}
+	i++
 	for {
-		idx := bytes.Index(rest, []byte(key))
-		if idx < 0 {
+		i = skipJSONSpace(line, i)
+		if i >= n {
 			return ""
 		}
-		// Reject matches inside another string value (e.g. someone
-		// publishing a payload that contains the literal "type").
-		// Simple heuristic: the byte preceding the key must be one of
-		// '{', ',' or whitespace at the top level. Good enough for our
-		// flat envelopes.
-		if idx > 0 {
-			b := rest[idx-1]
-			if b != '{' && b != ',' && b != ' ' && b != '\t' && b != '\n' && b != '\r' {
-				rest = rest[idx+len(key):]
-				continue
+		switch line[i] {
+		case '}':
+			return ""
+		case ',':
+			i++
+			continue
+		}
+		if line[i] != '"' {
+			return ""
+		}
+		keyStart := i + 1
+		keyEnd, ok := scanJSONString(line, i)
+		if !ok {
+			return ""
+		}
+		i = keyEnd
+		i = skipJSONSpace(line, i)
+		if i >= n || line[i] != ':' {
+			return ""
+		}
+		i++
+		i = skipJSONSpace(line, i)
+		if i >= n {
+			return ""
+		}
+		isType := keyEnd-1-keyStart == 4 &&
+			line[keyStart] == 't' && line[keyStart+1] == 'y' &&
+			line[keyStart+2] == 'p' && line[keyStart+3] == 'e'
+		if isType {
+			if line[i] != '"' {
+				return ""
 			}
+			valStart := i + 1
+			valEnd, ok := scanJSONString(line, i)
+			if !ok {
+				return ""
+			}
+			return string(line[valStart : valEnd-1])
 		}
-		v := skipColonAndQuote(rest[idx+len(key):])
-		if v == nil {
+		i, ok = skipJSONValue(line, i)
+		if !ok {
 			return ""
 		}
-		end := bytes.IndexByte(v, '"')
-		if end < 0 {
-			return ""
-		}
-		return string(v[:end])
 	}
 }
 
-// skipColonAndQuote consumes the `:` plus an opening `"` (with any
-// surrounding whitespace) and returns the slice starting at the first
-// byte of the value's contents. Returns nil if the shape is wrong.
-func skipColonAndQuote(s []byte) []byte {
-	i := 0
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
-		i++
+func skipJSONSpace(line []byte, i int) int {
+	for i < len(line) {
+		switch line[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
 	}
-	if i >= len(s) || s[i] != ':' {
-		return nil
+	return i
+}
+
+// scanJSONString walks an opening-`"` at line[i] to its closing `"`,
+// honouring backslash escapes. Returns the index immediately after the
+// closing quote, or false on a malformed string.
+func scanJSONString(line []byte, i int) (int, bool) {
+	n := len(line)
+	if i >= n || line[i] != '"' {
+		return 0, false
 	}
 	i++
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+	for i < n {
+		switch line[i] {
+		case '\\':
+			if i+1 >= n {
+				return 0, false
+			}
+			i += 2
+		case '"':
+			return i + 1, true
+		default:
+			i++
+		}
+	}
+	return 0, false
+}
+
+// skipJSONValue advances past a value starting at line[i], whatever
+// its kind (string, number, bool, null, object, array). Returns the
+// index past the value, or false on parse error.
+func skipJSONValue(line []byte, i int) (int, bool) {
+	n := len(line)
+	if i >= n {
+		return 0, false
+	}
+	switch line[i] {
+	case '"':
+		return scanJSONString(line, i)
+	case '{', '[':
+		return skipJSONContainer(line, i)
+	}
+	// number / true / false / null — walk to the next structural byte.
+	for i < n {
+		switch line[i] {
+		case ',', '}', ']', ' ', '\t', '\n', '\r':
+			return i, true
+		}
 		i++
 	}
-	if i >= len(s) || s[i] != '"' {
-		return nil
+	return i, true
+}
+
+// skipJSONContainer walks past a balanced { … } or [ … ] block starting
+// at line[i], tracking string state so quoted braces don't disturb the
+// depth count. Returns the index past the closing brace, or false.
+func skipJSONContainer(line []byte, i int) (int, bool) {
+	n := len(line)
+	if i >= n {
+		return 0, false
 	}
-	return s[i+1:]
+	depth := 0
+	inString := false
+	for i < n {
+		c := line[i]
+		if inString {
+			if c == '\\' {
+				if i+1 >= n {
+					return 0, false
+				}
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			i++
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+		i++
+	}
+	return 0, false
 }

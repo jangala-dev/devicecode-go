@@ -144,6 +144,33 @@ func TestWireTypeBadInput(t *testing.T) {
 	}
 }
 
+func TestWireTypeIgnoresNestedTypeKeys(t *testing.T) {
+	// protoType must return the top-level discriminator, not a nested
+	// payload.type / meta.type key. The previous heuristic-only scan
+	// would mis-route e.g. a `pub` with a payload that happened to
+	// contain its own "type" field. Examples below exercise the cases
+	// Codex flagged on the post-flash review.
+	for _, tc := range []struct {
+		line []byte
+		want string
+	}{
+		// Nested payload object with its own "type":
+		{[]byte(`{"payload":{"type":"x"},"type":"pub"}`), "pub"},
+		// Nested type appears before the real top-level type:
+		{[]byte(`{"meta":{"type":"firmware"},"type":"xfer_begin","xfer_id":"a"}`), "xfer_begin"},
+		// Type buried inside an array element:
+		{[]byte(`{"topic":["a","type","b"],"type":"unretain"}`), "unretain"},
+		// Type as a substring of a value (must NOT match):
+		{[]byte(`{"id":"my-type-here","type":"call"}`), "call"},
+		// Real-world hello shape from CM5 (regression for the malformed-frame bug):
+		{[]byte(`{"sid":"a08590c4-afb8-4a23-ae39-ded871a3d433","node":"cm5","type":"hello"}`), "hello"},
+	} {
+		if got := protoType(tc.line); got != tc.want {
+			t.Errorf("protoType(%s) = %q, want %q", tc.line, got, tc.want)
+		}
+	}
+}
+
 // ---- transport ----
 
 func TestTransportRoundTrip(t *testing.T) {

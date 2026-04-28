@@ -35,7 +35,7 @@ func main() {
 
 	conn := b.NewConnection("fabric")
 	tr := fabric.NewRWTransport(&serialRW{}, &serialRW{})
-	fabric.Run(ctx, tr, conn, "mcu-1", "cm5-local")
+	fabric.Run(ctx, tr, conn, "mcu-1", "cm5", fabric.DefaultLinkConfig())
 }
 
 func waitHALReady(ctx context.Context, c *bus.Connection, d time.Duration) bool {
