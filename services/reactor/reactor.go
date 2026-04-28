@@ -407,26 +407,23 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART sessions — fabric on uart0, log mirror on uart1. Mirrors
+	// UART sessions — fabric on uart0; uart1 is debug-only and gated by
+	// the `debug_uart` build tag (off in release per
+	// docs/firmware-alignment-protocol.md). Mirrors
 	// devicecode-lua@2c88090 `bigbox-v1-cm-2.json`, where the CM5-facing
 	// fabric link binds to uart0. The legacy CM5 telemetry-over-JSON path
 	// on uart0 has been removed; retained-state publishers in
 	// fabric-update will replace it.
-	const (
-		uartFabric = "uart0" // fabric link to CM5
-		uartLog    = "uart1" // debug/log mirror only
-	)
+	const uartFabric = "uart0"
 	subSessOpenFabric := r.uiConn.Subscribe(tSessOpened(uartFabric))
-	subSessOpenLog := r.uiConn.Subscribe(tSessOpened(uartLog))
 	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
-	subSessClosedLog := r.uiConn.Subscribe(tSessClosed(uartLog))
-
-	// Kick open requests (fire-and-forget; events carry handles)
 	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
-	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+
+	var dbgLog debugUARTLog
+	dbgLog.init(r.uiConn)
 
 	// Retry back-off guards
-	var retryFabricAt, retryLogAt time.Time
+	var retryFabricAt time.Time
 
 	// Fabric session lifecycle state
 	var fabricCancel context.CancelFunc
@@ -475,11 +472,8 @@ func (r *Reactor) Run(ctx context.Context) {
 				}()
 				log.Println("[uart0] fabric session opened")
 			}
-		case m := <-subSessOpenLog.Channel():
-			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				log.SetUART1(shmring.Get(shmring.Handle(ev.TXHandle)))
-				log.Println("[uart1] log session opened")
-			}
+		case m := <-dbgLog.openedChan():
+			dbgLog.handleOpened(m)
 		case <-subSessClosedFabric.Channel():
 			// Ignore stale close events — the open handler already tears down
 			// the previous session before starting a new one.
@@ -494,13 +488,8 @@ func (r *Reactor) Run(ctx context.Context) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
-		case <-subSessClosedLog.Channel():
-			log.SetUART1(nil)
-			log.Println("[uart1] log session closed")
-			if time.Now().After(retryLogAt) {
-				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
-				retryLogAt = time.Now().Add(2 * time.Second)
-			}
+		case <-dbgLog.closedChan():
+			dbgLog.handleClosed(r.uiConn)
 
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():

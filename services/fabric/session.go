@@ -159,6 +159,8 @@ type session struct {
 	txControl        txLane
 	txRPC            txLane
 	txBulk           txLane
+	importedRetained []bus.Topic // local topics currently retained on the bus due to wire imports
+	rpcReady         bool        // bridge replay complete; gates linkStatePayload.Ready
 	incomingTransfer *incomingTransfer
 	beginTransfer    func(transferMeta) (transferSink, error)
 
@@ -251,6 +253,7 @@ func (s *session) run(ctx context.Context) {
 			s.drainOutbound(now)
 			s.checkTransferTimeout(now)
 			s.tickPing(now)
+			s.tickReady(now)
 
 		case <-waitTick.C:
 			s.logWaiting()
@@ -283,7 +286,7 @@ func unixMilli(t time.Time) int64 {
 }
 
 func (s *session) currentStatus() string {
-	if s.link == linkUp {
+	if s.link == linkUp && s.rpcReady {
 		return statusReady
 	}
 	return statusOpening
@@ -302,7 +305,7 @@ func (s *session) publishLinkState(reason, err string) {
 		linkStatePayload{
 			LinkID:            s.linkID,
 			Status:            status,
-			Ready:             s.link == linkUp,
+			Ready:             s.link == linkUp && s.rpcReady,
 			Established:       s.link == linkUp,
 			PeerID:            s.peerID,
 			LocalSID:          s.localSID,
@@ -340,9 +343,11 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.peerProto = 0
 	s.exportReadyAt = time.Time{}
 	s.exportsEnabled = false
+	s.rpcReady = false
 	s.teardownExports()
 	s.teardownInbound()
 	s.teardownOutbound(pendingReason)
+	s.teardownImportedRetained()
 	s.abortTransfer(pendingReason)
 	s.publishLinkState(reason, err)
 	if err != "" {
@@ -356,6 +361,13 @@ func (s *session) handleLinkDown(reason, err string) {
 // `reason` carries the link-state telemetry tag (e.g. session_reset) and
 // is also used as the err string on any pending outbound calls cancelled
 // by the transition, matching rpc_bridge.lua's session-replace behaviour.
+//
+// On a session-reset transition (re-promote with the link already up),
+// imported retained facts are unretained locally so consumers don't see
+// stale data from the previous CM5 session — mirrors rpc_bridge.lua's
+// invalidate_imported_retained on generation bump. rpcReady is held low
+// until the export holdoff elapses (see tickReady), gating
+// linkStatePayload.Ready.
 func (s *session) promoteLink(reason string) {
 	if s.link == linkUp {
 		if reason == "" {
@@ -365,14 +377,57 @@ func (s *session) promoteLink(reason string) {
 		s.teardownExports()
 		s.teardownInbound()
 		s.teardownOutbound(reason)
+		s.teardownImportedRetained()
 	}
 	s.link = linkUp
+	s.rpcReady = false
 	s.setupExports()
 	s.exportsEnabled = true
 	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
 	s.nextPingAt = time.Now().Add(s.cfg.PingInterval)
 	s.log("exports enabled")
 	s.publishLinkState(reason, "")
+}
+
+// teardownImportedRetained clears every local retained slot we populated
+// from a wire import. Mirrors rpc_bridge.lua's invalidate_imported_retained.
+func (s *session) teardownImportedRetained() {
+	for _, t := range s.importedRetained {
+		s.conn.Publish(s.conn.NewMessage(t, nil, true))
+	}
+	s.importedRetained = nil
+}
+
+func (s *session) trackImportedRetain(t bus.Topic) {
+	for _, ex := range s.importedRetained {
+		if topicEquals(ex, t) {
+			return
+		}
+	}
+	s.importedRetained = append(s.importedRetained, t)
+}
+
+func (s *session) untrackImportedRetain(t bus.Topic) {
+	for i, ex := range s.importedRetained {
+		if topicEquals(ex, t) {
+			s.importedRetained = append(s.importedRetained[:i], s.importedRetained[i+1:]...)
+			return
+		}
+	}
+}
+
+// tickReady promotes rpcReady once the post-handshake export holdoff has
+// elapsed, mirroring rpc_bridge.lua's emit_rpc_ready(true) after retained
+// replay. Re-publishes link state so consumers observe the ready edge.
+func (s *session) tickReady(now time.Time) {
+	if s.link != linkUp || s.rpcReady {
+		return
+	}
+	if s.exportReadyAt.IsZero() || now.Before(s.exportReadyAt) {
+		return
+	}
+	s.rpcReady = true
+	s.publishLinkState("", "")
 }
 
 // ---- dispatch ----
@@ -596,10 +651,16 @@ func (s *session) onPub(msg *protoPub) {
 		s.lastConfigErr = ""
 		s.log("config/device applied to config/hal")
 		s.conn.Publish(s.conn.NewMessage(localTopic, cfg, true))
+		s.trackImportedRetain(localTopic)
 		return
 	}
 
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
+	if msg.Retain {
+		s.trackImportedRetain(localTopic)
+	} else {
+		s.untrackImportedRetain(localTopic)
+	}
 }
 
 func (s *session) onUnretain(msg *protoUnretain) {
@@ -609,6 +670,7 @@ func (s *session) onUnretain(msg *protoUnretain) {
 		return
 	}
 	s.conn.Publish(s.conn.NewMessage(localTopic, nil, true))
+	s.untrackImportedRetain(localTopic)
 }
 
 func (s *session) onCall(msg *protoCall) {

@@ -483,6 +483,112 @@ func TestSessionPingsUnconditionally(t *testing.T) {
 	}
 }
 
+func TestReadyHeldUntilExportHoldoff(t *testing.T) {
+	// session_ctl.lua / rpc_bridge.lua: ready == established and rpc_ready,
+	// where rpc_ready edges true only after retained replay completes.
+	// The Go side gates rpcReady on exportReadyAt elapsing post-handshake.
+	mcu, cm5 := pipePair()
+	b := newBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(bus.T("state", "fabric", "link", "mcu0"))
+	defer observer.Unsubscribe(sub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	var sawNotReady, sawReady bool
+	deadline := time.After(3 * time.Second)
+	for !sawReady {
+		select {
+		case msg := <-sub.Channel():
+			payload, ok := msg.Payload.(linkStatePayload)
+			if !ok {
+				t.Fatalf("payload type = %T", msg.Payload)
+			}
+			if payload.Established && !payload.Ready {
+				sawNotReady = true
+			}
+			if payload.Ready {
+				if !sawNotReady {
+					t.Fatalf("Ready edge raised without prior Established+!Ready state")
+				}
+				sawReady = true
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for Ready=true")
+		}
+	}
+}
+
+func TestSessionResetUnretainsImports(t *testing.T) {
+	// rpc_bridge.lua's invalidate_imported_retained clears every imported
+	// retained slot on session-generation bump. The Go side mirrors this
+	// in promoteLink/teardownImportedRetained: each tracked local topic
+	// gets a nil-payload retained publish that clears the bus's retain
+	// store, so consumers don't see stale CM5-session data.
+	mcu, cm5 := pipePair()
+	b := newBus()
+	observer := b.NewConnection("observer")
+	cfgSub := observer.Subscribe(tConfigHAL)
+	defer observer.Unsubscribe(cfgSub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	// Push a config via the import pub path so config/hal becomes a
+	// tracked imported retain.
+	sendMsg(t, cm5, protoPub{
+		Type:    msgPub,
+		Topic:   []string{"config", "device"},
+		Payload: json.RawMessage(`{"devices":[]}`),
+		Retain:  true,
+	})
+
+	// Observe the local retain (non-nil payload).
+	deadline := time.After(2 * time.Second)
+	gotInitial := false
+	for !gotInitial {
+		select {
+		case msg := <-cfgSub.Channel():
+			if msg.Retained && msg.Payload != nil {
+				gotInitial = true
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for initial config/hal retain")
+		}
+	}
+
+	// Force a session reset: hello with a new SID. Concurrent reader
+	// drains the new hello_ack the MCU sends back; pipePair is
+	// synchronous so without this the MCU's sendControl would block,
+	// promoteLink would never fire, and teardownImportedRetained would
+	// not run.
+	go func() { _ = readMsg[protoHelloAck](t, cm5) }()
+	sendMsg(t, cm5, protoHello{
+		Type: msgHello,
+		Node: "cm5-local",
+		Peer: "mcu-1",
+		SID:  "cm5-sid-new",
+	})
+
+	// Expect a nil-payload retained publish on config/hal.
+	deadline = time.After(2 * time.Second)
+	for {
+		select {
+		case msg := <-cfgSub.Channel():
+			if msg.Retained && msg.Payload == nil {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for unretain after session reset")
+		}
+	}
+}
+
 func TestWriterControlPreemptsRPCAndBulk(t *testing.T) {
 	// writer.lua drains the control lane first (no fairness); then
 	// weighted RR between rpc and bulk. Pre-load all three lanes and
