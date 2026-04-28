@@ -1,6 +1,9 @@
 package fabric
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // ---- Wire message type identifiers ----
 //
@@ -169,11 +172,64 @@ func marshal(v any) []byte {
 	return append(b, '\n')
 }
 
-// protoType extracts the "type" field from a JSON line.
+// protoType extracts the "type" field from a JSON line via a manual
+// byte scan rather than json.Unmarshal. TinyGo's encoding/json reflect
+// path was observed silently dropping the field for envelopes with
+// preceding sibling keys (e.g. {"sid":"…","node":"…","type":"hello"})
+// during real-CM5 traffic — frames parsed cleanly under standard Go
+// in tests but came back with Type="" on hardware. This scan finds the
+// first top-level "type":"…" pair, tolerates whitespace, and assumes
+// the value contains no escape sequences (true for every wire type
+// constant defined above).
 func protoType(line []byte) string {
-	var env struct {
-		Type string `json:"type"`
+	const key = `"type"`
+	rest := line
+	for {
+		idx := bytes.Index(rest, []byte(key))
+		if idx < 0 {
+			return ""
+		}
+		// Reject matches inside another string value (e.g. someone
+		// publishing a payload that contains the literal "type").
+		// Simple heuristic: the byte preceding the key must be one of
+		// '{', ',' or whitespace at the top level. Good enough for our
+		// flat envelopes.
+		if idx > 0 {
+			b := rest[idx-1]
+			if b != '{' && b != ',' && b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+				rest = rest[idx+len(key):]
+				continue
+			}
+		}
+		v := skipColonAndQuote(rest[idx+len(key):])
+		if v == nil {
+			return ""
+		}
+		end := bytes.IndexByte(v, '"')
+		if end < 0 {
+			return ""
+		}
+		return string(v[:end])
 	}
-	json.Unmarshal(line, &env)
-	return env.Type
+}
+
+// skipColonAndQuote consumes the `:` plus an opening `"` (with any
+// surrounding whitespace) and returns the slice starting at the first
+// byte of the value's contents. Returns nil if the shape is wrong.
+func skipColonAndQuote(s []byte) []byte {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	if i >= len(s) || s[i] != ':' {
+		return nil
+	}
+	i++
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	if i >= len(s) || s[i] != '"' {
+		return nil
+	}
+	return s[i+1:]
 }
