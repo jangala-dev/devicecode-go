@@ -1,47 +1,45 @@
 package fabric
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"hash"
-	"hash/crc32"
 	"runtime"
 	"strings"
 	"time"
 
 	"devicecode-go/x/strconvx"
+	"devicecode-go/x/xxhash"
 )
 
 const postTransferDoneSettle = 250 * time.Millisecond
 const transferProgressLogEvery = 32
 
+// transferMeta captures xfer_begin contents. The required Lua wire shape is
+// {xfer_id, size, checksum}; meta is optional but source-used (transfer_mgr
+// passes it through to the receiver, where meta.receiver names a local
+// endpoint to call after xfer_commit and before xfer_done). Preserve meta
+// as an opaque blob — interpretation lives in fabric-update.
 type transferMeta struct {
 	ID       string
-	Kind     string
-	Name     string
-	Format   string
-	Enc      string
 	Size     uint32
-	ChunkRaw uint32
-	Chunks   uint32
-	SHA256   string
+	Checksum string // xxHash32 hex (8 lower-case hex chars), no algorithm field
 	Meta     json.RawMessage
 }
 
+// transferInfo is internal-only state returned by the sink on Commit. It is
+// no longer wire-visible — xfer_done carries only xfer_id in the canonical
+// schema; size/checksum reconciliation lives on xfer_commit.
 type transferInfo struct {
-	BytesWritten uint32 `json:"bytes_written,omitempty"`
-	SlotXIPAddr  uint32 `json:"slot_xip_addr,omitempty"`
+	BytesWritten uint32
+	SlotXIPAddr  uint32
 }
 
-func (i transferInfo) isZero() bool {
-	return i.BytesWritten == 0 && i.SlotXIPAddr == 0
-}
-
+// transferSink is the firmware-side write target for an incoming transfer.
+// WriteChunk receives bytes at the given byte offset (matching xfer_chunk's
+// canonical wire fields). No sequence number is passed — the caller has
+// already validated offset against expected progress.
 type transferSink interface {
-	WriteChunk(seq, off uint32, data []byte) error
+	WriteChunk(offset uint32, data []byte) error
 	Commit() (transferInfo, error)
 	Apply() error
 	Abort(reason string) error
@@ -50,71 +48,46 @@ type transferSink interface {
 type incomingTransfer struct {
 	meta         transferMeta
 	sink         transferSink
-	expectedNext uint32
 	bytesWritten uint32
 	chunksSeen   uint32
-	hasher       hash.Hash
+	hasher       *xxhash.Hasher
 }
 
 func lowerHex(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-func crc32Hex(data []byte) string {
-	return fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
-}
-
-func sha256Hex(h hash.Hash) string {
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum)
-}
-
 func u32s(v uint32) string {
 	return strconvx.Itoa(int(v))
 }
 
-func infoPayload(info transferInfo) json.RawMessage {
-	if info.isZero() {
-		return nil
-	}
-	b, _ := json.Marshal(info)
-	return json.RawMessage(b)
-}
-
-func (s *session) sendTransferReady(id string, ok bool, next *uint32, errStr string) bool {
+func (s *session) sendTransferReady(id string) bool {
 	return s.sendFrame(marshal(protoXferReady{
-		T:    msgXferReady,
-		ID:   id,
-		OK:   ok,
-		Next: next,
-		Err:  errStr,
+		Type:   msgXferReady,
+		XferID: id,
 	}))
 }
 
-func (s *session) sendTransferNeed(id string, next uint32, errStr string) bool {
+func (s *session) sendTransferNeed(id string, next uint32) bool {
 	return s.sendFrame(marshal(protoXferNeed{
-		T:    msgXferNeed,
-		ID:   id,
-		Next: next,
-		Err:  errStr,
+		Type:   msgXferNeed,
+		XferID: id,
+		Next:   next,
 	}))
 }
 
-func (s *session) sendTransferDone(id string, ok bool, info transferInfo, errStr string) bool {
+func (s *session) sendTransferDone(id string) bool {
 	return s.sendFrame(marshal(protoXferDone{
-		T:    msgXferDone,
-		ID:   id,
-		OK:   ok,
-		Info: infoPayload(info),
-		Err:  errStr,
+		Type:   msgXferDone,
+		XferID: id,
 	}))
 }
 
 func (s *session) sendTransferAbort(id, reason string) bool {
 	return s.sendFrame(marshal(protoXferAbort{
-		T:      msgXferAbort,
-		ID:     id,
-		Reason: reason,
+		Type:   msgXferAbort,
+		XferID: id,
+		Err:    reason,
 	}))
 }
 
@@ -135,43 +108,19 @@ func (s *session) abortTransfer(reason string) {
 }
 
 func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
-	if msg.ID == "" {
-		return transferMeta{}, "xfer_begin.id"
-	}
-	if msg.Kind == "" {
-		return transferMeta{}, "xfer_begin.kind"
-	}
-	if msg.Name == "" {
-		return transferMeta{}, "xfer_begin.name"
-	}
-	if msg.Format == "" {
-		return transferMeta{}, "xfer_begin.format"
-	}
-	if msg.Enc == "" {
-		return transferMeta{}, "xfer_begin.enc"
+	if msg.XferID == "" {
+		return transferMeta{}, "xfer_begin.xfer_id"
 	}
 	if msg.Size == 0 {
 		return transferMeta{}, "xfer_begin.size"
 	}
-	if msg.ChunkRaw == 0 {
-		return transferMeta{}, "xfer_begin.chunk_raw"
-	}
-	if msg.Chunks == 0 {
-		return transferMeta{}, "xfer_begin.chunks"
-	}
-	if msg.SHA256 == "" {
-		return transferMeta{}, "xfer_begin.sha256"
+	if msg.Checksum == "" {
+		return transferMeta{}, "xfer_begin.checksum"
 	}
 	return transferMeta{
-		ID:       msg.ID,
-		Kind:     msg.Kind,
-		Name:     msg.Name,
-		Format:   msg.Format,
-		Enc:      msg.Enc,
+		ID:       msg.XferID,
 		Size:     msg.Size,
-		ChunkRaw: msg.ChunkRaw,
-		Chunks:   msg.Chunks,
-		SHA256:   lowerHex(msg.SHA256),
+		Checksum: lowerHex(msg.Checksum),
 		Meta:     append(json.RawMessage(nil), msg.Meta...),
 	}, ""
 }
@@ -179,18 +128,14 @@ func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 func (s *session) onTransferBegin(msg *protoXferBegin) {
 	meta, errStr := validateTransferBegin(msg)
 	if errStr != "" {
-		if msg.ID != "" {
-			s.sendTransferReady(msg.ID, false, nil, "bad_message: "+errStr)
+		if msg.XferID != "" {
+			s.sendTransferAbort(msg.XferID, "bad_message: "+errStr)
 		}
 		s.logKV("xfer_begin dropped", "err", errStr)
 		return
 	}
 	if s.incomingTransfer != nil {
-		s.sendTransferReady(meta.ID, false, nil, "busy")
-		return
-	}
-	if meta.Enc != "b64url" {
-		s.sendTransferReady(meta.ID, false, nil, "unsupported_encoding")
+		s.sendTransferAbort(meta.ID, "busy")
 		return
 	}
 	beginFn := s.beginTransfer
@@ -199,88 +144,76 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 	}
 	sink, err := beginFn(meta)
 	if err != nil {
-		s.sendTransferReady(meta.ID, false, nil, err.Error())
+		s.sendTransferAbort(meta.ID, err.Error())
 		return
 	}
 	s.incomingTransfer = &incomingTransfer{
 		meta:   meta,
 		sink:   sink,
-		hasher: sha256.New(),
+		hasher: xxhash.New(0),
 	}
 	println(
 		"[fabric]", "sid", s.localSID,
 		"xfer_begin accepted",
 		"id", meta.ID,
-		"kind", meta.Kind,
 		"size", u32s(meta.Size),
-		"chunks", u32s(meta.Chunks),
-		"chunk_raw", u32s(meta.ChunkRaw),
+		"checksum", meta.Checksum,
 	)
-	s.sendTransferReady(meta.ID, true, new(uint32), "")
+	s.sendTransferReady(meta.ID)
 }
 
 func (s *session) onTransferChunk(msg *protoXferChunk) {
 	cur := s.incomingTransfer
-	if cur == nil || cur.meta.ID != msg.ID {
-		s.logKV("xfer_chunk dropped", "id", msg.ID)
+	if cur == nil || cur.meta.ID != msg.XferID {
+		s.logKV("xfer_chunk dropped", "id", msg.XferID)
 		return
 	}
-	if msg.Seq != cur.expectedNext {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "unexpected_seq", "seq", u32s(msg.Seq))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "unexpected_seq")
-		return
-	}
-	if msg.Off != cur.bytesWritten {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "unexpected_offset", "off", u32s(msg.Off), "want_off", u32s(cur.bytesWritten))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "unexpected_offset")
+	// Lua transfer_mgr.lua aborts and clears the active transfer on any
+	// chunk-level fault (unexpected offset, decode failure, size mismatch).
+	// Match that — do not send xfer_need + keep alive.
+	id := cur.meta.ID
+	if msg.Offset != cur.bytesWritten {
+		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
+			"id", id, "err", "unexpected_offset",
+			"off", u32s(msg.Offset), "want_off", u32s(cur.bytesWritten))
+		s.abortTransfer("unexpected_offset")
+		s.sendTransferAbort(id, "unexpected_offset")
 		return
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(msg.Data)
 	if err != nil {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "decode_failed", "seq", u32s(msg.Seq), "off", u32s(msg.Off),
-			"data_len", u32s(uint32(len(msg.Data))))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "decode_failed")
+		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
+			"id", id, "err", "decode_failed",
+			"off", u32s(msg.Offset), "data_len", u32s(uint32(len(msg.Data))))
+		s.abortTransfer("decode_failed")
+		s.sendTransferAbort(id, "decode_failed")
 		return
 	}
-	if uint32(len(raw)) != msg.N || msg.N == 0 {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "size_mismatch", "seq", u32s(msg.Seq), "off", u32s(msg.Off),
-			"n", u32s(msg.N), "data_len", u32s(uint32(len(msg.Data))), "decoded", u32s(uint32(len(raw))))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
-		return
-	}
-	if crc32Hex(raw) != lowerHex(msg.CRC32) {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "bad_crc", "seq", u32s(msg.Seq))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "bad_crc")
+	if len(raw) == 0 {
+		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
+			"id", id, "err", "empty_chunk", "off", u32s(msg.Offset))
+		s.abortTransfer("empty_chunk")
+		s.sendTransferAbort(id, "empty_chunk")
 		return
 	}
 	if cur.bytesWritten+uint32(len(raw)) > cur.meta.Size {
-		println("[fabric]", "sid", s.localSID, "xfer_need sent",
-			"id", cur.meta.ID, "next", u32s(cur.expectedNext),
-			"err", "size_mismatch", "bytes_written", u32s(cur.bytesWritten),
-			"raw_len", u32s(uint32(len(raw))), "total", u32s(cur.meta.Size))
-		s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "size_mismatch")
+		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
+			"id", id, "err", "size_overflow",
+			"bytes_written", u32s(cur.bytesWritten),
+			"raw_len", u32s(uint32(len(raw))),
+			"total", u32s(cur.meta.Size))
+		s.abortTransfer("size_overflow")
+		s.sendTransferAbort(id, "size_overflow")
 		return
 	}
-	if err := cur.sink.WriteChunk(msg.Seq, msg.Off, raw); err != nil {
-		s.logKV("transfer write failed", "err", err.Error())
-		id := cur.meta.ID
+	if err := cur.sink.WriteChunk(msg.Offset, raw); err != nil {
 		reason := err.Error()
+		s.logKV("transfer write failed", "err", reason)
 		s.abortTransfer(reason)
-		s.sendTransferDone(id, false, transferInfo{}, reason)
+		s.sendTransferAbort(id, reason)
 		return
 	}
 	_, _ = cur.hasher.Write(raw)
-	cur.expectedNext++
 	cur.bytesWritten += uint32(len(raw))
 	cur.chunksSeen++
 	if cur.chunksSeen == 1 || (cur.chunksSeen%transferProgressLogEvery) == 0 {
@@ -288,22 +221,23 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 			"[fabric]", "sid", s.localSID,
 			"xfer_chunk accepted",
 			"id", cur.meta.ID,
-			"seq", u32s(msg.Seq),
-			"off", u32s(msg.Off),
-			"n", u32s(msg.N),
-			"data_len", u32s(uint32(len(msg.Data))),
+			"off", u32s(msg.Offset),
+			"data_len", u32s(uint32(len(raw))),
 			"bytes_written", u32s(cur.bytesWritten),
 		)
 	}
 	raw = nil
+	// Forced GC after each absorbed chunk eliminates firmware-transfer byte
+	// drops on the safe-window allocator. Do NOT remove this without
+	// reproducing the regression in firmware-mono/docs/old/FABRIC_TRANSFER_FIX.md.
 	runtime.GC()
-	s.sendTransferNeed(cur.meta.ID, cur.expectedNext, "")
+	s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 }
 
 func (s *session) onTransferCommit(msg *protoXferCommit) {
 	cur := s.incomingTransfer
-	if cur == nil || cur.meta.ID != msg.ID {
-		s.logKV("xfer_commit dropped", "id", msg.ID)
+	if cur == nil || cur.meta.ID != msg.XferID {
+		s.logKV("xfer_commit dropped", "id", msg.XferID)
 		return
 	}
 	id := cur.meta.ID
@@ -313,13 +247,20 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 			"bytes_written", u32s(cur.bytesWritten),
 			"msg_size", u32s(msg.Size), "meta_size", u32s(cur.meta.Size))
 		s.abortTransfer("size_mismatch")
-		s.sendTransferDone(id, false, transferInfo{}, "size_mismatch")
+		s.sendTransferAbort(id, "size_mismatch")
 		return
 	}
-	if lowerHex(msg.SHA256) != cur.meta.SHA256 || sha256Hex(cur.hasher) != cur.meta.SHA256 {
-		s.logKV("xfer_commit failed: sha256_mismatch", "id", id)
-		s.abortTransfer("sha256_mismatch")
-		s.sendTransferDone(id, false, transferInfo{}, "sha256_mismatch")
+	streamedHex := xxhashHex(cur.hasher.Sum32())
+	commitChecksum := lowerHex(msg.Checksum)
+	if commitChecksum != cur.meta.Checksum || streamedHex != cur.meta.Checksum {
+		println("[fabric]", "sid", s.localSID, "xfer_commit failed",
+			"id", id, "err", "checksum_mismatch",
+			"begin", cur.meta.Checksum,
+			"commit", commitChecksum,
+			"streamed", streamedHex,
+		)
+		s.abortTransfer("checksum_mismatch")
+		s.sendTransferAbort(id, "checksum_mismatch")
 		return
 	}
 	info, err := cur.sink.Commit()
@@ -327,7 +268,7 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		s.logKV("transfer commit failed", "err", err.Error())
 		reason := err.Error()
 		s.abortTransfer(reason)
-		s.sendTransferDone(id, false, transferInfo{}, reason)
+		s.sendTransferAbort(id, reason)
 		return
 	}
 	sink := cur.sink
@@ -338,7 +279,7 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		"id", id,
 		"bytes_written", u32s(info.BytesWritten),
 	)
-	if !s.sendTransferDone(id, true, info, "") {
+	if !s.sendTransferDone(id) {
 		return
 	}
 	time.Sleep(postTransferDoneSettle)
@@ -351,14 +292,26 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 
 func (s *session) onTransferAbort(msg *protoXferAbort) {
 	cur := s.incomingTransfer
-	if cur == nil || cur.meta.ID != msg.ID {
-		s.logKV("xfer_abort dropped", "id", msg.ID)
+	if cur == nil || cur.meta.ID != msg.XferID {
+		s.logKV("xfer_abort dropped", "id", msg.XferID)
 		return
 	}
-	reason := msg.Reason
+	reason := msg.Err
 	if reason == "" {
 		reason = "remote_abort"
 	}
 	println("[fabric]", "sid", s.localSID, "xfer_abort received", "id", cur.meta.ID, "reason", reason)
 	s.abortTransfer(reason)
+}
+
+// xxhashHex formats a uint32 xxHash32 digest as 8 lower-case hex characters,
+// matching the wire format used by the Lua reference's M.digest_hex.
+func xxhashHex(v uint32) string {
+	const digits = "0123456789abcdef"
+	var buf [8]byte
+	for i := 7; i >= 0; i-- {
+		buf[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }

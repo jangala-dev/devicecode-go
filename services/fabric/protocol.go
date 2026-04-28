@@ -2,7 +2,14 @@ package fabric
 
 import "encoding/json"
 
-// ---- Wire message type identifiers (fabric.md §4) ----
+// ---- Wire message type identifiers ----
+//
+// Wire schema mirrors devicecode-lua/src/services/fabric/protocol.lua at
+// update-migration tip (commit 2c88090). The frame discriminator field is
+// "type" (not "t"). Reply frames carry {id, ok, value, err}. Transfer frames
+// use xfer_id/offset/checksum/data with a minimal xfer_chunk shape and
+// xxHash32 hex wire integrity (no algorithm field; Lua source treats checksum
+// as opaque hex).
 
 const (
 	msgHello      = "hello"
@@ -32,7 +39,7 @@ type protoCaps struct {
 }
 
 type protoHello struct {
-	T     string     `json:"t"`
+	Type  string     `json:"type"`
 	Node  string     `json:"node"`
 	Peer  string     `json:"peer"`
 	SID   string     `json:"sid"`
@@ -41,7 +48,7 @@ type protoHello struct {
 }
 
 type protoHelloAck struct {
-	T     string `json:"t"`
+	Type  string `json:"type"`
 	Node  string `json:"node"`
 	SID   string `json:"sid,omitempty"`
 	Proto int    `json:"proto,omitempty"`
@@ -49,105 +56,105 @@ type protoHelloAck struct {
 }
 
 type protoPing struct {
-	T   string `json:"t"`
-	TS  int64  `json:"ts"`
-	SID string `json:"sid,omitempty"`
+	Type string `json:"type"`
+	TS   int64  `json:"ts"`
+	SID  string `json:"sid,omitempty"`
 }
 
 type protoPong struct {
-	T   string `json:"t"`
-	TS  int64  `json:"ts"`
-	SID string `json:"sid,omitempty"`
+	Type string `json:"type"`
+	TS   int64  `json:"ts"`
+	SID  string `json:"sid,omitempty"`
 }
 
-// Not wired yet — defined for forward compatibility.
-
 type protoPub struct {
-	T       string          `json:"t"`
+	Type    string          `json:"type"`
 	Topic   []string        `json:"topic"`
 	Payload json.RawMessage `json:"payload"`
 	Retain  bool            `json:"retain"`
 }
 
 type protoUnretain struct {
-	T     string   `json:"t"`
+	Type  string   `json:"type"`
 	Topic []string `json:"topic"`
 }
 
 type protoCall struct {
-	T         string          `json:"t"`
+	Type      string          `json:"type"`
 	ID        string          `json:"id"`
 	Topic     []string        `json:"topic"`
 	Payload   json.RawMessage `json:"payload"`
 	TimeoutMs int             `json:"timeout_ms"`
 }
 
+// protoReply mirrors Lua's reply frame: {type, id, ok, value, err}. The Go
+// field for the correlation id keeps the name "Corr" for readability — the
+// wire spelling is "id" because the reply correlates to a prior call.id.
 type protoReply struct {
-	T       string          `json:"t"`
-	Corr    string          `json:"corr"`
-	OK      bool            `json:"ok"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-	Err     string          `json:"err,omitempty"`
+	Type  string          `json:"type"`
+	Corr  string          `json:"id"`
+	OK    bool            `json:"ok"`
+	Value json.RawMessage `json:"value,omitempty"`
+	Err   string          `json:"err,omitempty"`
 }
 
+// protoXferBegin (control lane) — required fields per protocol.lua
+// validate_control: xfer_id, size, checksum (xxHash32 hex). meta is
+// optional but source-used: transfer_mgr.lua sends it on xfer_begin and
+// later does conn:call(meta.receiver, …) before xfer_done. Preserve the
+// blob opaquely so fabric-update's receiver can pull meta.receiver out.
 type protoXferBegin struct {
-	T        string          `json:"t"`
-	ID       string          `json:"id"`
-	Kind     string          `json:"kind"`
-	Name     string          `json:"name"`
-	Format   string          `json:"format"`
-	Enc      string          `json:"enc"`
+	Type     string          `json:"type"`
+	XferID   string          `json:"xfer_id"`
 	Size     uint32          `json:"size"`
-	ChunkRaw uint32          `json:"chunk_raw"`
-	Chunks   uint32          `json:"chunks"`
-	SHA256   string          `json:"sha256"`
+	Checksum string          `json:"checksum"`
 	Meta     json.RawMessage `json:"meta,omitempty"`
 }
 
+// protoXferReady (control) carries only xfer_id; success/failure is implicit
+// (failure is signalled via xfer_abort).
 type protoXferReady struct {
-	T    string  `json:"t"`
-	ID   string  `json:"id"`
-	OK   bool    `json:"ok"`
-	Next *uint32 `json:"next,omitempty"`
-	Err  string  `json:"err,omitempty"`
+	Type   string `json:"type"`
+	XferID string `json:"xfer_id"`
 }
 
+// protoXferChunk (bulk) — minimal {xfer_id, offset, data}. No chunk-level
+// checksum, no sequence number; ack is by byte offset via xfer_need.next.
 type protoXferChunk struct {
-	T     string `json:"t"`
-	ID    string `json:"id"`
-	Seq   uint32 `json:"seq"`
-	Off   uint32 `json:"off"`
-	N     uint32 `json:"n"`
-	CRC32 string `json:"crc32"`
-	Data  string `json:"data"`
+	Type   string `json:"type"`
+	XferID string `json:"xfer_id"`
+	Offset uint32 `json:"offset"`
+	Data   string `json:"data"`
 }
 
+// protoXferNeed (control) acks the receiver's expected next byte offset.
 type protoXferNeed struct {
-	T    string `json:"t"`
-	ID   string `json:"id"`
-	Next uint32 `json:"next"`
-	Err  string `json:"err,omitempty"`
+	Type   string `json:"type"`
+	XferID string `json:"xfer_id"`
+	Next   uint32 `json:"next"`
 }
 
+// protoXferCommit (control) carries the same wire-integrity shape as
+// xfer_begin: xfer_id, size, checksum (xxHash32 hex over the payload bytes).
 type protoXferCommit struct {
-	T      string `json:"t"`
-	ID     string `json:"id"`
-	Size   uint32 `json:"size"`
-	SHA256 string `json:"sha256"`
+	Type     string `json:"type"`
+	XferID   string `json:"xfer_id"`
+	Size     uint32 `json:"size"`
+	Checksum string `json:"checksum"`
 }
 
+// protoXferDone (control) carries only xfer_id; failure is signalled via
+// xfer_abort.
 type protoXferDone struct {
-	T    string          `json:"t"`
-	ID   string          `json:"id"`
-	OK   bool            `json:"ok"`
-	Info json.RawMessage `json:"info,omitempty"`
-	Err  string          `json:"err,omitempty"`
+	Type   string `json:"type"`
+	XferID string `json:"xfer_id"`
 }
 
+// protoXferAbort (control) carries xfer_id plus an optional err string.
 type protoXferAbort struct {
-	T      string `json:"t"`
-	ID     string `json:"id"`
-	Reason string `json:"reason"`
+	Type   string `json:"type"`
+	XferID string `json:"xfer_id"`
+	Err    string `json:"err,omitempty"`
 }
 
 // ---- codec helpers ----
@@ -162,11 +169,11 @@ func marshal(v any) []byte {
 	return append(b, '\n')
 }
 
-// protoType extracts the "t" field from a JSON line.
+// protoType extracts the "type" field from a JSON line.
 func protoType(line []byte) string {
 	var env struct {
-		T string `json:"t"`
+		Type string `json:"type"`
 	}
 	json.Unmarshal(line, &env)
-	return env.T
+	return env.Type
 }

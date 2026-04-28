@@ -67,7 +67,7 @@ const testCM5SID = "s1"
 func bringUp(t *testing.T, cm5 Transport) protoHelloAck {
 	t.Helper()
 	sendMsg(t, cm5, protoHello{
-		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: testCM5SID, Proto: protoVersion,
+		Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: testCM5SID, Proto: protoVersion,
 	})
 	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.Node != "mcu-1" || ack.SID == "" || ack.Proto != protoVersion {
@@ -79,17 +79,17 @@ func bringUp(t *testing.T, cm5 Transport) protoHelloAck {
 
 func unlockExports(t *testing.T, cm5 Transport) {
 	t.Helper()
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: testCM5SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 77, SID: testCM5SID})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.T != "pong" {
-		t.Fatalf("expected pong, got %q", pong.T)
+	if pong.Type != "pong" {
+		t.Fatalf("expected pong, got %q", pong.Type)
 	}
 }
 
 // ---- codec ----
 
 func TestCodecRoundTrip(t *testing.T) {
-	orig := protoHello{T: "hello", Node: "mcu-1", Peer: "cm5-local", SID: "abc", Proto: protoVersion}
+	orig := protoHello{Type: "hello", Node: "mcu-1", Peer: "cm5-local", SID: "abc", Proto: protoVersion}
 	data := marshal(orig)
 	if !bytes.HasSuffix(data, []byte("\n")) {
 		t.Error("marshal should end with newline")
@@ -113,21 +113,21 @@ func TestCodecAllTypes(t *testing.T) {
 		v    any
 		want string
 	}{
-		{protoHello{T: "hello"}, "hello"},
-		{protoHelloAck{T: "hello_ack"}, "hello_ack"},
-		{protoPing{T: "ping", TS: 1}, "ping"},
-		{protoPong{T: "pong", TS: 2}, "pong"},
-		{protoPub{T: "pub", Topic: []string{"a"}}, "pub"},
-		{protoUnretain{T: "unretain", Topic: []string{"a"}}, "unretain"},
-		{protoCall{T: "call", ID: "c1"}, "call"},
-		{protoReply{T: "reply", Corr: "c1", OK: true}, "reply"},
-		{protoXferBegin{T: "xfer_begin", ID: "x1"}, "xfer_begin"},
-		{protoXferReady{T: "xfer_ready", ID: "x1", OK: true}, "xfer_ready"},
-		{protoXferChunk{T: "xfer_chunk", ID: "x1"}, "xfer_chunk"},
-		{protoXferNeed{T: "xfer_need", ID: "x1"}, "xfer_need"},
-		{protoXferCommit{T: "xfer_commit", ID: "x1"}, "xfer_commit"},
-		{protoXferDone{T: "xfer_done", ID: "x1", OK: true}, "xfer_done"},
-		{protoXferAbort{T: "xfer_abort", ID: "x1", Reason: "aborted"}, "xfer_abort"},
+		{protoHello{Type: "hello"}, "hello"},
+		{protoHelloAck{Type: "hello_ack"}, "hello_ack"},
+		{protoPing{Type: "ping", TS: 1}, "ping"},
+		{protoPong{Type: "pong", TS: 2}, "pong"},
+		{protoPub{Type: "pub", Topic: []string{"a"}}, "pub"},
+		{protoUnretain{Type: "unretain", Topic: []string{"a"}}, "unretain"},
+		{protoCall{Type: "call", ID: "c1"}, "call"},
+		{protoReply{Type: "reply", Corr: "c1", OK: true}, "reply"},
+		{protoXferBegin{Type: "xfer_begin", XferID: "x1"}, "xfer_begin"},
+		{protoXferReady{Type: "xfer_ready", XferID: "x1"}, "xfer_ready"},
+		{protoXferChunk{Type: "xfer_chunk", XferID: "x1"}, "xfer_chunk"},
+		{protoXferNeed{Type: "xfer_need", XferID: "x1"}, "xfer_need"},
+		{protoXferCommit{Type: "xfer_commit", XferID: "x1"}, "xfer_commit"},
+		{protoXferDone{Type: "xfer_done", XferID: "x1"}, "xfer_done"},
+		{protoXferAbort{Type: "xfer_abort", XferID: "x1", Err: "aborted"}, "xfer_abort"},
 	} {
 		b := marshal(tc.v)
 		if got := protoType(b[:len(b)-1]); got != tc.want {
@@ -137,7 +137,7 @@ func TestCodecAllTypes(t *testing.T) {
 }
 
 func TestWireTypeBadInput(t *testing.T) {
-	for _, b := range [][]byte{[]byte("not json"), []byte(`{"no_t":true}`), nil} {
+	for _, b := range [][]byte{[]byte("not json"), []byte(`{"no_type":true}`), nil} {
 		if got := protoType(b); got != "" {
 			t.Errorf("protoType(%q) = %q, want empty", b, got)
 		}
@@ -156,11 +156,11 @@ func TestTransportRoundTrip(t *testing.T) {
 			t.Errorf("ReadLine: %v", err)
 			return
 		}
-		if string(line) != `{"t":"ping","ts":99}` {
+		if string(line) != `{"type":"ping","ts":99}` {
 			t.Errorf("got %q", line)
 		}
 	}()
-	sendMsg(t, a, protoPing{T: "ping", TS: 99})
+	sendMsg(t, a, protoPing{Type: "ping", TS: 99})
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -169,8 +169,8 @@ func TestTransportRoundTrip(t *testing.T) {
 }
 
 func TestOversizeLineRecovery(t *testing.T) {
-	big := `{"t":"ping","ts":0,"x":"` + strings.Repeat("x", maxLineLen+100) + `"}`
-	input := big + "\n" + `{"t":"ping","ts":3}` + "\n"
+	big := `{"type":"ping","ts":0,"x":"` + strings.Repeat("x", maxLineLen+100) + `"}`
+	input := big + "\n" + `{"type":"ping","ts":3}` + "\n"
 	tr := NewRWTransport(strings.NewReader(input), io.Discard)
 	_, err := tr.ReadLine()
 	if !errors.Is(err, ErrLineTooLong) {
@@ -180,7 +180,7 @@ func TestOversizeLineRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ReadLine: %v", err)
 	}
-	if string(line) != `{"t":"ping","ts":3}` {
+	if string(line) != `{"type":"ping","ts":3}` {
 		t.Errorf("got %q", line)
 	}
 }
@@ -193,21 +193,21 @@ func TestShmringTransportRoundTrip(t *testing.T) {
 	mcuTr := NewShmringTransport(rx, tx)
 	defer mcuTr.Close()
 
-	rx.TryWriteFrom([]byte(`{"t":"ping","ts":42}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"ping","ts":42}` + "\n"))
 	line, err := mcuTr.ReadLine()
 	if err != nil {
 		t.Fatalf("ReadLine: %v", err)
 	}
-	if string(line) != `{"t":"ping","ts":42}` {
+	if string(line) != `{"type":"ping","ts":42}` {
 		t.Errorf("got %q", line)
 	}
 
-	if err := mcuTr.WriteLine([]byte(`{"t":"pong","ts":42}`)); err != nil {
+	if err := mcuTr.WriteLine([]byte(`{"type":"pong","ts":42}`)); err != nil {
 		t.Fatalf("WriteLine: %v", err)
 	}
 	var out [128]byte
 	n := tx.TryReadInto(out[:])
-	if string(out[:n]) != `{"t":"pong","ts":42}`+"\n" {
+	if string(out[:n]) != `{"type":"pong","ts":42}`+"\n" {
 		t.Errorf("tx got %q", out[:n])
 	}
 }
@@ -216,13 +216,13 @@ func TestShmringTransportMultiLine(t *testing.T) {
 	rx := shmring.New(256)
 	tr := NewShmringTransport(rx, shmring.New(256))
 	defer tr.Close()
-	rx.TryWriteFrom([]byte(`{"t":"ping","ts":1}` + "\n" + `{"t":"ping","ts":2}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"ping","ts":1}` + "\n" + `{"type":"ping","ts":2}` + "\n"))
 	line1, _ := tr.ReadLine()
 	line2, _ := tr.ReadLine()
-	if string(line1) != `{"t":"ping","ts":1}` {
+	if string(line1) != `{"type":"ping","ts":1}` {
 		t.Errorf("line1 = %q", line1)
 	}
-	if string(line2) != `{"t":"ping","ts":2}` {
+	if string(line2) != `{"type":"ping","ts":2}` {
 		t.Errorf("line2 = %q", line2)
 	}
 }
@@ -274,7 +274,11 @@ func TestShmringTransportWriteLineWrapsAcrossSegments(t *testing.T) {
 }
 
 func TestShmringTransportOversize(t *testing.T) {
-	rx := shmring.New(4096)
+	// Ring must be larger than maxLineLen+100 + newline + the trailing ping
+	// frame so the producer can deposit both lines without blocking. The rx
+	// ring used to be 4096 when maxLineLen=2048, leaving comfortable
+	// headroom; now that maxLineLen=4096, bump to 8192.
+	rx := shmring.New(8192)
 	tr := NewShmringTransport(rx, shmring.New(256))
 	defer tr.Close()
 	big := make([]byte, maxLineLen+100)
@@ -283,7 +287,7 @@ func TestShmringTransportOversize(t *testing.T) {
 	}
 	rx.TryWriteFrom(big)
 	rx.TryWriteFrom([]byte("\n"))
-	rx.TryWriteFrom([]byte(`{"t":"ping","ts":7}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"ping","ts":7}` + "\n"))
 	_, err := tr.ReadLine()
 	if !errors.Is(err, ErrLineTooLong) {
 		t.Fatalf("expected ErrLineTooLong, got %v", err)
@@ -292,7 +296,7 @@ func TestShmringTransportOversize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ReadLine: %v", err)
 	}
-	if string(line) != `{"t":"ping","ts":7}` {
+	if string(line) != `{"type":"ping","ts":7}` {
 		t.Errorf("got %q", line)
 	}
 }
@@ -319,14 +323,14 @@ func TestHandshake(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
 	sendMsg(t, cm5, protoHello{
-		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s1", Proto: protoVersion,
+		Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s1", Proto: protoVersion,
 	})
 	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.Node != "mcu-1" || ack.SID == "" || ack.Proto != protoVersion {
 		t.Errorf("bad ack: %+v", ack)
 	}
 	time.Sleep(50 * time.Millisecond)
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 99, SID: "s1"})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 99, SID: "s1"})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 99 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
@@ -341,12 +345,12 @@ func TestSessionReset(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 
-	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
 	ack := readMsg[protoHelloAck](t, cm5)
 	if !ack.OK || ack.SID == "" || ack.Proto != protoVersion {
 		t.Error("hello_ack.OK = false")
 	}
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 55, SID: "s2"})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 55, SID: "s2"})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 55 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
@@ -360,7 +364,7 @@ func TestRejectsWrongPeer(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
-	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-999", SID: "s1", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-999", SID: "s1", Proto: protoVersion})
 	gotLine := make(chan readResult, 1)
 	go func() {
 		line, err := cm5.ReadLine()
@@ -371,7 +375,7 @@ func TestRejectsWrongPeer(t *testing.T) {
 		t.Fatal("got response to wrong-peer hello")
 	case <-time.After(200 * time.Millisecond):
 	}
-	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
 	select {
 	case res := <-gotLine:
 		if res.err != nil {
@@ -402,14 +406,14 @@ func TestRejectsMissingNodeWhenPeerPinned(t *testing.T) {
 		gotLine <- readResult{line: line, err: err}
 	}()
 
-	sendMsg(t, cm5, protoHello{T: "hello", Peer: "mcu-1", SID: "s1", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{Type: "hello", Peer: "mcu-1", SID: "s1", Proto: protoVersion})
 	select {
 	case <-gotLine:
 		t.Fatal("got response to hello without node")
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	sendMsg(t, cm5, protoHello{T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
+	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
 	select {
 	case res := <-gotLine:
 		if res.err != nil {
@@ -434,7 +438,7 @@ func TestPingPong(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	ack := bringUp(t, cm5)
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 42, SID: "s1"})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 42, SID: "s1"})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 42 || pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
@@ -464,8 +468,8 @@ func TestUnknownTypeIgnored(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
-	cm5.WriteLine([]byte(`{"t":"future_msg"}`))
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 1})
+	cm5.WriteLine([]byte(`{"type":"future_msg"}`))
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 1})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 1 {
 		t.Errorf("pong.TS = %d", pong.TS)
@@ -480,7 +484,7 @@ func TestMalformedJSONIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte("not json"))
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 2})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 2})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.TS != 2 {
 		t.Errorf("pong.TS = %d", pong.TS)
@@ -685,7 +689,7 @@ func TestPubImport(t *testing.T) {
 	sub := reader.Subscribe(bus.T("config", "hal"))
 
 	sendMsg(t, cm5, protoPub{
-		T:       "pub",
+		Type:       "pub",
 		Topic:   []string{"config", "device"},
 		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
 		Retain:  true,
@@ -721,8 +725,8 @@ func TestPubExport(t *testing.T) {
 	))
 
 	msg := readMsg[protoPub](t, cm5)
-	if msg.T != "pub" {
-		t.Fatalf("expected pub, got %q", msg.T)
+	if msg.Type != "pub" {
+		t.Fatalf("expected pub, got %q", msg.Type)
 	}
 	want := []string{"state", "env", "temperature", "core", "value"}
 	if !slicesEqual(msg.Topic, want) {
@@ -751,8 +755,8 @@ func TestUnretainExport(t *testing.T) {
 		true,
 	))
 	pub := readMsg[protoPub](t, cm5)
-	if pub.T != "pub" || !pub.Retain {
-		t.Fatalf("expected retained pub, got t=%q retain=%v", pub.T, pub.Retain)
+	if pub.Type != "pub" || !pub.Retain {
+		t.Fatalf("expected retained pub, got t=%q retain=%v", pub.Type, pub.Retain)
 	}
 
 	// Clear retained state (retain=true, payload=nil).
@@ -762,8 +766,8 @@ func TestUnretainExport(t *testing.T) {
 		true,
 	))
 	unr := readMsg[protoUnretain](t, cm5)
-	if unr.T != "unretain" {
-		t.Fatalf("expected unretain, got %q", unr.T)
+	if unr.Type != "unretain" {
+		t.Fatalf("expected unretain, got %q", unr.Type)
 	}
 	want := []string{"state", "env", "temperature", "core", "value"}
 	if !slicesEqual(unr.Topic, want) {
@@ -840,7 +844,7 @@ func TestPubIgnoredBeforeHandshake(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
 	sendMsg(t, cm5, protoPub{
-		T: "pub", Topic: []string{"config", "device"},
+		Type: "pub", Topic: []string{"config", "device"},
 		Payload: json.RawMessage(`{"v":1}`), Retain: true,
 	})
 	time.Sleep(50 * time.Millisecond)
@@ -877,7 +881,7 @@ func TestUnretainIgnoredBeforeHandshake(t *testing.T) {
 		t.Fatal("timed out waiting for retained config/device")
 	}
 
-	sendMsg(t, cm5, protoUnretain{T: "unretain", Topic: []string{"config", "device"}})
+	sendMsg(t, cm5, protoUnretain{Type: "unretain", Topic: []string{"config", "device"}})
 	select {
 	case m := <-sub.Channel():
 		t.Fatalf("unexpected pre-handshake unretain effect: %+v", m)
@@ -895,11 +899,11 @@ func TestUnretain(t *testing.T) {
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoPub{
-		T: "pub", Topic: []string{"config", "device"},
+		Type: "pub", Topic: []string{"config", "device"},
 		Payload: json.RawMessage(`{"v":1}`), Retain: true,
 	})
 	time.Sleep(50 * time.Millisecond)
-	sendMsg(t, cm5, protoUnretain{T: "unretain", Topic: []string{"config", "device"}})
+	sendMsg(t, cm5, protoUnretain{Type: "unretain", Topic: []string{"config", "device"}})
 	time.Sleep(50 * time.Millisecond)
 
 	reader := b.NewConnection("test")
@@ -928,7 +932,7 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 	defer handler.Unsubscribe(sub)
 
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "pre-hello-1", Topic: []string{"rpc", "hal", "dump"},
+		Type: "call", ID: "pre-hello-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
 
@@ -957,7 +961,7 @@ func TestCallImport(t *testing.T) {
 	}()
 
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "test-corr-1", Topic: []string{"rpc", "hal", "dump"},
+		Type: "call", ID: "test-corr-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
 	})
 
@@ -979,7 +983,7 @@ func TestCallNoRoute(t *testing.T) {
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "no-route-1", Topic: []string{"unknown", "endpoint"},
+		Type: "call", ID: "no-route-1", Topic: []string{"unknown", "endpoint"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
 
@@ -1006,7 +1010,7 @@ func TestDumpCallReturnsConfigState(t *testing.T) {
 
 	// Send config first so the session has state.
 	sendMsg(t, cm5, protoPub{
-		T:       "pub",
+		Type:       "pub",
 		Topic:   []string{"config", "device"},
 		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
 		Retain:  true,
@@ -1015,7 +1019,7 @@ func TestDumpCallReturnsConfigState(t *testing.T) {
 
 	// Call dump.
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
+		Type: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{"ask":"status"}`), TimeoutMs: 5000,
 	})
 
@@ -1027,7 +1031,7 @@ func TestDumpCallReturnsConfigState(t *testing.T) {
 		t.Errorf("expected ok=true, got err=%q", reply.Err)
 	}
 	var dump dumpReply
-	if err := json.Unmarshal(reply.Payload, &dump); err != nil {
+	if err := json.Unmarshal(reply.Value, &dump); err != nil {
 		t.Fatalf("unmarshal dump reply: %v", err)
 	}
 	if !dump.Applied {
@@ -1049,28 +1053,28 @@ func TestDumpCallDoesNotBlockPing(t *testing.T) {
 
 	// Send dump call and ping back-to-back.
 	sendMsg(t, cm5, protoCall{
-		T: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
+		Type: "call", ID: "dump-1", Topic: []string{"rpc", "hal", "dump"},
 		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
 	})
-	sendMsg(t, cm5, protoPing{T: "ping", TS: 77, SID: testCM5SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", TS: 77, SID: testCM5SID})
 
 	type readResult struct {
 		line []byte
 		err  error
 	}
 	type wireHeader struct {
-		T string `json:"t"`
+		Type string `json:"type"`
 	}
 	var gotReply, gotPong bool
 	for i := 0; i < 2; i++ {
 		msg := readMsg[wireHeader](t, cm5)
-		switch msg.T {
+		switch msg.Type {
 		case msgReply:
 			gotReply = true
 		case msgPong:
 			gotPong = true
 		default:
-			t.Fatalf("unexpected message type %q", msg.T)
+			t.Fatalf("unexpected message type %q", msg.Type)
 		}
 	}
 	if !gotReply {
@@ -1107,8 +1111,8 @@ func TestCallExport(t *testing.T) {
 	}()
 
 	call := readMsg[protoCall](t, cm5)
-	if call.T != "call" {
-		t.Fatalf("expected call, got %q", call.T)
+	if call.Type != "call" {
+		t.Fatalf("expected call, got %q", call.Type)
 	}
 	want := []string{"rpc", "hal", "dump"}
 	if !slicesEqual(call.Topic, want) {
@@ -1123,10 +1127,10 @@ func TestCallExport(t *testing.T) {
 	}
 
 	sendMsg(t, cm5, protoReply{
-		T:       "reply",
-		Corr:    call.ID,
-		OK:      true,
-		Payload: json.RawMessage(`{"ok":true,"remote":"cm5"}`),
+		Type:  "reply",
+		Corr:  call.ID,
+		OK:    true,
+		Value: json.RawMessage(`{"ok":true,"remote":"cm5"}`),
 	})
 
 	select {
@@ -1430,12 +1434,12 @@ func TestCallExportPeerReset(t *testing.T) {
 	}()
 
 	call := readMsg[protoCall](t, cm5)
-	if call.T != "call" {
-		t.Fatalf("expected call, got %q", call.T)
+	if call.Type != "call" {
+		t.Fatalf("expected call, got %q", call.Type)
 	}
 
 	sendMsg(t, cm5, protoHello{
-		T: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "fresh-session", Proto: protoVersion,
+		Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "fresh-session", Proto: protoVersion,
 	})
 	_ = readMsg[protoHelloAck](t, cm5)
 
@@ -1488,20 +1492,20 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 	}()
 
 	call := readMsg[protoCall](t, cm5)
-	if call.T != "call" {
-		t.Fatalf("expected call, got %q", call.T)
+	if call.Type != "call" {
+		t.Fatalf("expected call, got %q", call.Type)
 	}
 
 	// Send an echoed hello_ack (our own SID) — should be ignored.
 	sendMsg(t, cm5, protoHelloAck{
-		T: "hello_ack", Node: "mcu-1", SID: ack.SID, Proto: protoVersion, OK: true,
+		Type: "hello_ack", Node: "mcu-1", SID: ack.SID, Proto: protoVersion, OK: true,
 	})
 
 	sendMsg(t, cm5, protoReply{
-		T:       "reply",
-		Corr:    call.ID,
-		OK:      true,
-		Payload: json.RawMessage(`{"ok":true,"remote":"cm5"}`),
+		Type:  "reply",
+		Corr:  call.ID,
+		OK:    true,
+		Value: json.RawMessage(`{"ok":true,"remote":"cm5"}`),
 	})
 
 	select {

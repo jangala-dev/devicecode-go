@@ -9,7 +9,13 @@ import (
 
 // Used for USB serial (fabric-test) and host-side unit tests.
 
-const maxLineLen = 2048
+// maxLineLen caps a single fabric frame (line-delimited JSON) end-to-end. It
+// must clear the worst-case encoded transfer chunk: release chunk_size = 2048
+// raw → ~2731 chars base64url-encoded + ~150-byte JSON envelope + newline
+// ≈ 2900 bytes. 4096 is the tightest round power-of-2 above that with ~1.1 KB
+// headroom. See devicecode-lua/src/services/fabric/protocol.lua at
+// update-migration tip for the canonical encoding.
+const maxLineLen = 4096
 
 var ErrLineTooLong = fmt.Errorf("line exceeds %d bytes", maxLineLen)
 

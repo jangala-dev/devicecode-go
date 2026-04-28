@@ -2,19 +2,17 @@ package fabric
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/x/xxhash"
 )
 
 type fakeTransferSink struct {
-	seqs         []uint32
 	offs         []uint32
 	writes       [][]byte
 	writeErr     error
@@ -26,11 +24,10 @@ type fakeTransferSink struct {
 	abortReasons []string
 }
 
-func (s *fakeTransferSink) WriteChunk(seq, off uint32, data []byte) error {
+func (s *fakeTransferSink) WriteChunk(off uint32, data []byte) error {
 	if s.writeErr != nil {
 		return s.writeErr
 	}
-	s.seqs = append(s.seqs, seq)
 	s.offs = append(s.offs, off)
 	s.writes = append(s.writes, append([]byte(nil), data...))
 	return nil
@@ -73,40 +70,54 @@ func rawURL(data []byte) string {
 	return base64.RawURLEncoding.EncodeToString(data)
 }
 
-func sha256String(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+// xxhashStr is the wire-format checksum: lower-case hex, 8 chars, no algorithm
+// field. Mirrors the Lua reference's M.digest_hex.
+func xxhashStr(data []byte) string {
+	return xxhash.SumHex(data)
 }
 
-func TestTransferBeginUnsupportedOnHost(t *testing.T) {
+func TestTransferBeginPreservesMeta(t *testing.T) {
+	// xfer_begin's meta is opaque to fabric-protocol but must be preserved
+	// for fabric-update's receiver, which pulls meta.receiver out of it.
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
 
+	var captured transferMeta
+	sink := &fakeTransferSink{}
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu-1",
+		peerID:   "cm5-local",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			captured = meta
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
 	bringUp(t, cm5)
 
-	payload := []byte("firmware")
-	sendMsg(t, cm5, protoXferBegin{
-		T:        msgXferBegin,
-		ID:       "xfer-1",
-		Kind:     "firmware.rp2350",
-		Name:     "fw.bin",
-		Format:   "bin",
-		Enc:      "b64url",
-		Size:     uint32(len(payload)),
-		ChunkRaw: 4,
-		Chunks:   2,
-		SHA256:   sha256String(payload),
-	})
+	payload := []byte("abcd")
+	metaBlob := json.RawMessage(`{"receiver":["raw","member","mcu","cap","updater","main","rpc","receive"],"version":"1.2.3"}`)
 
-	ready := readMsg[protoXferReady](t, cm5)
-	if ready.T != msgXferReady || ready.ID != "xfer-1" || ready.OK {
-		t.Fatalf("bad xfer_ready: %+v", ready)
+	sendMsg(t, cm5, protoXferBegin{
+		Type:     msgXferBegin,
+		XferID:   "xfer-meta",
+		Size:     uint32(len(payload)),
+		Checksum: xxhashStr(payload),
+		Meta:     metaBlob,
+	})
+	_ = readMsg[protoXferReady](t, cm5)
+
+	if string(captured.Meta) != string(metaBlob) {
+		t.Fatalf("transferMeta.Meta = %q, want %q", captured.Meta, metaBlob)
 	}
-	if ready.Err != "unsupported" {
-		t.Fatalf("xfer_ready.Err = %q, want unsupported", ready.Err)
+	if captured.ID != "xfer-meta" || captured.Size != uint32(len(payload)) {
+		t.Fatalf("transferMeta basic fields wrong: %+v", captured)
 	}
 }
 
@@ -127,64 +138,47 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcdefghij")
+	checksum := xxhashStr(payload)
+
 	sendMsg(t, cm5, protoXferBegin{
-		T:        msgXferBegin,
-		ID:       "xfer-2",
-		Kind:     "firmware.rp2350",
-		Name:     "fw.bin",
-		Format:   "bin",
-		Enc:      "b64url",
+		Type:     msgXferBegin,
+		XferID:   "xfer-2",
 		Size:     uint32(len(payload)),
-		ChunkRaw: 4,
-		Chunks:   3,
-		SHA256:   sha256String(payload),
+		Checksum: checksum,
 	})
 
 	ready := readMsg[protoXferReady](t, cm5)
-	if !ready.OK || ready.Next == nil || *ready.Next != 0 {
+	if ready.Type != msgXferReady || ready.XferID != "xfer-2" {
 		t.Fatalf("bad xfer_ready: %+v", ready)
 	}
 
-	parts := [][]byte{
-		payload[:4],
-		payload[4:8],
-		payload[8:],
-	}
+	parts := [][]byte{payload[:4], payload[4:8], payload[8:]}
 	off := uint32(0)
 	for i, part := range parts {
 		sendMsg(t, cm5, protoXferChunk{
-			T:     msgXferChunk,
-			ID:    "xfer-2",
-			Seq:   uint32(i),
-			Off:   off,
-			N:     uint32(len(part)),
-			CRC32: crc32Hex(part),
-			Data:  rawURL(part),
+			Type:   msgXferChunk,
+			XferID: "xfer-2",
+			Offset: off,
+			Data:   rawURL(part),
 		})
 		need := readMsg[protoXferNeed](t, cm5)
-		if need.Next != uint32(i+1) || need.Err != "" {
-			t.Fatalf("bad xfer_need[%d]: %+v", i, need)
+		want := off + uint32(len(part))
+		if need.Next != want {
+			t.Fatalf("xfer_need[%d].next = %d, want %d", i, need.Next, want)
 		}
-		off += uint32(len(part))
+		off = want
 	}
 
 	sendMsg(t, cm5, protoXferCommit{
-		T:      msgXferCommit,
-		ID:     "xfer-2",
-		Size:   uint32(len(payload)),
-		SHA256: sha256String(payload),
+		Type:     msgXferCommit,
+		XferID:   "xfer-2",
+		Size:     uint32(len(payload)),
+		Checksum: checksum,
 	})
 
 	done := readMsg[protoXferDone](t, cm5)
-	if !done.OK || done.ID != "xfer-2" {
+	if done.Type != msgXferDone || done.XferID != "xfer-2" {
 		t.Fatalf("bad xfer_done: %+v", done)
-	}
-	var info transferInfo
-	if err := json.Unmarshal(done.Info, &info); err != nil {
-		t.Fatalf("unmarshal info: %v", err)
-	}
-	if info.BytesWritten != 10 || info.SlotXIPAddr != 0x10280000 {
-		t.Fatalf("bad transfer info: %+v", info)
 	}
 
 	time.Sleep(postTransferDoneSettle + 50*time.Millisecond)
@@ -200,7 +194,10 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	}
 }
 
-func TestTransferChunkBadCRCRequestsResend(t *testing.T) {
+func TestTransferChunkBadOffsetAborts(t *testing.T) {
+	// Lua transfer_mgr aborts and clears the active transfer on chunk faults
+	// (unexpected_offset, decode_failed, size_overflow). Match that — do not
+	// keep the transfer alive with an xfer_need.
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -212,39 +209,35 @@ func TestTransferChunkBadCRCRequestsResend(t *testing.T) {
 
 	payload := []byte("abcd")
 	sendMsg(t, cm5, protoXferBegin{
-		T:        msgXferBegin,
-		ID:       "xfer-3",
-		Kind:     "firmware.rp2350",
-		Name:     "fw.bin",
-		Format:   "bin",
-		Enc:      "b64url",
+		Type:     msgXferBegin,
+		XferID:   "xfer-3",
 		Size:     uint32(len(payload)),
-		ChunkRaw: 4,
-		Chunks:   1,
-		SHA256:   sha256String(payload),
+		Checksum: xxhashStr(payload),
 	})
 	_ = readMsg[protoXferReady](t, cm5)
 
+	// Send a chunk at the wrong byte offset; expect xfer_abort and
+	// sink.Abort, not an xfer_need retry.
 	sendMsg(t, cm5, protoXferChunk{
-		T:     msgXferChunk,
-		ID:    "xfer-3",
-		Seq:   0,
-		Off:   0,
-		N:     uint32(len(payload)),
-		CRC32: "deadbeef",
-		Data:  rawURL(payload),
+		Type:   msgXferChunk,
+		XferID: "xfer-3",
+		Offset: 7,
+		Data:   rawURL(payload),
 	})
 
-	need := readMsg[protoXferNeed](t, cm5)
-	if need.Next != 0 || need.Err != "bad_crc" {
-		t.Fatalf("bad xfer_need: %+v", need)
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Type != msgXferAbort || abort.XferID != "xfer-3" || abort.Err != "unexpected_offset" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 	if len(sink.writes) != 0 {
 		t.Fatalf("sink received %d writes, want 0", len(sink.writes))
 	}
+	if len(sink.abortReasons) == 0 {
+		t.Fatal("expected sink.Abort to be called on chunk fault")
+	}
 }
 
-func TestTransferCommitHashMismatchReturnsDoneError(t *testing.T) {
+func TestTransferChunkDecodeFailureAborts(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -256,42 +249,151 @@ func TestTransferCommitHashMismatchReturnsDoneError(t *testing.T) {
 
 	payload := []byte("abcd")
 	sendMsg(t, cm5, protoXferBegin{
-		T:        msgXferBegin,
-		ID:       "xfer-4",
-		Kind:     "firmware.rp2350",
-		Name:     "fw.bin",
-		Format:   "bin",
-		Enc:      "b64url",
+		Type:     msgXferBegin,
+		XferID:   "xfer-d1",
 		Size:     uint32(len(payload)),
-		ChunkRaw: 4,
-		Chunks:   1,
-		SHA256:   sha256String(payload),
+		Checksum: xxhashStr(payload),
+	})
+	_ = readMsg[protoXferReady](t, cm5)
+
+	// Bogus base64 (uses non-base64url chars).
+	sendMsg(t, cm5, protoXferChunk{
+		Type:   msgXferChunk,
+		XferID: "xfer-d1",
+		Offset: 0,
+		Data:   "!!!not-base64!!!",
+	})
+
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Err != "decode_failed" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
+	}
+	if len(sink.abortReasons) == 0 {
+		t.Fatal("expected sink.Abort on decode failure")
+	}
+}
+
+func TestTransferChunkSizeOverflowAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	// Advertise size=4 but send 6 bytes in the first chunk.
+	sendMsg(t, cm5, protoXferBegin{
+		Type:     msgXferBegin,
+		XferID:   "xfer-d2",
+		Size:     uint32(len(payload)),
+		Checksum: xxhashStr(payload),
 	})
 	_ = readMsg[protoXferReady](t, cm5)
 
 	sendMsg(t, cm5, protoXferChunk{
-		T:     msgXferChunk,
-		ID:    "xfer-4",
-		Seq:   0,
-		Off:   0,
-		N:     uint32(len(payload)),
-		CRC32: crc32Hex(payload),
-		Data:  rawURL(payload),
+		Type:   msgXferChunk,
+		XferID: "xfer-d2",
+		Offset: 0,
+		Data:   rawURL([]byte("abcdef")),
+	})
+
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Err != "size_overflow" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
+	}
+}
+
+func TestTransferCommitChecksumMismatchAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	// Begin with the wrong-checksum advertised. The only way to surface a
+	// commit-time mismatch is for begin/commit checksums to disagree, OR for
+	// the streamed bytes to disagree with the begin checksum. Use the
+	// latter: claim a bogus begin/commit checksum but stream the real bytes.
+	bogus := strings.Repeat("0", 8)
+	sendMsg(t, cm5, protoXferBegin{
+		Type:     msgXferBegin,
+		XferID:   "xfer-4",
+		Size:     uint32(len(payload)),
+		Checksum: bogus,
+	})
+	_ = readMsg[protoXferReady](t, cm5)
+
+	sendMsg(t, cm5, protoXferChunk{
+		Type:   msgXferChunk,
+		XferID: "xfer-4",
+		Offset: 0,
+		Data:   rawURL(payload),
 	})
 	_ = readMsg[protoXferNeed](t, cm5)
 
 	sendMsg(t, cm5, protoXferCommit{
-		T:      msgXferCommit,
-		ID:     "xfer-4",
-		Size:   uint32(len(payload)),
-		SHA256: strings.Repeat("0", 64),
+		Type:     msgXferCommit,
+		XferID:   "xfer-4",
+		Size:     uint32(len(payload)),
+		Checksum: bogus,
 	})
 
-	done := readMsg[protoXferDone](t, cm5)
-	if done.OK || done.Err != "sha256_mismatch" {
-		t.Fatalf("bad xfer_done: %+v", done)
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Type != msgXferAbort || abort.Err != "checksum_mismatch" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink abort on hash mismatch")
+		t.Fatal("expected sink abort on checksum mismatch")
+	}
+}
+
+func TestTransferCommitChecksumMismatchOnCommitFrameAborts(t *testing.T) {
+	// xfer_begin and xfer_commit must agree on the checksum. If they
+	// disagree (even when the streamed bytes match begin), commit aborts.
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	good := xxhashStr(payload)
+	sendMsg(t, cm5, protoXferBegin{
+		Type:     msgXferBegin,
+		XferID:   "xfer-5",
+		Size:     uint32(len(payload)),
+		Checksum: good,
+	})
+	_ = readMsg[protoXferReady](t, cm5)
+
+	sendMsg(t, cm5, protoXferChunk{
+		Type:   msgXferChunk,
+		XferID: "xfer-5",
+		Offset: 0,
+		Data:   rawURL(payload),
+	})
+	_ = readMsg[protoXferNeed](t, cm5)
+
+	// Commit advertises a different checksum than begin: must abort.
+	sendMsg(t, cm5, protoXferCommit{
+		Type:     msgXferCommit,
+		XferID:   "xfer-5",
+		Size:     uint32(len(payload)),
+		Checksum: strings.Repeat("0", 8),
+	})
+
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Type != msgXferAbort || abort.Err != "checksum_mismatch" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 }
