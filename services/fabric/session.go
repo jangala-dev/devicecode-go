@@ -228,7 +228,7 @@ func (s *session) run(ctx context.Context) {
 	defer exportTick.Stop()
 
 	s.publishLinkState("", "")
-	s.log("run start build_tag=protoTypeScanV3")
+	s.log("run start")
 
 	for {
 		select {
