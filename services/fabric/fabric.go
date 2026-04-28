@@ -34,12 +34,29 @@ type LinkConfig struct {
 	// this window. Mirrors transfer_mgr.lua's `phase_timeout`.
 	// Release: 15s.
 	PhaseTimeout time.Duration
+	// PingInterval drives the unconditional outbound ping cadence after
+	// the link is established (`session_ctl.lua` resets next_ping_at =
+	// now + ping_interval after every send; not TX-activity-based).
+	// Release: 10s.
+	PingInterval time.Duration
+	// LivenessTimeout tears the link down if no frame arrives within
+	// this window once established. Mirrors session_ctl.lua's
+	// liveness_timeout_s. Release: 30s.
+	LivenessTimeout time.Duration
+	// MaxInboundHelpers caps the number of in-flight inbound RPC calls.
+	// Excess inbound calls reply `{ok=false, err="busy"}` per
+	// rpc_bridge.lua's `spawn_local_call_helper`. Lua default is 64
+	// (falls back to max_pending_calls); we keep that for parity.
+	MaxInboundHelpers int
 }
 
 func DefaultLinkConfig() LinkConfig {
 	return LinkConfig{
-		ChunkSize:    2048,
-		PhaseTimeout: 15 * time.Second,
+		ChunkSize:         2048,
+		PhaseTimeout:      15 * time.Second,
+		PingInterval:      10 * time.Second,
+		LivenessTimeout:   30 * time.Second,
+		MaxInboundHelpers: 64,
 	}
 }
 
@@ -51,6 +68,15 @@ func (c *LinkConfig) applyDefaults() {
 	if c.PhaseTimeout == 0 {
 		c.PhaseTimeout = d.PhaseTimeout
 	}
+	if c.PingInterval == 0 {
+		c.PingInterval = d.PingInterval
+	}
+	if c.LivenessTimeout == 0 {
+		c.LivenessTimeout = d.LivenessTimeout
+	}
+	if c.MaxInboundHelpers == 0 {
+		c.MaxInboundHelpers = d.MaxInboundHelpers
+	}
 }
 
 var nextSessionID atomic.Uint64
@@ -60,11 +86,12 @@ func newLocalSID() string {
 }
 
 // Run starts the fabric session. Blocks until ctx is cancelled or the
-// transport returns an unrecoverable error. The MCU is respond-only:
-// it never initiates hello or ping. It waits for hello from the CM5
-// and replies with hello_ack; it responds to ping with pong. The CM5
-// owns heartbeat cadence — the MCU marks the link stale if nothing
-// arrives within the timeout.
+// transport returns an unrecoverable error. The MCU is a hello
+// responder (CM5 always initiates hello/hello_ack), but otherwise
+// runs the symmetric session_ctl semantics: once established, it
+// sends pings every PingInterval and tears the link down if no frame
+// arrives within LivenessTimeout. Mirrors session_ctl.lua at
+// devicecode-lua@2c88090.
 func Run(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID string, cfg LinkConfig) {
 	s := session{
 		linkID:   defaultLinkID,

@@ -446,6 +446,9 @@ func TestPingPong(t *testing.T) {
 }
 
 func TestMCUNeverInitiates(t *testing.T) {
+	// Pre-handshake the MCU is silent; tickPing only fires once the link
+	// is up. Active outbound pings post-handshake are covered by
+	// TestSessionPingsUnconditionally.
 	mcu, cm5 := pipePair()
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -459,6 +462,72 @@ func TestMCUNeverInitiates(t *testing.T) {
 	case <-time.After(2 * time.Second):
 	}
 	cancel()
+}
+
+func TestSessionPingsUnconditionally(t *testing.T) {
+	// session_ctl.lua resets next_ping_at = now + ping_interval after
+	// every send, with no TX-activity dependency. Once the link is up,
+	// pings must keep flowing even if neither side talks otherwise.
+	mcu, cm5 := pipePair()
+	b := newBus()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", LinkConfig{PingInterval: 150 * time.Millisecond})
+	bringUp(t, cm5)
+
+	for i := 0; i < 3; i++ {
+		ping := readMsg[protoPing](t, cm5)
+		if ping.Type != msgPing {
+			t.Fatalf("ping[%d] type = %q, want %q", i, ping.Type, msgPing)
+		}
+	}
+}
+
+func TestInboundCallBusyAtCapacity(t *testing.T) {
+	// rpc_bridge.lua's spawn_local_call_helper rejects with err="busy"
+	// when inbound_helpers >= max_inbound_helpers, before the route check.
+	// With MaxInboundHelpers=1, the second concurrent inbound call must
+	// reply busy without going through routing.
+	prev := importCallRules
+	importCallRules = append([]importRule{}, prev...)
+	importCallRules = append(importCallRules, importRule{
+		wire:  []string{"rpc", "test", "noop"},
+		local: []string{"rpc", "test", "noop"},
+	})
+	t.Cleanup(func() { importCallRules = prev })
+
+	mcu, cm5 := pipePair()
+	b := newBus()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", LinkConfig{MaxInboundHelpers: 1})
+	bringUp(t, cm5)
+
+	// First call holds the only helper slot. The bus has no handler, so
+	// the call sits as a pending request until timeout.
+	sendMsg(t, cm5, protoCall{
+		Type:      msgCall,
+		ID:        "c1",
+		Topic:     []string{"rpc", "test", "noop"},
+		Payload:   json.RawMessage(`{}`),
+		TimeoutMs: 5000,
+	})
+
+	// Second call arrives while the helper is full → busy reply.
+	sendMsg(t, cm5, protoCall{
+		Type:    msgCall,
+		ID:      "c2",
+		Topic:   []string{"rpc", "test", "noop"},
+		Payload: json.RawMessage(`{}`),
+	})
+
+	reply := readMsg[protoReply](t, cm5)
+	if reply.Corr != "c2" {
+		t.Fatalf("first reply corr = %q, want c2", reply.Corr)
+	}
+	if reply.OK || reply.Err != "busy" {
+		t.Fatalf("expected busy reply for c2, got %+v", reply)
+	}
 }
 
 func TestUnknownTypeIgnored(t *testing.T) {
@@ -1458,8 +1527,8 @@ func TestCallExportPeerReset(t *testing.T) {
 		if out.OK {
 			t.Fatal("expected ok=false")
 		}
-		if out.Error != "peer_session_changed" {
-			t.Fatalf("error = %q, want peer_session_changed", out.Error)
+		if out.Error != "session_reset" {
+			t.Fatalf("error = %q, want session_reset", out.Error)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for peer-reset reply")

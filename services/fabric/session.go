@@ -31,15 +31,14 @@ const (
 
 // ---- timeouts (local policy) ----
 //
-// Timing relationships:
-//   staleTimeout (45s) > callTimeoutDef (5s)
-//
-// The CM5 sends pings every 15s of TX inactivity. The MCU marks the
-// peer stale after 45s without any RX, giving a 30s margin.
-// Exports are enabled immediately on link-up (after exportStartHoldoff).
+// LinkConfig drives the ping cadence (PingInterval) and liveness-stale
+// detection (LivenessTimeout). Mirrors session_ctl.lua at
+// devicecode-lua@2c88090: pings fire unconditionally every
+// ping_interval_s; the link is torn down if no frame arrives within
+// liveness_timeout_s. Exports are enabled immediately on link-up
+// (after exportStartHoldoff).
 
 const (
-	staleTimeout       = 45 * time.Second
 	callTimeoutDef     = 5 * time.Second
 	waitLogEvery       = 2 * time.Second
 	exportStartHoldoff = 1 * time.Second
@@ -60,15 +59,16 @@ const (
 // ---- link reasons and error strings ----
 
 const (
-	reasonLinkDown           = "link_down"
-	reasonPeerStale          = "peer_stale"
-	reasonPeerReset          = "peer_reset"
-	reasonPeerSessionChanged = "peer_session_changed"
-	reasonHelloRejected      = "hello_rejected"
-	reasonTransportDown      = "transport_down"
-	reasonTransportWrite     = "transport_write_failed"
-	reasonNoRoute            = "no_route"
-	reasonTimeout            = "timeout"
+	reasonLinkDown       = "link_down"
+	reasonPeerStale      = "peer_stale"
+	reasonPeerReset      = "peer_reset"
+	reasonSessionReset   = "session_reset"
+	reasonHelloRejected  = "hello_rejected"
+	reasonTransportDown  = "transport_down"
+	reasonTransportWrite = "transport_write_failed"
+	reasonNoRoute        = "no_route"
+	reasonBusy           = "busy"
+	reasonTimeout        = "timeout"
 )
 
 // ---- bus topics for config handling ----
@@ -155,6 +155,7 @@ type session struct {
 	inboundCalls     []*inboundCall
 	outboundCalls    []*outboundCall
 	nextOutboundID   uint64
+	nextPingAt       time.Time
 	incomingTransfer *incomingTransfer
 	beginTransfer    func(transferMeta) (transferSink, error)
 
@@ -209,7 +210,7 @@ func (s *session) run(ctx context.Context) {
 	defer s.abortTransfer(reasonLinkDown)
 	defer s.log("run stop")
 
-	stale := time.NewTimer(staleTimeout)
+	stale := time.NewTimer(s.cfg.LivenessTimeout)
 	defer stale.Stop()
 
 	waitTick := time.NewTicker(waitLogEvery)
@@ -238,7 +239,7 @@ func (s *session) run(ctx context.Context) {
 				return
 			}
 			s.dispatch(res.line)
-			resetTimer(stale, staleTimeout)
+			resetTimer(stale, s.cfg.LivenessTimeout)
 
 		case <-exportTick.C:
 			now := time.Now()
@@ -246,6 +247,7 @@ func (s *session) run(ctx context.Context) {
 			s.drainInbound(now)
 			s.drainOutbound(now)
 			s.checkTransferTimeout(now)
+			s.tickPing(now)
 
 		case <-waitTick.C:
 			s.logWaiting()
@@ -254,7 +256,7 @@ func (s *session) run(ctx context.Context) {
 			if s.link == linkUp {
 				s.handleLinkDown(reasonPeerStale, "")
 			} else {
-				stale.Reset(staleTimeout)
+				stale.Reset(s.cfg.LivenessTimeout)
 			}
 		}
 	}
@@ -348,6 +350,9 @@ func (s *session) handleLinkDown(reason, err string) {
 }
 
 // promoteLink transitions to linkUp, tearing down any prior session state.
+// `reason` carries the link-state telemetry tag (e.g. session_reset) and
+// is also used as the err string on any pending outbound calls cancelled
+// by the transition, matching rpc_bridge.lua's session-replace behaviour.
 func (s *session) promoteLink(reason string) {
 	if s.link == linkUp {
 		if reason == "" {
@@ -362,6 +367,7 @@ func (s *session) promoteLink(reason string) {
 	s.setupExports()
 	s.exportsEnabled = true
 	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
+	s.nextPingAt = time.Now().Add(s.cfg.PingInterval)
 	s.log("exports enabled")
 	s.publishLinkState(reason, "")
 }
@@ -454,7 +460,7 @@ func (s *session) logMalformed(line []byte, err error) {
 func (s *session) notePeerIdentity(node, sid string, proto int) string {
 	reason := ""
 	if s.link == linkUp && s.peerSID != "" && sid != "" && s.peerSID != sid {
-		reason = reasonPeerSessionChanged
+		reason = reasonSessionReset
 	}
 	if node != "" {
 		s.peerNode = node
@@ -539,6 +545,22 @@ func (s *session) onPing(msg *protoPing) {
 	s.log("pong tx")
 }
 
+// tickPing sends an outbound ping if the link is established and the
+// PingInterval cadence has elapsed. Mirrors session_ctl.lua: pings fire
+// unconditionally every ping_interval after each send (NOT TX-activity-based).
+func (s *session) tickPing(now time.Time) {
+	if s.link != linkUp {
+		return
+	}
+	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
+		return
+	}
+	if !s.sendFrame(marshal(protoPing{Type: msgPing, TS: now.UnixMilli(), SID: s.localSID})) {
+		return
+	}
+	s.nextPingAt = now.Add(s.cfg.PingInterval)
+}
+
 func (s *session) onPong(msg *protoPong) {
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
@@ -612,6 +634,12 @@ func (s *session) onCall(msg *protoCall) {
 			ConfigError: s.lastConfigErr,
 		}
 		s.sendFrame(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: true, Value: mustMarshal(reply)}))
+		return
+	}
+
+	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
+		s.log("incoming call dropped: busy")
+		s.sendFrame(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
 		return
 	}
 
