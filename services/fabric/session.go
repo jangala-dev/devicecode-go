@@ -658,9 +658,12 @@ func (s *session) onPub(msg *protoPub) {
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 	if msg.Retain {
 		s.trackImportedRetain(localTopic)
-	} else {
-		s.untrackImportedRetain(localTopic)
 	}
+	// A non-retained pub on the same topic must NOT untrack: the bus
+	// retain store is only cleared by an explicit unretain (or a
+	// retained-nil publish), so the prior retained value is still live
+	// and must be cleaned up on session reset. Mirrors rpc_bridge.lua,
+	// which only mutates imported_retained on retain set/clear.
 }
 
 func (s *session) onUnretain(msg *protoUnretain) {

@@ -589,6 +589,93 @@ func TestSessionResetUnretainsImports(t *testing.T) {
 	}
 }
 
+func TestSessionResetUnretainsImportsAfterTransientPub(t *testing.T) {
+	// Regression: a non-retained pub arriving on the same imported topic
+	// after an earlier retained pub must NOT untrack — the bus retain
+	// store still holds the prior retained value (the bus only clears it
+	// on explicit unretain/retained-nil). Without this, the stale retain
+	// would survive a session-reset because we'd think nothing was tracked.
+	prev := importPublishRules
+	importPublishRules = append([]importRule{}, prev...)
+	importPublishRules = append(importPublishRules, importRule{
+		wire:  []string{"telem", "device", "fast"},
+		local: []string{"telem", "hal", "fast"},
+	})
+	t.Cleanup(func() { importPublishRules = prev })
+
+	mcu, cm5 := pipePair()
+	b := newBus()
+	observer := b.NewConnection("observer")
+	subFast := observer.Subscribe(bus.T("telem", "hal", "fast"))
+	defer observer.Unsubscribe(subFast)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	// 1) Retained import — establishes the bus retain + tracking entry.
+	sendMsg(t, cm5, protoPub{
+		Type:    msgPub,
+		Topic:   []string{"telem", "device", "fast"},
+		Payload: json.RawMessage(`{"v":1}`),
+		Retain:  true,
+	})
+
+	// Drain until we see the retained payload.
+	deadline := time.After(2 * time.Second)
+	gotRetain := false
+	for !gotRetain {
+		select {
+		case msg := <-subFast.Channel():
+			if msg.Retained && msg.Payload != nil {
+				gotRetain = true
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for initial retained pub")
+		}
+	}
+
+	// 2) Non-retained pub on same topic — must not untrack.
+	sendMsg(t, cm5, protoPub{
+		Type:    msgPub,
+		Topic:   []string{"telem", "device", "fast"},
+		Payload: json.RawMessage(`{"v":2}`),
+		Retain:  false,
+	})
+	// Best-effort drain so the next subFast read sees the unretain edge.
+	deadline = time.After(500 * time.Millisecond)
+	draining := true
+	for draining {
+		select {
+		case <-subFast.Channel():
+		case <-deadline:
+			draining = false
+		}
+	}
+
+	// 3) Session reset → expect the original retain to be cleared.
+	go func() { _ = readMsg[protoHelloAck](t, cm5) }()
+	sendMsg(t, cm5, protoHello{
+		Type: msgHello,
+		Node: "cm5-local",
+		Peer: "mcu-1",
+		SID:  "cm5-sid-new",
+	})
+
+	deadline = time.After(2 * time.Second)
+	for {
+		select {
+		case msg := <-subFast.Channel():
+			if msg.Retained && msg.Payload == nil {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for unretain after session reset")
+		}
+	}
+}
+
 func TestWriterControlPreemptsRPCAndBulk(t *testing.T) {
 	// writer.lua drains the control lane first (no fairness); then
 	// weighted RR between rpc and bulk. Pre-load all three lanes and
