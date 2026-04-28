@@ -468,7 +468,7 @@ func (r *Reactor) Run(ctx context.Context) {
 				fabricSessionOpen = true
 				go func() {
 					defer close(done)
-					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5-local", fabric.DefaultLinkConfig())
+					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5", fabric.DefaultLinkConfig())
 				}()
 				log.Println("[uart0] fabric session opened")
 			}
