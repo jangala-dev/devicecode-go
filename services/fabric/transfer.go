@@ -51,6 +51,10 @@ type incomingTransfer struct {
 	bytesWritten uint32
 	chunksSeen   uint32
 	hasher       *xxhash.Hasher
+	// deadline is the idle-chunk watchdog: bumped on every accepted chunk
+	// and on initial xfer_begin. checkTransferTimeout fires if now > deadline.
+	// Mirrors transfer_mgr.lua: `active.deadline = runtime.now() + phase_timeout`.
+	deadline time.Time
 }
 
 func lowerHex(s string) string {
@@ -107,6 +111,26 @@ func (s *session) abortTransfer(reason string) {
 	}
 }
 
+// checkTransferTimeout enforces the idle-chunk watchdog. Fires once per
+// drain tick from the session run loop; cheap when no transfer is active.
+// On expiry both the local sink is aborted and an xfer_abort frame is sent
+// to the peer (matching Lua transfer_mgr.lua's `clear_active('timeout')` +
+// outbound xfer_abort).
+func (s *session) checkTransferTimeout(now time.Time) {
+	cur := s.incomingTransfer
+	if cur == nil {
+		return
+	}
+	if !now.After(cur.deadline) {
+		return
+	}
+	id := cur.meta.ID
+	println("[fabric]", "sid", s.localSID, "xfer_phase_timeout",
+		"id", id, "phase_s", u32s(uint32(s.cfg.PhaseTimeout/time.Second)))
+	s.abortTransfer("timeout")
+	s.sendTransferAbort(id, "timeout")
+}
+
 func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 	if msg.XferID == "" {
 		return transferMeta{}, "xfer_begin.xfer_id"
@@ -148,9 +172,10 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		return
 	}
 	s.incomingTransfer = &incomingTransfer{
-		meta:   meta,
-		sink:   sink,
-		hasher: xxhash.New(0),
+		meta:     meta,
+		sink:     sink,
+		hasher:   xxhash.New(0),
+		deadline: time.Now().Add(s.cfg.PhaseTimeout),
 	}
 	println(
 		"[fabric]", "sid", s.localSID,
@@ -216,6 +241,7 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	_, _ = cur.hasher.Write(raw)
 	cur.bytesWritten += uint32(len(raw))
 	cur.chunksSeen++
+	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 	if cur.chunksSeen == 1 || (cur.chunksSeen%transferProgressLogEvery) == 0 {
 		println(
 			"[fabric]", "sid", s.localSID,

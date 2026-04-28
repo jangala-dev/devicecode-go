@@ -320,7 +320,7 @@ func TestHandshake(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	sendMsg(t, cm5, protoHello{
 		Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s1", Proto: protoVersion,
@@ -342,7 +342,7 @@ func TestSessionReset(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-1", SID: "s2", Proto: protoVersion})
@@ -362,7 +362,7 @@ func TestRejectsWrongPeer(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	sendMsg(t, cm5, protoHello{Type: "hello", Node: "cm5-local", Peer: "mcu-999", SID: "s1", Proto: protoVersion})
 	gotLine := make(chan readResult, 1)
@@ -398,7 +398,7 @@ func TestRejectsMissingNodeWhenPeerPinned(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	gotLine := make(chan readResult, 1)
 	go func() {
@@ -436,7 +436,7 @@ func TestPingPong(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	ack := bringUp(t, cm5)
 	sendMsg(t, cm5, protoPing{Type: "ping", TS: 42, SID: "s1"})
 	pong := readMsg[protoPong](t, cm5)
@@ -450,7 +450,7 @@ func TestMCUNeverInitiates(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	gotLine := make(chan struct{})
 	go func() { cm5.ReadLine(); close(gotLine) }()
 	select {
@@ -466,7 +466,7 @@ func TestUnknownTypeIgnored(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte(`{"type":"future_msg"}`))
 	sendMsg(t, cm5, protoPing{Type: "ping", TS: 1})
@@ -481,7 +481,7 @@ func TestMalformedJSONIgnored(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte("not json"))
 	sendMsg(t, cm5, protoPing{Type: "ping", TS: 2})
@@ -496,7 +496,7 @@ func TestCancelClosesCleanly(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local"); close(done) }()
+	go func() { Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig()); close(done) }()
 	bringUp(t, cm5)
 	cancel()
 	select {
@@ -515,7 +515,7 @@ func TestLinkStatePublishedOnHandshake(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	ack := bringUp(t, cm5)
 
@@ -682,7 +682,7 @@ func TestPubImport(t *testing.T) {
 	conn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, conn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, conn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	reader := b.NewConnection("test")
@@ -714,7 +714,7 @@ func TestPubExport(t *testing.T) {
 	publishConn := b.NewConnection("hal")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	unlockExports(t, cm5)
 
@@ -744,7 +744,7 @@ func TestUnretainExport(t *testing.T) {
 	publishConn := b.NewConnection("hal")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	unlockExports(t, cm5)
 
@@ -841,7 +841,7 @@ func TestPubIgnoredBeforeHandshake(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	sendMsg(t, cm5, protoPub{
 		Type: "pub", Topic: []string{"config", "device"},
@@ -864,7 +864,7 @@ func TestUnretainIgnoredBeforeHandshake(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	writer := b.NewConnection("writer")
 	writer.Publish(writer.NewMessage(bus.T("config", "device"), json.RawMessage(`{"v":1}`), true))
@@ -895,7 +895,7 @@ func TestUnretain(t *testing.T) {
 	conn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, conn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, conn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoPub{
@@ -925,7 +925,7 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 	fabricConn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 
 	handler := b.NewConnection("handler")
 	sub := handler.Subscribe(bus.T("rpc", "hal", "dump"))
@@ -949,7 +949,7 @@ func TestCallImport(t *testing.T) {
 	fabricConn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	handler := b.NewConnection("handler")
@@ -979,7 +979,7 @@ func TestCallNoRoute(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local")
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoCall{
@@ -1005,7 +1005,7 @@ func TestDumpCallReturnsConfigState(t *testing.T) {
 	fabricConn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	// Send config first so the session has state.
@@ -1048,7 +1048,7 @@ func TestDumpCallDoesNotBlockPing(t *testing.T) {
 	fabricConn := b.NewConnection("fabric")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 
 	// Send dump call and ping back-to-back.
@@ -1092,7 +1092,7 @@ func TestCallExport(t *testing.T) {
 	reqConn := b.NewConnection("caller")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	unlockExports(t, cm5)
 
@@ -1163,7 +1163,7 @@ func TestCallExportOnlyConfiguredRule(t *testing.T) {
 	reqConn := b.NewConnection("caller")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	unlockExports(t, cm5)
 
@@ -1415,7 +1415,7 @@ func TestCallExportPeerReset(t *testing.T) {
 	reqConn := b.NewConnection("caller")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	bringUp(t, cm5)
 	unlockExports(t, cm5)
 
@@ -1473,7 +1473,7 @@ func TestEchoedHelloAckIgnoredDuringOutgoingCall(t *testing.T) {
 	reqConn := b.NewConnection("caller")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local")
+	go Run(ctx, mcu, fabricConn, "mcu-1", "cm5-local", DefaultLinkConfig())
 	ack := bringUp(t, cm5)
 	unlockExports(t, cm5)
 

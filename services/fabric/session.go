@@ -138,6 +138,7 @@ type session struct {
 	localSID string
 	tr       Transport
 	conn     *bus.Connection
+	cfg      LinkConfig
 
 	link           linkState
 	peerNode       string
@@ -173,6 +174,7 @@ func (s *session) logKV(msg, key, value string) {
 
 // run is the main loop. Blocks until ctx is cancelled.
 func (s *session) run(ctx context.Context) {
+	s.cfg.applyDefaults()
 	lines := make(chan readResult, lineQueueSize)
 
 	go func() {
@@ -239,9 +241,11 @@ func (s *session) run(ctx context.Context) {
 			resetTimer(stale, staleTimeout)
 
 		case <-exportTick.C:
+			now := time.Now()
 			s.drainExports()
-			s.drainInbound(time.Now())
-			s.drainOutbound(time.Now())
+			s.drainInbound(now)
+			s.drainOutbound(now)
+			s.checkTransferTimeout(now)
 
 		case <-waitTick.C:
 			s.logWaiting()

@@ -354,6 +354,52 @@ func TestTransferCommitChecksumMismatchAborts(t *testing.T) {
 	}
 }
 
+func TestTransferIdleChunkWatchdog(t *testing.T) {
+	// transfer_mgr.lua refreshes active.deadline = now + phase_timeout on
+	// each accepted chunk and aborts with reason="timeout" if the deadline
+	// passes. With a tight PhaseTimeout, dropping the wire after xfer_begin
+	// must produce an unsolicited xfer_abort within ~one drain tick.
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu-1",
+		peerID:   "cm5-local",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		cfg:      LinkConfig{PhaseTimeout: 100 * time.Millisecond},
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, protoXferBegin{
+		Type:     msgXferBegin,
+		XferID:   "xfer-wd",
+		Size:     uint32(len(payload)),
+		Checksum: xxhashStr(payload),
+	})
+	_ = readMsg[protoXferReady](t, cm5)
+
+	// Stop sending chunks; watchdog should fire within ~PhaseTimeout +
+	// one exportTickInterval (50ms).
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Type != msgXferAbort || abort.XferID != "xfer-wd" || abort.Err != "timeout" {
+		t.Fatalf("bad xfer_abort: %+v", abort)
+	}
+	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "timeout" {
+		t.Fatalf("sink.Abort reasons = %v, want [\"timeout\"]", sink.abortReasons)
+	}
+}
+
 func TestTransferCommitChecksumMismatchOnCommitFrameAborts(t *testing.T) {
 	// xfer_begin and xfer_commit must agree on the checksum. If they
 	// disagree (even when the streamed bytes match begin), commit aborts.
