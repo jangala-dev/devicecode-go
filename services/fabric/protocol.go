@@ -1,6 +1,10 @@
 package fabric
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"devicecode-go/x/strconvx"
+)
 
 // ---- Wire message type identifiers ----
 //
@@ -180,41 +184,52 @@ func marshal(v any) []byte {
 // e.g. for `{"payload":{"type":"x"},"type":"pub"}` the result is "pub".
 // Returns "" if the line isn't a JSON object, the top-level "type" key
 // is missing, or its value isn't a string.
+//
+// DEBUG: every bail path emits a one-line `protoType bail` print so we
+// can see on hardware exactly where the scanner gives up. This noise
+// will be removed once the hardware bring-up is complete.
 func protoType(line []byte) string {
 	n := len(line)
 	i := skipJSONSpace(line, 0)
 	if i >= n || line[i] != '{' {
+		debugBail("no_opening_brace", line, i)
 		return ""
 	}
 	i++
 	for {
 		i = skipJSONSpace(line, i)
 		if i >= n {
+			debugBail("eof_after_brace", line, i)
 			return ""
 		}
 		switch line[i] {
 		case '}':
+			debugBail("close_before_type", line, i)
 			return ""
 		case ',':
 			i++
 			continue
 		}
 		if line[i] != '"' {
+			debugBail("non_quote_at_key_start", line, i)
 			return ""
 		}
 		keyStart := i + 1
 		keyEnd, ok := scanJSONString(line, i)
 		if !ok {
+			debugBail("scanstring_key_failed", line, i)
 			return ""
 		}
 		i = keyEnd
 		i = skipJSONSpace(line, i)
 		if i >= n || line[i] != ':' {
+			debugBail("missing_colon_after_key", line, i)
 			return ""
 		}
 		i++
 		i = skipJSONSpace(line, i)
 		if i >= n {
+			debugBail("eof_after_colon", line, i)
 			return ""
 		}
 		isType := keyEnd-1-keyStart == 4 &&
@@ -222,20 +237,33 @@ func protoType(line []byte) string {
 			line[keyStart+2] == 'p' && line[keyStart+3] == 'e'
 		if isType {
 			if line[i] != '"' {
+				debugBail("type_value_not_string", line, i)
 				return ""
 			}
 			valStart := i + 1
 			valEnd, ok := scanJSONString(line, i)
 			if !ok {
+				debugBail("scanstring_value_failed", line, i)
 				return ""
 			}
 			return string(line[valStart : valEnd-1])
 		}
 		i, ok = skipJSONValue(line, i)
 		if !ok {
+			debugBail("skipvalue_failed", line, i)
 			return ""
 		}
 	}
+}
+
+func debugBail(where string, line []byte, i int) {
+	preview := line
+	if len(preview) > 96 {
+		preview = preview[:96]
+	}
+	println("[fabric-debug] protoType bail at", where,
+		"i=", strconvx.Itoa(i), "len=", strconvx.Itoa(len(line)),
+		"head=", string(preview))
 }
 
 func skipJSONSpace(line []byte, i int) int {
