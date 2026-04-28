@@ -407,14 +407,16 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART sessions — fabric on uart0; uart1 is debug-only and gated by
-	// the `debug_uart` build tag (off in release per
-	// docs/firmware-alignment-protocol.md). Mirrors
-	// devicecode-lua@2c88090 `bigbox-v1-cm-2.json`, where the CM5-facing
-	// fabric link binds to uart0. The legacy CM5 telemetry-over-JSON path
-	// on uart0 has been removed; retained-state publishers in
-	// fabric-update will replace it.
-	const uartFabric = "uart0"
+	// UART sessions — fabric on uart1 (where the CM5 link physically
+	// terminates on the proto_1 hardware), uart0 reserved for the
+	// optional debug log mirror. The plan originally aspired to put
+	// fabric on uart0 to match `bigbox-v1-cm-2.json`'s CM5-side label
+	// (`uart-0` → `/dev/ttyAMA0`); on the MCU side the uart0/uart1
+	// labels are independent of the CM5's labels — they're a function
+	// of which physical pins the harness wires connect to. The
+	// legacy CM5 telemetry-over-JSON path is gone either way; retained-
+	// state publishers in fabric-update will replace it.
+	const uartFabric = "uart1"
 	subSessOpenFabric := r.uiConn.Subscribe(tSessOpened(uartFabric))
 	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
 	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
@@ -470,7 +472,7 @@ func (r *Reactor) Run(ctx context.Context) {
 					defer close(done)
 					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5", fabric.DefaultLinkConfig())
 				}()
-				log.Println("[uart0] fabric session opened")
+				log.Println("[uart1] fabric session opened")
 			}
 		case m := <-dbgLog.openedChan():
 			dbgLog.handleOpened(m)
@@ -483,7 +485,7 @@ func (r *Reactor) Run(ctx context.Context) {
 			stopFabricSession()
 			fabricSessionOpen = false
 			nextFabricWaitLog = time.Now()
-			log.Println("[uart0] fabric session closed")
+			log.Println("[uart1] fabric session closed")
 			if time.Now().After(retryFabricAt) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
