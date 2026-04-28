@@ -134,9 +134,6 @@ type Reactor struct {
 	bus    *bus.Bus
 	uiConn *bus.Connection
 
-	// UART
-	jsonOut *shmring.Ring // telemetry (JSON UART TX)
-
 	// inputs (latest)
 	vin_mV, vbat_mV int32
 	iin_mA, ibat_mA int32
@@ -165,9 +162,6 @@ type Reactor struct {
 
 	// misc
 	now time.Time
-
-	// telemetry drop counters (bytes)
-	droppedUART0Bytes int
 }
 
 func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
@@ -377,96 +371,23 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 	r.vin_mV = v.VIN_mV
 	r.iin_mA = v.IIn_mA
 	r.tsVIN = r.now
-
-	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
-	if r.jsonOut != nil {
-		var w utilities.JSONWriter
-		w.Write = r.jsonWrite
-		w.Begin()
-		w.KvInt("power/charger/internal/vin", int(v.VIN_mV))
-		w.KvInt("power/charger/internal/vsys", int(v.VSYS_mV))
-		w.KvInt("power/charger/internal/iin", int(v.IIn_mA))
-		// Full bitfield maps (0/1) for LOCF pipelines
-		{
-			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.KvInt("power/charger/internal/system/"+bitName, 1)
-				} else {
-					w.KvInt("power/charger/internal/system/"+bitName, 0)
-				}
-			}
-		}
-		{
-			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.KvInt("power/charger/internal/status/"+bitName, 1)
-				} else {
-					w.KvInt("power/charger/internal/status/"+bitName, 0)
-				}
-			}
-		}
-		{
-			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
-			for {
-				bitName, set, ok := it.NextAny()
-				if !ok {
-					break
-				}
-				if set {
-					w.KvInt("power/charger/internal/state/"+bitName, 1)
-				} else {
-					w.KvInt("power/charger/internal/state/"+bitName, 0)
-				}
-			}
-		}
-		w.End()
-	}
 }
 
 func (r *Reactor) OnBattery(v types.BatteryValue) {
 	r.vbat_mV = v.PackMilliV
 	r.ibat_mA = v.IBatMilliA
 	r.tsVBAT = r.now
-
-	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
-	if r.jsonOut != nil {
-		var w utilities.JSONWriter
-		w.Write = r.jsonWrite
-		w.Begin()
-		w.KvInt("power/battery/internal/vbat", int(v.PackMilliV))
-		w.KvInt("power/battery/internal/ibat", int(v.IBatMilliA))
-		w.KvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
-		w.End()
-	}
 }
 
-func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
+func (r *Reactor) OnTempDeciC(label string, deci int, _ string) {
 	log.Deci(label, deci)
-	if r.jsonOut != nil {
-		var w utilities.JSONWriter
-		w.Write = r.jsonWrite
-		w.Begin()
-		w.KvInt(jsonKey, deci)
-		w.End()
-	}
 }
 
-// ---- memory snapshot telemetry (every ~2 s in main loop) ----
+// ---- memory snapshot (every ~3 s in main loop) ----
 
 func (r *Reactor) emitMemSnapshot() {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	// log line
 	log.Println(
 		"[mem] ",
 		"alloc:", int(ms.Alloc), " ",
@@ -474,14 +395,6 @@ func (r *Reactor) emitMemSnapshot() {
 		"mallocs:", int(ms.Mallocs), " ",
 		"frees:", int(ms.Frees),
 	)
-	// JSON (minimal to keep overhead low)
-	if r.jsonOut != nil {
-		var w utilities.JSONWriter
-		w.Write = r.jsonWrite
-		w.Begin()
-		w.KvInt("sys/mem/alloc", int(ms.Alloc))
-		w.End()
-	}
 }
 
 func (r *Reactor) Run(ctx context.Context) {
@@ -494,22 +407,26 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART sessions
+	// UART sessions — fabric on uart0, log mirror on uart1. Mirrors
+	// devicecode-lua@2c88090 `bigbox-v1-cm-2.json`, where the CM5-facing
+	// fabric link binds to uart0. The legacy CM5 telemetry-over-JSON path
+	// on uart0 has been removed; retained-state publishers in
+	// fabric-update will replace it.
 	const (
-		uartTele   = "uart0" // telemetry JSON
-		uartFabric = "uart1" // fabric link to CM5
+		uartFabric = "uart0" // fabric link to CM5
+		uartLog    = "uart1" // debug/log mirror only
 	)
-	subSessOpenTele := r.uiConn.Subscribe(tSessOpened(uartTele))
 	subSessOpenFabric := r.uiConn.Subscribe(tSessOpened(uartFabric))
-	subSessClosedTele := r.uiConn.Subscribe(tSessClosed(uartTele))
+	subSessOpenLog := r.uiConn.Subscribe(tSessOpened(uartLog))
 	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
+	subSessClosedLog := r.uiConn.Subscribe(tSessClosed(uartLog))
 
 	// Kick open requests (fire-and-forget; events carry handles)
-	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
+	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
 
 	// Retry back-off guards
-	var retryTeleAt, retryFabricAt time.Time
+	var retryFabricAt, retryLogAt time.Time
 
 	// Fabric session lifecycle state
 	var fabricCancel context.CancelFunc
@@ -539,11 +456,6 @@ func (r *Reactor) Run(ctx context.Context) {
 	for {
 		select {
 		// ---- UART session opened/closed ----
-		case m := <-subSessOpenTele.Channel():
-			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
-				log.Println("[uart0] telemetry session opened")
-			}
 		case m := <-subSessOpenFabric.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
 				// Tear down any previous fabric session before starting a new one.
@@ -561,15 +473,12 @@ func (r *Reactor) Run(ctx context.Context) {
 					defer close(done)
 					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5-local", fabric.DefaultLinkConfig())
 				}()
-				log.Println("[uart1] fabric session opened")
+				log.Println("[uart0] fabric session opened")
 			}
-		case <-subSessClosedTele.Channel():
-			r.jsonOut = nil
-			log.Println("[uart0] telemetry session closed")
-			// Auto-reopen with back-off
-			if time.Now().After(retryTeleAt) {
-				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-				retryTeleAt = time.Now().Add(2 * time.Second)
+		case m := <-subSessOpenLog.Channel():
+			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
+				log.SetUART1(shmring.Get(shmring.Handle(ev.TXHandle)))
+				log.Println("[uart1] log session opened")
 			}
 		case <-subSessClosedFabric.Channel():
 			// Ignore stale close events — the open handler already tears down
@@ -580,10 +489,17 @@ func (r *Reactor) Run(ctx context.Context) {
 			stopFabricSession()
 			fabricSessionOpen = false
 			nextFabricWaitLog = time.Now()
-			log.Println("[uart1] fabric session closed")
+			log.Println("[uart0] fabric session closed")
 			if time.Now().After(retryFabricAt) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
+			}
+		case <-subSessClosedLog.Channel():
+			log.SetUART1(nil)
+			log.Println("[uart1] log session closed")
+			if time.Now().After(retryLogAt) {
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
+				retryLogAt = time.Now().Add(2 * time.Second)
 			}
 
 		// ---- Env prints ----
@@ -601,14 +517,6 @@ func (r *Reactor) Run(ctx context.Context) {
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
-				// JSON
-				if r.jsonOut != nil {
-					var w utilities.JSONWriter
-					w.Write = r.jsonWrite
-					w.Begin()
-					w.KvInt("env/humidity/core", int(v.RHx100))
-					w.End()
-				}
 			}
 
 		// ---- Die Temp Backup ----
@@ -643,20 +551,6 @@ func (r *Reactor) Run(ctx context.Context) {
 
 		case m := <-evSub.Channel():
 			printCapEvent(m)
-			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
-			if r.jsonOut != nil {
-				dom, _ := m.Topic.At(2).(string)
-				kind, _ := m.Topic.At(3).(string)
-				name, _ := m.Topic.At(4).(string)
-				tag, _ := m.Topic.At(6).(string)
-				if dom != "" && kind != "" && name != "" && tag != "" {
-					var w utilities.JSONWriter
-					w.Write = r.jsonWrite
-					w.Begin()
-					w.KvStr(dom+"/"+kind+"/"+name+"/event", tag)
-					w.End()
-				}
-			}
 
 		// ---- Supervisory tick ----
 		case <-ticker.C:
@@ -685,26 +579,6 @@ func (r *Reactor) Run(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// -----------------------------------------------------------------------------
-// Centralised UART write helpers (handle partial writes)
-// -----------------------------------------------------------------------------
-
-// uart0 (telemetry JSON) — returns bytes written; tracks dropped bytes on partial writes.
-func (r *Reactor) jsonWrite(b []byte) int {
-	if r == nil || r.jsonOut == nil || len(b) == 0 {
-		return 0
-	}
-	n := r.jsonOut.TryWriteFrom(b)
-	if n < len(b) {
-		r.droppedUART0Bytes += (len(b) - n)
-		// Rate-limited note
-		if r.droppedUART0Bytes == (len(b)-n) || (r.droppedUART0Bytes%1024) == 0 {
-			log.Println("[uart0] dropped bytes =", r.droppedUART0Bytes)
-		}
-	}
-	return n
 }
 
 // -----------------------------------------------------------------------------
