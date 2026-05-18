@@ -398,7 +398,7 @@ func (r *Reactor) emitMemSnapshot() {
 }
 
 func (r *Reactor) Run(ctx context.Context) {
-// Subscriptions (env + power)
+	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
 	tempSub := r.uiConn.Subscribe(tTempValue)
 	tempDieSub := r.uiConn.Subscribe(tDieTempValue)
@@ -407,22 +407,11 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART sessions — fabric on uart1 (where the CM5 link physically
-	// terminates on the proto_1 hardware), uart0 reserved for the
-	// optional debug log mirror. The plan originally aspired to put
-	// fabric on uart0 to match `bigbox-v1-cm-2.json`'s CM5-side label
-	// (`uart-0` → `/dev/ttyAMA0`); on the MCU side the uart0/uart1
-	// labels are independent of the CM5's labels — they're a function
-	// of which physical pins the harness wires connect to. The
-	// legacy CM5 telemetry-over-JSON path is gone either way; retained-
-	// state publishers in fabric-update will replace it.
+	// UART session for the CM5 Fabric link on proto_1 hardware.
 	const uartFabric = "uart1"
 	subSessOpenFabric := r.uiConn.Subscribe(tSessOpened(uartFabric))
 	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
 	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
-
-	var dbgLog debugUARTLog
-	dbgLog.init(r.uiConn)
 
 	// Retry back-off guards
 	var retryFabricAt time.Time
@@ -445,7 +434,6 @@ func (r *Reactor) Run(ctx context.Context) {
 		}
 	}
 
-	
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
 	defer ticker.Stop()
@@ -474,8 +462,6 @@ func (r *Reactor) Run(ctx context.Context) {
 				}()
 				log.Println("[uart1] fabric session opened")
 			}
-		case m := <-dbgLog.openedChan():
-			dbgLog.handleOpened(m)
 		case <-subSessClosedFabric.Channel():
 			// Ignore stale close events — the open handler already tears down
 			// the previous session before starting a new one.
@@ -490,9 +476,6 @@ func (r *Reactor) Run(ctx context.Context) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
-		case <-dbgLog.closedChan():
-			dbgLog.handleClosed(r.uiConn)
-
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {

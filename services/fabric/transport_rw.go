@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-// Used for USB serial (fabric-test) and host-side unit tests.
+// Used by host-side unit tests and any stream-backed Fabric transport.
 
 // maxLineLen caps a single fabric frame (line-delimited JSON) end-to-end. It
 // must clear the worst-case encoded transfer chunk: release chunk_size = 2048

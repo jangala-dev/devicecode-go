@@ -42,12 +42,6 @@ const (
 	callTimeoutDef     = 5 * time.Second
 	waitLogEvery       = 2 * time.Second
 	exportStartHoldoff = 1 * time.Second
-	// postHelloAckSettle gives the serial reactor goroutine a chance
-	// to drain the hello_ack bytes from the TX shmring before
-	// promoteLink publishes bus state and triggers export work.
-	// TinyGo's cooperative scheduler does not preempt, so without
-	// this yield the reactor may not run until the next tick.
-	postHelloAckSettle = 10 * time.Millisecond
 	// exportMaxPerTick caps the total export messages sent per drain
 	// cycle across all subscriptions, keeping UART throughput within
 	// the 115200-baud link capacity.
@@ -576,7 +570,6 @@ func (s *session) onHello(msg *protoHello) {
 		return
 	}
 	s.log("hello_ack tx")
-	time.Sleep(postHelloAckSettle)
 	s.promoteLink(reason)
 }
 
@@ -1032,9 +1025,10 @@ func (s *session) drainOutbound(now time.Time) {
 // writer.go) so the lane intent is explicit at the call site.
 //
 // Lane assignment per protocol.lua's FRAME_CLASS:
-//   control: hello, hello_ack, ping, pong, xfer_{begin,ready,need,commit,done,abort}
-//   rpc:     pub, unretain, call, reply
-//   bulk:    xfer_chunk (MCU does not originate; bulk lane unused on MCU)
+//
+//	control: hello, hello_ack, ping, pong, xfer_{begin,ready,need,commit,done,abort}
+//	rpc:     pub, unretain, call, reply
+//	bulk:    xfer_chunk (MCU does not originate; bulk lane unused on MCU)
 func (s *session) sendControl(data []byte) bool { return s.enqueueFrame(laneControl, data) }
 func (s *session) sendRPC(data []byte) bool     { return s.enqueueFrame(laneRPC, data) }
 

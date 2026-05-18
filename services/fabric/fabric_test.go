@@ -148,8 +148,7 @@ func TestWireTypeIgnoresNestedTypeKeys(t *testing.T) {
 	// protoType must return the top-level discriminator, not a nested
 	// payload.type / meta.type key. The previous heuristic-only scan
 	// would mis-route e.g. a `pub` with a payload that happened to
-	// contain its own "type" field. Examples below exercise the cases
-	// Codex flagged on the post-flash review.
+	// contain its own "type" field.
 	for _, tc := range []struct {
 		line []byte
 		want string
@@ -826,7 +825,10 @@ func TestCancelClosesCleanly(t *testing.T) {
 	b := newBus()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig()); close(done) }()
+	go func() {
+		Run(ctx, mcu, b.NewConnection("fabric"), "mcu-1", "cm5-local", DefaultLinkConfig())
+		close(done)
+	}()
 	bringUp(t, cm5)
 	cancel()
 	select {
@@ -1019,7 +1021,7 @@ func TestPubImport(t *testing.T) {
 	sub := reader.Subscribe(bus.T("config", "hal"))
 
 	sendMsg(t, cm5, protoPub{
-		Type:       "pub",
+		Type:    "pub",
 		Topic:   []string{"config", "device"},
 		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
 		Retain:  true,
@@ -1340,7 +1342,7 @@ func TestDumpCallReturnsConfigState(t *testing.T) {
 
 	// Send config first so the session has state.
 	sendMsg(t, cm5, protoPub{
-		Type:       "pub",
+		Type:    "pub",
 		Topic:   []string{"config", "device"},
 		Payload: json.RawMessage(`{"devices":[],"pollers":[]}`),
 		Retain:  true,
