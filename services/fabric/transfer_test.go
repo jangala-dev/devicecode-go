@@ -73,7 +73,7 @@ func rawURL(data []byte) string {
 // xxhashStr is the wire-format checksum: lower-case hex, 8 chars, no algorithm
 // field. Mirrors the Lua reference's M.digest_hex.
 func xxhashStr(data []byte) string {
-	return xxhash.SumHex(data)
+	return xxhashHex(xxhash.Sum32(data, 0))
 }
 
 func TestTransferBeginPreservesMeta(t *testing.T) {

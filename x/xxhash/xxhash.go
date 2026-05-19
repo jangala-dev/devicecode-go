@@ -21,12 +21,12 @@ const (
 
 // Hasher is a streaming xxHash32 state.
 type Hasher struct {
-	seed     uint32
-	totalLen uint32
+	seed           uint32
+	totalLen       uint32
 	v1, v2, v3, v4 uint32
-	mem      [16]byte
-	memN     uint8 // 0..15
-	large    bool  // true once a 16-byte block has been absorbed
+	mem            [16]byte
+	memN           uint8 // 0..15
+	large          bool  // true once a 16-byte block has been absorbed
 }
 
 // New returns a streaming xxHash32 hasher seeded with seed.
@@ -35,10 +35,6 @@ func New(seed uint32) *Hasher {
 	h.reset(seed)
 	return h
 }
-
-// Reset re-initialises the hasher with seed 0. To re-seed with a different
-// value, allocate a new Hasher with New.
-func (h *Hasher) Reset() { h.reset(0) }
 
 func (h *Hasher) reset(seed uint32) {
 	h.seed = seed
@@ -137,13 +133,6 @@ func Sum32(p []byte, seed uint32) uint32 {
 	return h.Sum32()
 }
 
-// SumHex returns the xxHash32 of p (seed 0) as 8 lower-case hex characters,
-// matching the wire format used by the Lua reference's M.digest_hex.
-func SumHex(p []byte) string { return hex8(Sum32(p, 0)) }
-
-// VerifyHex compares SumHex(p) to expected for case-sensitive equality.
-func VerifyHex(p []byte, expected string) bool { return SumHex(p) == expected }
-
 func round(acc, lane uint32) uint32 {
 	acc += lane * prime32_2
 	acc = bits.RotateLeft32(acc, 13)
@@ -153,15 +142,4 @@ func round(acc, lane uint32) uint32 {
 
 func leU32(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-const hexdigits = "0123456789abcdef"
-
-func hex8(v uint32) string {
-	var buf [8]byte
-	for i := 7; i >= 0; i-- {
-		buf[i] = hexdigits[v&0xf]
-		v >>= 4
-	}
-	return string(buf[:])
 }

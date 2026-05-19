@@ -15,10 +15,10 @@ import (
 	"devicecode-go/x/shmring"
 )
 
-func pipePair() (*RWTransport, *RWTransport) {
+func pipePair() (*rwTransport, *rwTransport) {
 	r1, w1 := io.Pipe()
 	r2, w2 := io.Pipe()
-	return NewRWTransport(r2, w1), NewRWTransport(r1, w2)
+	return newRWTransport(r2, w1), newRWTransport(r1, w2)
 }
 
 func newBus() *bus.Bus { return bus.NewBus(3, "+", "#") }
@@ -197,7 +197,7 @@ func TestTransportRoundTrip(t *testing.T) {
 func TestOversizeLineRecovery(t *testing.T) {
 	big := `{"type":"ping","ts":0,"x":"` + strings.Repeat("x", maxLineLen+100) + `"}`
 	input := big + "\n" + `{"type":"ping","ts":3}` + "\n"
-	tr := NewRWTransport(strings.NewReader(input), io.Discard)
+	tr := newRWTransport(strings.NewReader(input), io.Discard)
 	_, err := tr.ReadLine()
 	if !errors.Is(err, ErrLineTooLong) {
 		t.Fatalf("expected ErrLineTooLong, got %v", err)

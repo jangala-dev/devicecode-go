@@ -19,33 +19,11 @@ var refVectors = []struct {
 	{"123456789", "123456789", "937bad67"},
 }
 
-func TestSumHex_KnownAnswer(t *testing.T) {
-	for _, v := range refVectors {
-		got := SumHex([]byte(v.input))
-		if got != v.hex {
-			t.Errorf("SumHex(%q): got %s, want %s", v.input, got, v.hex)
-		}
-	}
-}
-
 func TestSum32_KnownAnswer(t *testing.T) {
-	// Sum32(_, 0) must agree with SumHex (which forces seed 0).
 	for _, v := range refVectors {
-		want := SumHex([]byte(v.input))
-		got := hex8(Sum32([]byte(v.input), 0))
-		if got != want {
-			t.Errorf("Sum32(%q, 0): got %s, want %s", v.input, got, want)
-		}
-	}
-}
-
-func TestVerifyHex(t *testing.T) {
-	for _, v := range refVectors {
-		if !VerifyHex([]byte(v.input), v.hex) {
-			t.Errorf("VerifyHex(%q, %s) returned false", v.input, v.hex)
-		}
-		if VerifyHex([]byte(v.input), "deadbeef") {
-			t.Errorf("VerifyHex(%q, deadbeef) returned true", v.input)
+		got := testHex8(Sum32([]byte(v.input), 0))
+		if got != v.hex {
+			t.Errorf("Sum32(%q, 0): got %s, want %s", v.input, got, v.hex)
 		}
 	}
 }
@@ -56,7 +34,7 @@ func TestStreaming_ByteByByte(t *testing.T) {
 		for _, b := range []byte(v.input) {
 			h.Write([]byte{b})
 		}
-		got := hex8(h.Sum32())
+		got := testHex8(h.Sum32())
 		if got != v.hex {
 			t.Errorf("byte-stream %q: got %s, want %s", v.input, got, v.hex)
 		}
@@ -68,13 +46,13 @@ func TestStreaming_OddSplits(t *testing.T) {
 	// 17, and 31 exercise mem-buffer top-up, exact block boundary, and tail
 	// bytes.
 	in := []byte("0123456789abcdef0123456789abcdef")
-	want := SumHex(in)
+	want := testHex8(Sum32(in, 0))
 
 	for _, split := range []int{0, 1, 7, 15, 16, 17, 31, 32} {
 		h := New(0)
 		h.Write(in[:split])
 		h.Write(in[split:])
-		got := hex8(h.Sum32())
+		got := testHex8(h.Sum32())
 		if got != want {
 			t.Errorf("split=%d: got %s, want %s", split, got, want)
 		}
@@ -87,21 +65,8 @@ func TestStreaming_EmptyWritesNoOp(t *testing.T) {
 	h.Write([]byte{})
 	h.Write([]byte("abc"))
 	h.Write([]byte{})
-	if got := hex8(h.Sum32()); got != "32d153ff" {
+	if got := testHex8(h.Sum32()); got != "32d153ff" {
 		t.Errorf("with empty writes interleaved: got %s, want 32d153ff", got)
-	}
-}
-
-func TestReset(t *testing.T) {
-	h := New(0)
-	h.Write([]byte("abc"))
-	if hex8(h.Sum32()) != "32d153ff" {
-		t.Fatalf("first sum mismatch")
-	}
-	h.Reset()
-	h.Write([]byte("abc"))
-	if hex8(h.Sum32()) != "32d153ff" {
-		t.Fatalf("post-reset sum mismatch")
 	}
 }
 
@@ -134,10 +99,21 @@ func TestSum32ContinuesAfter(t *testing.T) {
 	h.Write([]byte("a"))
 	h.Sum32()
 	h.Write([]byte("bc"))
-	got := hex8(h.Sum32())
+	got := testHex8(h.Sum32())
 	if got != "32d153ff" {
 		t.Errorf("post-Sum32 continuation: got %s, want 32d153ff", got)
 	}
+}
+
+const hexdigits = "0123456789abcdef"
+
+func testHex8(v uint32) string {
+	var buf [8]byte
+	for i := 7; i >= 0; i-- {
+		buf[i] = hexdigits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
 func TestLargeBuffer(t *testing.T) {
