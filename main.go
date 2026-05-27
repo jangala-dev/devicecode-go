@@ -7,13 +7,24 @@ import (
 	"devicecode-go/bus"
 	"devicecode-go/services/hal"
 	"devicecode-go/services/reactor"
+	"devicecode-go/services/updater"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
 )
 
 // HAL
 const halTimeout = 5 * time.Second
+
 var halReadiness = bus.T("hal", "state")
+
+// Firmware identity is set by host build tooling before main runs. The e2e
+// harness generates a same-package init file because TinyGo's -X support is
+// narrower than the standard Go linker's support.
+var (
+	FirmwareVersion = "0.0.0-dev"
+	FirmwareBuild   = "local"
+	FirmwareImageID = "img-dev"
+)
 
 // -----------------------------------------------------------------------------
 // Main
@@ -46,6 +57,15 @@ func main() {
 			time.Sleep(2 * time.Second)
 		}
 	}
+
+	// boot_id (master R3 / fabric-update W6): generate AFTER HAL ready
+	// and BEFORE the reactor opens fabric. RAM-only — never persisted.
+	bootID := updater.GenerateBootID()
+	log.Println("[main] boot_id =", bootID)
+
+	reactor.FirmwareVersion = FirmwareVersion
+	reactor.FirmwareBuild = FirmwareBuild
+	reactor.FirmwareImageID = FirmwareImageID
 
 	// Reactor
 	r := reactor.NewReactor(b, uiConn)
