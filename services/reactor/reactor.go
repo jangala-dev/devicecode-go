@@ -9,13 +9,49 @@ import (
 
 	"devicecode-go/bus"
 	"devicecode-go/services/fabric"
+	"devicecode-go/services/telemetry"
+	"devicecode-go/services/updater"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
 	"devicecode-go/x/shmring"
 	"devicecode-go/x/strconvx"
 )
 
-const fabricWaitLogInterval = 2 * time.Second
+// FirmwareVersion/FirmwareBuild/FirmwareImageID are the stamps the updater
+// publishes via state/self/software. main may override them before the reactor
+// starts; defaults are development sentinels.
+var (
+	FirmwareVersion = "0.0.0-dev"
+	FirmwareBuild   = "local"
+	FirmwareImageID = "img-dev"
+)
+
+func firmwareIdentity() updater.Identity {
+	return updater.Identity{
+		Version: FirmwareVersion,
+		Build:   FirmwareBuild,
+		ImageID: FirmwareImageID,
+	}
+}
+
+const (
+	fabricWaitLogInterval = 2 * time.Second
+	fabricStopWaitTimeout = 500 * time.Millisecond
+)
+
+func waitFabricDone(done <-chan struct{}, timeout time.Duration) bool {
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
 
 // -----------------------------------------------------------------------------
 // Thresholds & timing
@@ -162,6 +198,9 @@ type Reactor struct {
 
 	// misc
 	now time.Time
+
+	// updater service handle used by the post-hello_ack republish hook.
+	updater *updater.Service
 }
 
 func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
@@ -398,6 +437,31 @@ func (r *Reactor) emitMemSnapshot() {
 }
 
 func (r *Reactor) Run(ctx context.Context) {
+	// Updater service: state machine + updater prepare/commit RPC
+	// RPC handlers + updater/main staging + retained state/self/{software,
+	// updater, health} facts. Started early so the initial fact retains
+	// land before fabric establishes — that way the first hello_ack
+	// observer sees a populated retain store.
+	updaterConn := r.bus.NewConnection("updater")
+	identity := firmwareIdentity()
+	updaterSvc := updater.New(updater.Options{
+		Conn:     updaterConn,
+		Verifier: updater.PassthroughVerifier(identity),
+		Applier:  updater.ProductionApplier(),
+		Identity: identity,
+	})
+	go updaterSvc.Run(ctx)
+	r.updater = updaterSvc
+
+	// Telemetry service: subscribes to HAL value topics and republishes
+	// at state/self/* with integer engineering units; runs the charger
+	// alert FSM and emits event/self/power/charger/alert on bit-set
+	// transitions. Started after the updater so the initial software/
+	// updater retains land first.
+	telemetryConn := r.bus.NewConnection("telemetry")
+	telemetrySvc := telemetry.New(telemetryConn)
+	go telemetrySvc.Run(ctx)
+
 	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
 	tempSub := r.uiConn.Subscribe(tTempValue)
@@ -426,11 +490,12 @@ func (r *Reactor) Run(ctx context.Context) {
 		if fabricCancel == nil {
 			return
 		}
+		done := fabricDone
 		fabricCancel()
 		fabricCancel = nil
-		if fabricDone != nil {
-			<-fabricDone
-			fabricDone = nil
+		fabricDone = nil
+		if !waitFabricDone(done, fabricStopWaitTimeout) {
+			log.Println("[uart1] fabric session stop timed out")
 		}
 	}
 
@@ -456,11 +521,12 @@ func (r *Reactor) Run(ctx context.Context) {
 				fabricCancel = cancel
 				fabricDone = done
 				fabricSessionOpen = true
+				log.Println("[uart1] fabric session opening node=mcu peer=bigbox-cm5 link=mcu-uart0")
 				go func() {
 					defer close(done)
-					fabric.Run(fabricCtx, tr, fabricConn, "mcu-1", "cm5", fabric.DefaultLinkConfig())
+					fabric.Run(fabricCtx, tr, fabricConn, "mcu", "bigbox-cm5", fabric.DefaultLinkConfig())
 				}()
-				log.Println("[uart1] fabric session opened")
+				log.Println("[uart1] fabric session opened node=mcu peer=bigbox-cm5 link=mcu-uart0")
 			}
 		case <-subSessClosedFabric.Channel():
 			// Ignore stale close events — the open handler already tears down
