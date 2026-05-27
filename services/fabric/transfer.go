@@ -7,28 +7,29 @@ import (
 	"strings"
 	"time"
 
+	"devicecode-go/services/updater"
 	"devicecode-go/x/strconvx"
 	"devicecode-go/x/xxhash"
 )
 
-const postTransferDoneSettle = 250 * time.Millisecond
-const transferProgressLogEvery = 32
+const transferTargetUpdaterMain = "updater/main"
+const transferIdleRetryLimit = 3
 
-// transferMeta captures xfer_begin contents. The required Lua wire shape is
-// {xfer_id, size, checksum}; meta is optional but source-used (transfer_mgr
-// passes it through to the receiver, where meta.receiver names a local
-// endpoint to call after xfer_commit and before xfer_done). Preserve meta
-// as an opaque blob — interpretation lives in fabric-update.
+// transferMeta captures xfer_begin contents. The transfer target is explicit
+// on the wire; firmware update uses target="updater/main". meta remains opaque
+// and informational to Fabric.
 type transferMeta struct {
-	ID       string
-	Size     uint32
-	Checksum string // xxHash32 hex (8 lower-case hex chars), no algorithm field
-	Meta     json.RawMessage
+	ID        string
+	Target    string
+	Size      uint32
+	DigestAlg string
+	Digest    string // xxHash32 hex (8 lower-case hex chars), seed 0
+	Meta      json.RawMessage
 }
 
 // transferInfo is internal-only state returned by the sink on Commit. It is
 // no longer wire-visible — xfer_done carries only xfer_id in the canonical
-// schema; size/checksum reconciliation lives on xfer_commit.
+// schema; size/digest reconciliation lives on xfer_commit.
 type transferInfo struct {
 	BytesWritten uint32
 	SlotXIPAddr  uint32
@@ -38,11 +39,18 @@ type transferInfo struct {
 // WriteChunk receives bytes at the given byte offset (matching xfer_chunk's
 // canonical wire fields). No sequence number is passed — the caller has
 // already validated offset against expected progress.
+//
+// Bytes() returns the committed payload bytes for target invocation.
+// Only valid after Commit() has succeeded. May return nil if the sink
+// streamed the bytes elsewhere (e.g. the RP2350 sink writes directly to
+// flash and doesn't keep a RAM copy); updater/main consumes that staged
+// stream from the updater package.
 type transferSink interface {
 	WriteChunk(offset uint32, data []byte) error
 	Commit() (transferInfo, error)
 	Apply() error
 	Abort(reason string) error
+	Bytes() []byte
 }
 
 type incomingTransfer struct {
@@ -51,6 +59,7 @@ type incomingTransfer struct {
 	bytesWritten uint32
 	chunksSeen   uint32
 	hasher       *xxhash.Hasher
+	idleRetries  uint8
 	// deadline is the idle-chunk watchdog: bumped on every accepted chunk
 	// and on initial xfer_begin. checkTransferTimeout fires if now > deadline.
 	// Mirrors transfer_mgr.lua: `active.deadline = runtime.now() + phase_timeout`.
@@ -61,8 +70,37 @@ func lowerHex(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+func canonicalXXHash32Hex(s string) (string, bool) {
+	digest := lowerHex(s)
+	return digest, s == digest && validXXHash32Hex(digest)
+}
+
+func validXXHash32Hex(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func u32s(v uint32) string {
 	return strconvx.Itoa(int(v))
+}
+
+func decodeChunkData(encoded string) ([]byte, string) {
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, "invalid_chunk_encoding"
+	}
+	if base64.RawURLEncoding.EncodeToString(raw) != encoded {
+		return nil, "invalid_chunk_encoding"
+	}
+	return raw, ""
 }
 
 func (s *session) sendTransferReady(id string) bool {
@@ -124,9 +162,14 @@ func (s *session) checkTransferTimeout(now time.Time) {
 	if !now.After(cur.deadline) {
 		return
 	}
+	if cur.idleRetries < transferIdleRetryLimit {
+		cur.idleRetries++
+		cur.deadline = now.Add(s.cfg.PhaseTimeout)
+		s.logKV("transfer idle retry", "offset", u32s(cur.bytesWritten))
+		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+		return
+	}
 	id := cur.meta.ID
-	println("[fabric]", "sid", s.localSID, "xfer_phase_timeout",
-		"id", id, "phase_s", u32s(uint32(s.cfg.PhaseTimeout/time.Second)))
 	s.abortTransfer("timeout")
 	s.sendTransferAbort(id, "timeout")
 }
@@ -135,21 +178,34 @@ func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 	if msg.XferID == "" {
 		return transferMeta{}, "xfer_begin.xfer_id"
 	}
+	if msg.Target == "" {
+		return transferMeta{}, "missing_target"
+	}
+	if msg.Target != transferTargetUpdaterMain {
+		return transferMeta{}, "unsupported_target"
+	}
 	if msg.Size == 0 {
 		return transferMeta{}, "xfer_begin.size"
 	}
-	if msg.Checksum == "" {
-		return transferMeta{}, "xfer_begin.checksum"
+	if msg.DigestAlg != digestAlg {
+		return transferMeta{}, "unsupported_digest_alg"
+	}
+	digest, ok := canonicalXXHash32Hex(msg.Digest)
+	if !ok {
+		return transferMeta{}, "invalid_digest"
 	}
 	return transferMeta{
-		ID:       msg.XferID,
-		Size:     msg.Size,
-		Checksum: lowerHex(msg.Checksum),
-		Meta:     append(json.RawMessage(nil), msg.Meta...),
+		ID:        msg.XferID,
+		Target:    msg.Target,
+		Size:      msg.Size,
+		DigestAlg: msg.DigestAlg,
+		Digest:    digest,
+		Meta:      append(json.RawMessage(nil), msg.Meta...),
 	}, ""
 }
 
 func (s *session) onTransferBegin(msg *protoXferBegin) {
+	s.extendTransferQuiet("xfer_begin_rx", transferPrepareQuiet)
 	meta, errStr := validateTransferBegin(msg)
 	if errStr != "" {
 		if msg.XferID != "" {
@@ -159,6 +215,19 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		return
 	}
 	if s.incomingTransfer != nil {
+		cur := s.incomingTransfer
+		if cur.meta.ID == meta.ID &&
+			cur.meta.Size == meta.Size &&
+			cur.meta.Target == meta.Target &&
+			cur.meta.DigestAlg == meta.DigestAlg &&
+			cur.meta.Digest == meta.Digest {
+			s.logKV("xfer_begin duplicate", "id", meta.ID)
+			if s.sendTransferReady(meta.ID) {
+				s.sendTransferNeed(meta.ID, cur.bytesWritten)
+			}
+			cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+			return
+		}
 		s.sendTransferAbort(meta.ID, "busy")
 		return
 	}
@@ -177,14 +246,9 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		hasher:   xxhash.New(0),
 		deadline: time.Now().Add(s.cfg.PhaseTimeout),
 	}
-	println(
-		"[fabric]", "sid", s.localSID,
-		"xfer_begin accepted",
-		"id", meta.ID,
-		"size", u32s(meta.Size),
-		"checksum", meta.Checksum,
-	)
-	s.sendTransferReady(meta.ID)
+	if s.sendTransferReady(meta.ID) {
+		s.sendTransferNeed(meta.ID, 0)
+	}
 }
 
 func (s *session) onTransferChunk(msg *protoXferChunk) {
@@ -193,42 +257,65 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 		s.logKV("xfer_chunk dropped", "id", msg.XferID)
 		return
 	}
-	// Lua transfer_mgr.lua aborts and clears the active transfer on any
-	// chunk-level fault (unexpected offset, decode failure, size mismatch).
-	// Match that — do not send xfer_need + keep alive.
 	id := cur.meta.ID
-	if msg.Offset != cur.bytesWritten {
-		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
-			"id", id, "err", "unexpected_offset",
-			"off", u32s(msg.Offset), "want_off", u32s(cur.bytesWritten))
-		s.abortTransfer("unexpected_offset")
-		s.sendTransferAbort(id, "unexpected_offset")
+	if msg.Offset < cur.bytesWritten {
+		s.sendTransferNeed(id, cur.bytesWritten)
+		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 		return
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(msg.Data)
-	if err != nil {
-		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
-			"id", id, "err", "decode_failed",
-			"off", u32s(msg.Offset), "data_len", u32s(uint32(len(msg.Data))))
-		s.abortTransfer("decode_failed")
-		s.sendTransferAbort(id, "decode_failed")
+	if msg.Offset > cur.bytesWritten {
+		s.sendTransferNeed(id, cur.bytesWritten)
+		return
+	}
+	raw, errStr := decodeChunkData(msg.Data)
+	if errStr != "" {
+		s.logKV("xfer_chunk decode retry", "err", errStr)
+		s.sendTransferNeed(id, cur.bytesWritten)
+		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 		return
 	}
 	if len(raw) == 0 {
-		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
-			"id", id, "err", "empty_chunk", "off", u32s(msg.Offset))
 		s.abortTransfer("empty_chunk")
 		s.sendTransferAbort(id, "empty_chunk")
 		return
 	}
 	if cur.bytesWritten+uint32(len(raw)) > cur.meta.Size {
-		println("[fabric]", "sid", s.localSID, "xfer_chunk aborted",
-			"id", id, "err", "size_overflow",
-			"bytes_written", u32s(cur.bytesWritten),
-			"raw_len", u32s(uint32(len(raw))),
-			"total", u32s(cur.meta.Size))
-		s.abortTransfer("size_overflow")
-		s.sendTransferAbort(id, "size_overflow")
+		reason := "size_too_large"
+		s.abortTransfer(reason)
+		s.sendTransferAbort(id, reason)
+		return
+	}
+	// Per-chunk integrity is required by the current MCU contract.
+	// JSON parsing alone misses single-byte UART corruption inside the
+	// base64url data string: the bytes still decode, just to the wrong
+	// values. On mismatch we ask the sender to resume at the current
+	// byte offset instead of clearing the transfer.
+	want, ok := canonicalXXHash32Hex(msg.ChunkDigest)
+	if !ok {
+		reason := "invalid_chunk_digest"
+		if msg.ChunkDigest == "" {
+			reason = "missing_chunk_digest"
+		}
+		println(
+			"[fabric-xfer]", "abort_tx",
+			"id", id,
+			"reason", reason,
+			"offset", u32s(msg.Offset),
+			"digest_len", strconvx.Itoa(len(msg.ChunkDigest)),
+			"digest", msg.ChunkDigest,
+			"data_len", strconvx.Itoa(len(msg.Data)),
+		)
+		s.abortTransfer(reason)
+		s.sendTransferAbort(id, reason)
+		return
+	}
+	got := xxhashHex(xxhash.Sum32(raw, 0))
+	if got != want {
+		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+		// Recovery counts as progress — bump the deadline so a burst
+		// of digest-mismatched chunks doesn't trip the idle watchdog
+		// mid-recovery.
+		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 		return
 	}
 	if err := cur.sink.WriteChunk(msg.Offset, raw); err != nil {
@@ -241,21 +328,12 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	_, _ = cur.hasher.Write(raw)
 	cur.bytesWritten += uint32(len(raw))
 	cur.chunksSeen++
+	cur.idleRetries = 0
 	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
-	if cur.chunksSeen == 1 || (cur.chunksSeen%transferProgressLogEvery) == 0 {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"xfer_chunk accepted",
-			"id", cur.meta.ID,
-			"off", u32s(msg.Offset),
-			"data_len", u32s(uint32(len(raw))),
-			"bytes_written", u32s(cur.bytesWritten),
-		)
-	}
 	raw = nil
-	// Forced GC after each absorbed chunk eliminates firmware-transfer byte
-	// drops on the safe-window allocator. Do NOT remove this without
-	// reproducing the regression in firmware-mono/docs/old/FABRIC_TRANSFER_FIX.md.
+	// Keep transfer memory bounded on TinyGo. The receiver allocates while
+	// unmarshalling JSON and decoding base64 chunks; without regular collection
+	// long updates can run out of heap before commit.
 	runtime.GC()
 	s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 }
@@ -268,28 +346,29 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 	}
 	id := cur.meta.ID
 	if msg.Size != cur.meta.Size || cur.bytesWritten != cur.meta.Size {
-		println("[fabric]", "sid", s.localSID, "xfer_commit failed",
-			"id", id, "err", "size_mismatch",
-			"bytes_written", u32s(cur.bytesWritten),
-			"msg_size", u32s(msg.Size), "meta_size", u32s(cur.meta.Size))
-		s.abortTransfer("size_mismatch")
-		s.sendTransferAbort(id, "size_mismatch")
+		reason := "short_transfer"
+		s.abortTransfer(reason)
+		s.sendTransferAbort(id, reason)
+		return
+	}
+	if msg.DigestAlg != digestAlg {
+		s.abortTransfer("unsupported_digest_alg")
+		s.sendTransferAbort(id, "unsupported_digest_alg")
+		return
+	}
+	commitDigest, ok := canonicalXXHash32Hex(msg.Digest)
+	if !ok {
+		s.abortTransfer("invalid_digest")
+		s.sendTransferAbort(id, "invalid_digest")
 		return
 	}
 	streamedHex := xxhashHex(cur.hasher.Sum32())
-	commitChecksum := lowerHex(msg.Checksum)
-	if commitChecksum != cur.meta.Checksum || streamedHex != cur.meta.Checksum {
-		println("[fabric]", "sid", s.localSID, "xfer_commit failed",
-			"id", id, "err", "checksum_mismatch",
-			"begin", cur.meta.Checksum,
-			"commit", commitChecksum,
-			"streamed", streamedHex,
-		)
-		s.abortTransfer("checksum_mismatch")
-		s.sendTransferAbort(id, "checksum_mismatch")
+	if commitDigest != cur.meta.Digest || streamedHex != cur.meta.Digest {
+		s.abortTransfer("digest_mismatch")
+		s.sendTransferAbort(id, "digest_mismatch")
 		return
 	}
-	info, err := cur.sink.Commit()
+	_, err := cur.sink.Commit()
 	if err != nil {
 		s.logKV("transfer commit failed", "err", err.Error())
 		reason := err.Error()
@@ -298,22 +377,112 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		return
 	}
 	sink := cur.sink
+	meta := cur.meta
+	s.extendTransferQuiet("xfer_commit_target", transferCompleteQuiet)
 	s.clearTransfer()
-	println(
-		"[fabric]", "sid", s.localSID,
-		"xfer_commit accepted",
-		"id", id,
-		"bytes_written", u32s(info.BytesWritten),
-	)
-	if !s.sendTransferDone(id) {
+
+	bytesPayload := sink.Bytes()
+	ok, reason := s.invokeTransferTarget(meta, id, bytesPayload)
+	if !ok {
+		s.extendTransferQuiet("xfer_target_rejected", transferCompleteQuiet)
+		s.sendTransferAbort(id, reason)
 		return
 	}
-	time.Sleep(postTransferDoneSettle)
-	if err := sink.Apply(); err != nil {
-		s.logKV("transfer apply failed", "err", err.Error())
-		return
+	s.extendTransferQuiet("xfer_done", transferCompleteQuiet)
+	s.sendTransferDone(id)
+}
+
+const targetCallTimeout = 5 * time.Second
+
+// invokeTransferTarget calls the local updater staging RPC named by
+// xfer_begin.target. The wire no longer carries raw/member receiver topics;
+// target="updater/main" maps to an internal bus RPC owned by the updater
+// service. The reply gates whether fabric sends xfer_done or xfer_abort.
+func (s *session) invokeTransferTarget(meta transferMeta, xferID string, artefact []byte) (bool, string) {
+	if meta.Target != transferTargetUpdaterMain {
+		return false, "unsupported_target"
 	}
-	println("[fabric]", "sid", s.localSID, "transfer apply ok", "id", id)
+	payload := updater.StagePayload{
+		LinkID:    s.linkID,
+		XferID:    xferID,
+		Target:    meta.Target,
+		Size:      meta.Size,
+		DigestAlg: meta.DigestAlg,
+		Digest:    meta.Digest,
+		Meta:      meta.Meta,
+		Artefact:  artefact,
+	}
+	msg := s.conn.NewMessage(updater.TopicStageRPC, payload, false)
+	replySub := s.conn.Request(msg)
+	defer s.conn.Unsubscribe(replySub)
+
+	select {
+	case rep, ok := <-replySub.Channel():
+		if !ok || rep == nil {
+			return false, "stage_no_reply"
+		}
+		ok, reason := decodeStageReply(rep.Payload)
+		if !ok {
+			return false, reason
+		}
+		return true, ""
+	case <-time.After(targetCallTimeout):
+		return false, "stage_timeout"
+	}
+}
+
+func decodeStageReply(payload any) (bool, string) {
+	switch v := payload.(type) {
+	case nil:
+		return false, "stage_nil_payload"
+	case updater.StageReply:
+		if !v.OK {
+			if v.Err == "" {
+				return false, "stage_rejected"
+			}
+			return false, v.Err
+		}
+		return true, ""
+	case *updater.StageReply:
+		if v == nil {
+			return false, "stage_nil_payload"
+		}
+		if !v.OK {
+			if v.Err == "" {
+				return false, "stage_rejected"
+			}
+			return false, v.Err
+		}
+		return true, ""
+	case map[string]any:
+		ok, _ := v["ok"].(bool)
+		if !ok {
+			err, _ := v["err"].(string)
+			if err == "" {
+				err = "stage_rejected"
+			}
+			return false, err
+		}
+		return true, ""
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return false, "stage_marshal_failed"
+	}
+	var probe struct {
+		OK  bool   `json:"ok"`
+		Err string `json:"err"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return false, "stage_unmarshal_failed"
+	}
+	if !probe.OK {
+		if probe.Err == "" {
+			return false, "stage_rejected"
+		}
+		return false, probe.Err
+	}
+	return true, ""
 }
 
 func (s *session) onTransferAbort(msg *protoXferAbort) {
@@ -326,7 +495,6 @@ func (s *session) onTransferAbort(msg *protoXferAbort) {
 	if reason == "" {
 		reason = "remote_abort"
 	}
-	println("[fabric]", "sid", s.localSID, "xfer_abort received", "id", cur.meta.ID, "reason", reason)
 	s.abortTransfer(reason)
 }
 

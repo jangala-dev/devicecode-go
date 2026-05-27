@@ -1,5 +1,7 @@
 package fabric
 
+import "devicecode-go/x/xxhash"
+
 func traceLine(dir string, data []byte) {
 	if !fabricTraceEnabled {
 		return
@@ -34,6 +36,18 @@ func tracePreview(data []byte) string {
 		out = append(out, '.', '.', '.')
 	}
 	return string(out)
+}
+
+func traceTail(data []byte) string {
+	const max = 200
+	if len(data) > max {
+		data = data[len(data)-max:]
+	}
+	return tracePreview(data)
+}
+
+func traceHash(data []byte) string {
+	return xxhashHex(xxhash.Sum32(data, 0))
 }
 
 func hexNibble(v byte) byte {

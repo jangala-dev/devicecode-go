@@ -1,19 +1,62 @@
 //go:build tinygo && rp2350
 
-// Default RP2350 transfer sink for the fabric-protocol baseline. Rejects all
-// transfers at xfer_begin: signed-image verification and staged flash writes
-// land in fabric-update via the receiver topic
-// `raw/member/mcu/cap/updater/main/rpc/receive` and `pico2-a-b/imagev1/`. Until
-// that path lands, the safe default is to refuse incoming transfers rather
-// than flash unverified bytes directly into the inactive slot.
-
 package fabric
 
-import "errors"
+import (
+	"errors"
 
-var errTransferUnsupported = errors.New("staging_unavailable: signed-image receiver not present in this build")
+	"devicecode-go/services/updater"
+)
+
+type streamedStageSink struct {
+	accepted uint32
+	closed   bool
+}
 
 func beginTransfer(meta transferMeta) (transferSink, error) {
-	_ = meta
-	return nil, errTransferUnsupported
+	if err := updater.BeginStreamedStage(meta.Size); err != nil {
+		return nil, err
+	}
+	return &streamedStageSink{}, nil
 }
+
+func (s *streamedStageSink) WriteChunk(off uint32, data []byte) error {
+	if s.closed {
+		return errors.New("sink_closed")
+	}
+	if s.accepted != off {
+		return errors.New("unexpected_offset")
+	}
+	if err := updater.WriteStreamedStage(data); err != nil {
+		return err
+	}
+	s.accepted += uint32(len(data))
+	return nil
+}
+
+func (s *streamedStageSink) Commit() (transferInfo, error) {
+	if s.closed {
+		return transferInfo{}, errors.New("sink_closed")
+	}
+	written, err := updater.CommitStreamedStage()
+	if err != nil {
+		return transferInfo{}, err
+	}
+	s.closed = true
+	return transferInfo{BytesWritten: written}, nil
+}
+
+func (s *streamedStageSink) Apply() error { return nil }
+
+func (s *streamedStageSink) Abort(reason string) error {
+	_ = reason
+	updater.AbortStreamedStage()
+	s.closed = true
+	return nil
+}
+
+// Bytes returns nil because the TinyGo RP2350 default path verifies the signed
+// container while streaming and writes only the authenticated payload into the
+// inactive slot. fabric still calls updater/main staging; the updater consumes
+// the verified staged descriptor instead of an in-RAM artefact.
+func (s *streamedStageSink) Bytes() []byte { return nil }

@@ -9,16 +9,20 @@ import "devicecode-go/bus"
 // of routes. If new routes are required, add them here and on the Lua
 // config side.
 //
-// CM5 -> MCU wire publish:
-//   ["config","device"] -> config/hal (with Lua empty-table normalization)
+// The legacy MCU surface (config/device -> config/hal import, rpc/hal/dump
+// inline handler, hal/cap/env/* and hal/cap/power/* exports, hal/state ->
+// state/hal export, fabric/out/rpc/hal/dump call export) has been removed. The
+// canonical surface is now:
 //
 // CM5 -> MCU wire call:
-//   ["rpc","hal","dump"] -> handled directly by session (not via import rules)
+//   ["cap","self","updater","main","rpc","prepare-update"] -> rpc/updater/prepare
+//   ["cap","self","updater","main","rpc","commit-update"]  -> rpc/updater/commit
+//   xfer_begin target="updater/main" is handled by the transfer path
+//   and routed to the local updater staging RPC after xfer_commit.
 //
 // MCU local bus publish -> wire:
-//   hal/cap/env/#   -> ["state","env",...]
-//   hal/cap/power/# -> ["state","power",...]
-//   hal/state       -> ["state","hal"]
+//   state/self/#   -> state/self/...    (identity, telemetry, update facts)
+//   event/self/#   -> event/self/...    (sparse charger alerts)
 
 type importRule struct {
 	wire  []string
@@ -31,39 +35,50 @@ type busExportRule struct {
 	suffix       bool
 }
 
-var importPublishRules = []importRule{
+// importPublishRules is empty. Config-like data flows through the
+// prepare-update metadata field instead of retained publishes.
+var importPublishRules = []importRule{}
+
+var (
+	wireUpdaterPrepare = []string{"cap", "self", "updater", "main", "rpc", "prepare-update"}
+	wireUpdaterCommit  = []string{"cap", "self", "updater", "main", "rpc", "commit-update"}
+)
+
+// cap/self/updater/main/rpc/{prepare-update,commit-update} land here from
+// the wire and are routed to local rpc/updater/{prepare,commit} where the
+// updater service binds. The updater package re-uses the same local topic
+// strings (services/updater.TopicPrepareRPC / TopicCommitRPC) so callers
+// stay consistent.
+var importCallRules = []importRule{
 	{
-		wire:  []string{"config", "device"},
-		local: []string{"config", "hal"},
+		wire:  wireUpdaterPrepare,
+		local: []string{"rpc", "updater", "prepare"},
+	},
+	{
+		wire:  wireUpdaterCommit,
+		local: []string{"rpc", "updater", "commit"},
 	},
 }
 
-// rpc/hal/dump is handled directly by onCall, not via import rules.
-var importCallRules = []importRule{}
-
+// exportPublishRules is the minimal surface: local `state/self/*` retains and
+// `event/self/*` events flow to the wire under the same name. Legacy HAL export
+// topics are replaced by telemetry publishers under state/self/*.
 var exportPublishRules = []busExportRule{
 	{
-		localPrefix:  []string{"hal", "cap", "env"},
-		remotePrefix: []string{"state", "env"},
+		localPrefix:  []string{"state", "self"},
+		remotePrefix: []string{"state", "self"},
 		suffix:       true,
 	},
 	{
-		localPrefix:  []string{"hal", "cap", "power"},
-		remotePrefix: []string{"state", "power"},
+		localPrefix:  []string{"event", "self"},
+		remotePrefix: []string{"event", "self"},
 		suffix:       true,
-	},
-	{
-		localPrefix:  []string{"hal", "state"},
-		remotePrefix: []string{"state", "hal"},
 	},
 }
 
-var exportCallRules = []busExportRule{
-	{
-		localPrefix:  []string{"fabric", "out", "rpc", "hal", "dump"},
-		remotePrefix: []string{"rpc", "hal", "dump"},
-	},
-}
+// exportCallRules is empty. The MCU does not originate outbound RPC calls for
+// the current Fabric/update contract.
+var exportCallRules = []busExportRule{}
 
 func importPublishTopic(wire []string) bus.Topic {
 	return importMatch(wire, importPublishRules)

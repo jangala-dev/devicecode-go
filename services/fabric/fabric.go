@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/updater"
 	"devicecode-go/x/strconvx"
 )
 
@@ -16,12 +17,11 @@ type Transport interface {
 	Close() error
 }
 
-const protoVersion = 1
-const defaultLinkID = "mcu0"
+const defaultLinkID = "mcu-uart0"
 
 // LinkConfig carries the fabric link parameters that the CM5 publishes
 // alongside its own session/transfer-mgr instances. Mirrors the relevant
-// keys in `bigbox-v1-cm-2.json` `service.fabric.links.<id>` for the
+// keys in `bigbox-v1-cm-2.json` `fabric.data.links.<id>` for the
 // MCU-facing link. Missing fields fall back to release defaults via
 // applyDefaults so callers can pass `LinkConfig{}` to mean "release".
 type LinkConfig struct {
@@ -95,7 +95,11 @@ func (c *LinkConfig) applyDefaults() {
 var nextSessionID atomic.Uint64
 
 func newLocalSID() string {
-	return "mcu-sid-" + strconvx.Utoa64(nextSessionID.Add(1))
+	bootID := updater.BootID()
+	if bootID == "" {
+		bootID = updater.GenerateBootID()
+	}
+	return "mcu-sid-" + bootID + "-" + strconvx.Utoa64(nextSessionID.Add(1))
 }
 
 // Run starts the fabric session. Blocks until ctx is cancelled or the

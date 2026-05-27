@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"devicecode-go/bus"
@@ -48,6 +49,17 @@ const (
 	exportMaxPerTick   = 1
 	exportTickInterval = 50 * time.Millisecond
 	errPayloadMarshal  = "payload_marshal_failed"
+
+	// The USB/UART path used during OTA echoes MCU-originated JSONL back into
+	// the MCU receiver. If exported retained state is in flight while CM5 starts
+	// an OTA transfer, the echoed line can contain CM5's xfer_begin spliced into
+	// the middle of the state pub. Hold exports quiet from prepare until either
+	// xfer_begin arrives or this window expires.
+	transferPrepareQuiet = 10 * time.Second
+	// Keep telemetry/state exports quiet long enough for the host to send the
+	// follow-up updater commit call after xfer_done. On echo-prone UART links,
+	// retained export backlog can otherwise splice into the commit JSONL frame.
+	transferCompleteQuiet = 10 * time.Second
 )
 
 // ---- link reasons and error strings ----
@@ -65,29 +77,14 @@ const (
 	reasonTimeout        = "timeout"
 )
 
-// ---- bus topics for config handling ----
-
-var (
-	tConfigHAL    = bus.T("config", "hal")
-	dumpCallTopic = []string{"rpc", "hal", "dump"}
-)
-
 // ---- types ----
 
-type dumpReply struct {
-	OK          bool            `json:"ok"`
-	Method      string          `json:"method"`
-	Echo        any             `json:"echo,omitempty"`
-	HAL         *types.HALState `json:"hal,omitempty"`
-	Applied     bool            `json:"applied"`
-	ConfigCount int             `json:"config_count,omitempty"`
-	ConfigError string          `json:"config_error,omitempty"`
-}
-
 type inboundCall struct {
-	id       string
-	sub      *bus.Subscription
-	deadline time.Time
+	id              string
+	topic           []string
+	sub             *bus.Subscription
+	deadline        time.Time
+	transferPrepare bool
 }
 
 type outboundCall struct {
@@ -110,7 +107,7 @@ type linkStatePayload struct {
 	LocalSID          string `json:"local_sid"`
 	PeerSID           string `json:"peer_sid,omitempty"`
 	PeerNode          string `json:"peer_node,omitempty"`
-	PeerProto         int    `json:"peer_proto,omitempty"`
+	PeerProto         string `json:"peer_proto,omitempty"`
 	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
 	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
 	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
@@ -137,38 +134,41 @@ type session struct {
 	link           linkState
 	peerNode       string
 	peerSID        string
-	peerProto      int
+	peerProto      string
 	lastRxAt       time.Time
 	lastTxAt       time.Time
 	lastPongAt     time.Time
 	exportReadyAt  time.Time
 	exportsEnabled bool
 
-	exportSubs       []*bus.Subscription
-	exportCallSubs   []*bus.Subscription
-	inboundCalls     []*inboundCall
-	outboundCalls    []*outboundCall
-	nextOutboundID   uint64
-	nextPingAt       time.Time
-	txControl        txLane
-	txRPC            txLane
-	txBulk           txLane
-	importedRetained []bus.Topic // local topics currently retained on the bus due to wire imports
-	rpcReady         bool        // bridge replay complete; gates linkStatePayload.Ready
-	incomingTransfer *incomingTransfer
-	beginTransfer    func(transferMeta) (transferSink, error)
-
-	// Config state — tracks config/device → config/hal translation.
-	configApplied bool
-	configCount   int
-	lastConfigErr string
+	exportSubs          []*bus.Subscription
+	exportCallSubs      []*bus.Subscription
+	inboundCalls        []*inboundCall
+	outboundCalls       []*outboundCall
+	nextOutboundID      uint64
+	nextPingAt          time.Time
+	txControl           txLane
+	txRPC               txLane
+	txBulk              txLane
+	importedRetained    []bus.Topic // local topics currently retained on the bus due to wire imports
+	rpcReady            bool        // bridge replay complete; gates linkStatePayload.Ready
+	incomingTransfer    *incomingTransfer
+	transferQuietUntil  time.Time
+	transferQuietReason string
+	beginTransfer       func(transferMeta) (transferSink, error)
 }
 
 func (s *session) log(msg string) {
+	if !fabricTraceEnabled {
+		return
+	}
 	println("[fabric]", "sid", s.localSID, msg)
 }
 
 func (s *session) logKV(msg, key, value string) {
+	if !fabricTraceEnabled {
+		return
+	}
 	println("[fabric]", "sid", s.localSID, msg, key, value)
 }
 
@@ -334,10 +334,12 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.link = linkDown
 	s.peerNode = ""
 	s.peerSID = ""
-	s.peerProto = 0
+	s.peerProto = ""
 	s.exportReadyAt = time.Time{}
 	s.exportsEnabled = false
 	s.rpcReady = false
+	s.transferQuietUntil = time.Time{}
+	s.transferQuietReason = ""
 	s.teardownExports()
 	s.teardownInbound()
 	s.teardownOutbound(pendingReason)
@@ -468,6 +470,8 @@ func (s *session) dispatch(line []byte) {
 		typedDispatch(s, line, s.onTransferCommit)
 	case msgXferAbort:
 		typedDispatch(s, line, s.onTransferAbort)
+	case msgXferReady, msgXferNeed, msgXferDone:
+		s.logKV("echoed transfer control ignored", "type", t)
 	default:
 		s.logKV("unknown message type dropped", "type", t)
 	}
@@ -495,21 +499,40 @@ func (s *session) logMalformed(line []byte, err error) {
 	if err != nil {
 		errStr = err.Error()
 	}
-	println(
-		"[fabric]", "sid", s.localSID,
-		"malformed frame dropped",
-		"line_len", strconvx.Itoa(len(line)),
-		"line_head", tracePreview(line),
-		"err", errStr,
-	)
+	if fabricTraceEnabled {
+		println(
+			"[fabric]", "sid", s.localSID,
+			"malformed frame dropped",
+			"line_len", strconvx.Itoa(len(line)),
+			"line_xxhash32", traceHash(line),
+			"line_head", tracePreview(line),
+			"line_tail", traceTail(line),
+			"err", errStr,
+		)
+	}
+
+	// If a transfer is in flight, the dropped frame was very likely a
+	// corrupted xfer_chunk. Without an explicit signal CM5 keeps
+	// streaming chunks past the gap and the receiver silently drops
+	// them as out-of-order; the transfer eventually fails on the
+	// phase timeout. Re-request the next expected byte so CM5
+	// retransmits from the gap. Cheap if it wasn't actually a chunk
+	// (the sender just gets one stale need frame and ignores it once
+	// it has caught up).
+	if cur := s.incomingTransfer; cur != nil {
+		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+		// Refresh the idle-chunk deadline so a stream of malformed frames can
+		// recover instead of tripping phase_timeout mid-retry.
+		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+	}
 }
 
-// notePeerIdentity records the remote peer's node, SID, and proto version.
+// notePeerIdentity records the remote peer's node, SID, and protocol name.
 // If the SID changes mid-session, the returned reason triggers a full
 // teardown of exports and pending calls on the Go side. Note: the Lua
 // side only tears down pending calls on SID change, not exports — this
 // asymmetry is intentional since the CM5 re-subscribes on reconnect.
-func (s *session) notePeerIdentity(node, sid string, proto int) string {
+func (s *session) notePeerIdentity(node, sid string, proto string) string {
 	reason := ""
 	if s.link == linkUp && s.peerSID != "" && sid != "" && s.peerSID != sid {
 		reason = reasonSessionReset
@@ -520,7 +543,7 @@ func (s *session) notePeerIdentity(node, sid string, proto int) string {
 	if sid != "" {
 		s.peerSID = sid
 	}
-	if proto > 0 {
+	if proto != "" {
 		s.peerProto = proto
 	}
 	return reason
@@ -548,9 +571,55 @@ func hasWirePrefix(topic, prefix []string) bool {
 	return true
 }
 
+func wireTopicEquals(topic, want []string) bool {
+	if len(topic) != len(want) {
+		return false
+	}
+	for i := range want {
+		if topic[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func wireTopicString(topic []string) string {
+	if len(topic) == 0 {
+		return ""
+	}
+	return strings.Join(topic, "/")
+}
+
+func (s *session) extendTransferQuiet(reason string, d time.Duration) {
+	now := time.Now()
+	until := now.Add(d)
+	if until.After(s.transferQuietUntil) {
+		s.transferQuietUntil = until
+		s.transferQuietReason = reason
+	}
+}
+
+func (s *session) transferQuiet(now time.Time) (bool, string) {
+	if cur := s.incomingTransfer; cur != nil {
+		return true, "incoming_transfer:" + cur.meta.ID
+	}
+	if !s.transferQuietUntil.IsZero() && now.Before(s.transferQuietUntil) {
+		reason := s.transferQuietReason
+		if reason == "" {
+			reason = "quiet_window"
+		}
+		return true, reason
+	}
+	return false, ""
+}
+
 func (s *session) onHello(msg *protoHello) {
-	if msg.Peer != "" && msg.Peer != s.nodeID {
-		s.log("hello dropped: wrong peer")
+	if msg.Proto != protocolName {
+		s.log("hello dropped: unsupported proto")
+		return
+	}
+	if msg.SID == "" || msg.Node == "" {
+		s.log("hello dropped: missing identity")
 		return
 	}
 	if s.peerID != "" && msg.Node != s.peerID {
@@ -562,10 +631,9 @@ func (s *session) onHello(msg *protoHello) {
 
 	if !s.sendControl(marshal(protoHelloAck{
 		Type:  msgHelloAck,
-		Node:  s.nodeID,
+		Proto: protocolName,
 		SID:   s.localSID,
-		Proto: protoVersion,
-		OK:    true,
+		Node:  s.nodeID,
 	})) {
 		return
 	}
@@ -578,9 +646,12 @@ func (s *session) onHelloAck(msg *protoHelloAck) {
 		s.log("echoed hello_ack ignored")
 		return
 	}
-	if !msg.OK {
-		s.log("hello_ack rejected by peer")
-		s.handleLinkDown(reasonHelloRejected, "")
+	if msg.Proto != protocolName {
+		s.log("hello_ack dropped: unsupported proto")
+		return
+	}
+	if msg.SID == "" || msg.Node == "" {
+		s.log("hello_ack dropped: missing identity")
 		return
 	}
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
@@ -589,6 +660,13 @@ func (s *session) onHelloAck(msg *protoHelloAck) {
 }
 
 func (s *session) onPing(msg *protoPing) {
+	if s.isSelfControlFrame("", msg.SID) {
+		s.log("echoed ping ignored")
+		return
+	}
+	if !s.transferQuietUntil.IsZero() && time.Now().Before(s.transferQuietUntil) {
+		return
+	}
 	s.logKV("ping rx", "peer_sid", msg.SID)
 	if !s.sendControl(marshal(protoPong{Type: msgPong, TS: msg.TS, SID: s.localSID})) {
 		return
@@ -601,6 +679,13 @@ func (s *session) onPing(msg *protoPing) {
 // unconditionally every ping_interval after each send (NOT TX-activity-based).
 func (s *session) tickPing(now time.Time) {
 	if s.link != linkUp {
+		return
+	}
+	if quiet, _ := s.transferQuiet(now); quiet {
+		// Keep the UART quiet while CM5 is preparing or streaming a firmware
+		// image; chunk recovery depends on xfer_need being the only periodic
+		// MCU-originated frame on the fabric link.
+		s.nextPingAt = now.Add(s.cfg.PingInterval)
 		return
 	}
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
@@ -631,23 +716,6 @@ func (s *session) onPub(msg *protoPub) {
 		return
 	}
 
-	// config/device → config/hal: normalize and track.
-	if topicEquals(localTopic, tConfigHAL) {
-		cfg, err := decodeHALConfig(msg.Payload)
-		if err != "" {
-			s.lastConfigErr = err
-			s.log("config/device rejected: " + err)
-			return
-		}
-		s.configApplied = true
-		s.configCount++
-		s.lastConfigErr = ""
-		s.log("config/device applied to config/hal")
-		s.conn.Publish(s.conn.NewMessage(localTopic, cfg, true))
-		s.trackImportedRetain(localTopic)
-		return
-	}
-
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 	if msg.Retain {
 		s.trackImportedRetain(localTopic)
@@ -670,34 +738,6 @@ func (s *session) onUnretain(msg *protoUnretain) {
 }
 
 func (s *session) onCall(msg *protoCall) {
-	// rpc/hal/dump: handle directly — reply with config and HAL state.
-	if slicesEqualStrings(msg.Topic, dumpCallTopic) {
-		var halState *types.HALState
-		sub := s.conn.Subscribe(bus.T("hal", "state"))
-		select {
-		case m := <-sub.Channel():
-			if m != nil {
-				if st, ok := decodeHALState(m.Payload); ok {
-					halState = &st
-				}
-			}
-		default:
-		}
-		s.conn.Unsubscribe(sub)
-
-		reply := dumpReply{
-			OK:          true,
-			Method:      "dump",
-			Echo:        decodePayload(msg.Payload),
-			HAL:         halState,
-			Applied:     s.configApplied,
-			ConfigCount: s.configCount,
-			ConfigError: s.lastConfigErr,
-		}
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: true, Value: mustMarshal(reply)}))
-		return
-	}
-
 	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
 		s.log("incoming call dropped: busy")
 		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
@@ -711,16 +751,24 @@ func (s *session) onCall(msg *protoCall) {
 		return
 	}
 
+	isTransferPrepare := wireTopicEquals(msg.Topic, wireUpdaterPrepare)
+	if isTransferPrepare {
+		s.extendTransferQuiet("prepare_call_rx", transferPrepareQuiet)
+	}
+
 	timeout := callTimeoutDef
 	if msg.TimeoutMs > 0 {
 		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
 	}
 	busMsg := s.conn.NewMessage(localTopic, msg.Payload, false)
 	sub := s.conn.Request(busMsg)
+	topicCopy := append([]string(nil), msg.Topic...)
 	s.inboundCalls = append(s.inboundCalls, &inboundCall{
-		id:       msg.ID,
-		sub:      sub,
-		deadline: time.Now().Add(timeout),
+		id:              msg.ID,
+		topic:           topicCopy,
+		sub:             sub,
+		deadline:        time.Now().Add(timeout),
+		transferPrepare: isTransferPrepare,
 	})
 }
 
@@ -737,7 +785,7 @@ func (s *session) onReply(msg *protoReply) {
 			s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: msg.Err}, false)
 			return
 		}
-		s.conn.Reply(call.req, decodePayload(msg.Value), false)
+		s.conn.Reply(call.req, decodePayload(msg.Payload), false)
 		return
 	}
 
@@ -761,14 +809,6 @@ func checkBusError(payload any) string {
 		return probe.Error
 	}
 	return ""
-}
-
-func mustMarshal(v any) json.RawMessage {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return json.RawMessage(`{"error":"marshal_failed"}`)
-	}
-	return json.RawMessage(b)
 }
 
 func topicEquals(t bus.Topic, expected bus.Topic) bool {
@@ -846,10 +886,17 @@ func (s *session) drainExports() {
 	if s.link != linkUp {
 		return
 	}
+	now := time.Now()
+	if quiet, _ := s.transferQuiet(now); quiet {
+		// Avoid colliding telemetry/state exports with prepare/xfer traffic on
+		// echo-prone links. Queued retained state can be exported after the OTA
+		// control/data path has gone quiet.
+		return
+	}
 	if !s.exportsEnabled {
 		return
 	}
-	if !s.exportReadyAt.IsZero() && time.Now().Before(s.exportReadyAt) {
+	if !s.exportReadyAt.IsZero() && now.Before(s.exportReadyAt) {
 		return
 	}
 	total := 0
@@ -882,6 +929,15 @@ func (s *session) drainExports() {
 					s.logKV("export payload dropped", "err", err.Error())
 					continue
 				}
+				if fabricTraceEnabled {
+					println(
+						"[fabric]", "sid", s.localSID,
+						"export pub tx",
+						"topic", wireTopicString(wire),
+						"retain", m.Retained,
+						"payload_len", strconvx.Itoa(len(payload)),
+					)
+				}
 				if !s.sendRPC(marshal(protoPub{
 					Type:    msgPub,
 					Topic:   wire,
@@ -911,12 +967,18 @@ func (s *session) drainInbound(now time.Time) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil // prevent double-unsubscribe in teardownInbound
 			if !ok || reply == nil {
+				if call.transferPrepare {
+					s.extendTransferQuiet("prepare_reply_timeout", transferPrepareQuiet)
+				}
 				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 					return
 				}
 				continue
 			}
 			if errStr := checkBusError(reply.Payload); errStr != "" {
+				if call.transferPrepare {
+					s.extendTransferQuiet("prepare_reply_error", transferPrepareQuiet)
+				}
 				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr})) {
 					return
 				}
@@ -924,12 +986,18 @@ func (s *session) drainInbound(now time.Time) {
 			}
 			payload, err := marshalPayload(reply.Payload)
 			if err != nil {
+				if call.transferPrepare {
+					s.extendTransferQuiet("prepare_reply_marshal_failed", transferPrepareQuiet)
+				}
 				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
 					return
 				}
 				continue
 			}
-			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Value: payload})) {
+			if call.transferPrepare {
+				s.extendTransferQuiet("prepare_reply_ok", transferPrepareQuiet)
+			}
+			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload})) {
 				return
 			}
 			continue
@@ -939,6 +1007,9 @@ func (s *session) drainInbound(now time.Time) {
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
+			if call.transferPrepare {
+				s.extendTransferQuiet("prepare_call_timeout", transferPrepareQuiet)
+			}
 			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
 				return
 			}
