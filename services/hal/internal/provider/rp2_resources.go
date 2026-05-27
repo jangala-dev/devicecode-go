@@ -711,6 +711,20 @@ func (p *rp2SerialPort) TryRead(b []byte) int      { return p.u.TryRead(b) }
 func (p *rp2SerialPort) TryWrite(b []byte) int     { return p.u.TryWrite(b) }
 func (p *rp2SerialPort) Flush() error              { return p.u.Flush() }
 
+func (p *rp2SerialPort) RXBuffered() int {
+	if p.u == nil || p.u.Buffer == nil {
+		return -1
+	}
+	return int(p.u.Buffer.Used())
+}
+
+func (p *rp2SerialPort) RXBufferCap() int {
+	if p.u == nil || p.u.Buffer == nil {
+		return -1
+	}
+	return int(p.u.Buffer.Size())
+}
+
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
 
 // Parity strings: "none","even","odd"
