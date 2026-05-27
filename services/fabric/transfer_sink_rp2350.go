@@ -55,8 +55,7 @@ func (s *streamedStageSink) Abort(reason string) error {
 	return nil
 }
 
-// Bytes returns nil because the TinyGo RP2350 default path verifies the signed
-// container while streaming and writes only the authenticated payload into the
-// inactive slot. fabric still calls updater/main staging; the updater consumes
-// the verified staged descriptor instead of an in-RAM artefact.
+// Bytes returns nil because the TinyGo RP2350 default path streams directly
+// into the inactive slot. fabric still calls updater/main staging; the updater
+// consumes the pre-staged descriptor instead of an in-RAM artefact.
 func (s *streamedStageSink) Bytes() []byte { return nil }
