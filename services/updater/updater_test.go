@@ -3,6 +3,7 @@ package updater
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"pico2-a-b/imagev1"
 )
 
 // ---- helpers --------------------------------------------------------
@@ -1058,6 +1060,81 @@ func TestStageStubVerifierPublishesFailed(t *testing.T) {
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
 	if !strings.Contains(strValue(up.LastError), "verifier_stub") {
 		t.Fatalf("last_error = %q, want stub sentinel", strValue(up.LastError))
+	}
+}
+
+func TestStageSignedImageVerifierWritesManifestDescriptor(t *testing.T) {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+	target := imagev1.Target{
+		ProductFamily:   "bigbox",
+		HardwareProfile: "bb-v1-cm5-2",
+		MCUBoardFamily:  "rp2354a",
+	}
+	artefact, _, err := imagev1.Pack([]byte("signed payload"), imagev1.PackOptions{
+		Target:  target,
+		Version: "13.0",
+		BuildID: "build-13.0",
+		ImageID: "mcu-dev-13.0",
+		KeyID:   "test-key",
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldProduct := SignedImageProductFamily
+	oldProfile := SignedImageHardwareProfile
+	oldBoard := SignedImageMCUBoardFamily
+	oldKeyID := SignedImageTrustedKeyID
+	oldKey := SignedImageTrustedPublicKey
+	defer func() {
+		SignedImageProductFamily = oldProduct
+		SignedImageHardwareProfile = oldProfile
+		SignedImageMCUBoardFamily = oldBoard
+		SignedImageTrustedKeyID = oldKeyID
+		SignedImageTrustedPublicKey = oldKey
+	}()
+	SignedImageProductFamily = target.ProductFamily
+	SignedImageHardwareProfile = target.HardwareProfile
+	SignedImageMCUBoardFamily = target.MCUBoardFamily
+	SignedImageTrustedKeyID = "test-key"
+	SignedImageTrustedPublicKey = hex.EncodeToString(pub)
+
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+	memMD := NewMemoryMetadata()
+	svc, cancel := runService(t, b, Options{
+		Conn:          conn,
+		Verifier:      SignedImageVerifier(),
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+	})
+	defer cancel()
+
+	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "signed-xfer", artefact), false)
+	replySub := caller.Request(req)
+	defer caller.Unsubscribe(replySub)
+	select {
+	case msg := <-replySub.Channel():
+		reply, _ := msg.Payload.(StageReply)
+		if !reply.OK {
+			t.Fatalf("stage reply not ok: %+v", reply)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for stage reply")
+	}
+
+	desc, ok := memMD.StagedDescriptor()
+	if !ok {
+		t.Fatal("staged descriptor not persisted")
+	}
+	if desc.Version != "13.0" || desc.BuildID != "build-13.0" || desc.ImageID != "mcu-dev-13.0" {
+		t.Fatalf("descriptor wrong: %+v", desc)
+	}
+	if desc.Length != uint32(len("signed payload")) || len(desc.PayloadSHA256) != 64 {
+		t.Fatalf("descriptor payload metadata wrong: %+v", desc)
 	}
 }
 
