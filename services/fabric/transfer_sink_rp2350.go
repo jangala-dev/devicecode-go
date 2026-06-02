@@ -9,15 +9,18 @@ import (
 )
 
 type streamedStageSink struct {
-	accepted uint32
-	closed   bool
+	xferID     string
+	generation uint64
+	accepted   uint32
+	closed     bool
 }
 
 func beginTransfer(meta transferMeta) (transferSink, error) {
-	if err := updater.BeginStreamedStage(meta.Size); err != nil {
+	generation, err := updater.BeginStreamedStage(meta.ID, meta.Size)
+	if err != nil {
 		return nil, err
 	}
-	return &streamedStageSink{}, nil
+	return &streamedStageSink{xferID: meta.ID, generation: generation}, nil
 }
 
 func (s *streamedStageSink) WriteChunk(off uint32, data []byte) error {
@@ -27,7 +30,7 @@ func (s *streamedStageSink) WriteChunk(off uint32, data []byte) error {
 	if s.accepted != off {
 		return errors.New("unexpected_offset")
 	}
-	if err := updater.WriteStreamedStage(data); err != nil {
+	if err := updater.WriteStreamedStage(s.xferID, s.generation, data); err != nil {
 		return err
 	}
 	s.accepted += uint32(len(data))
@@ -38,24 +41,24 @@ func (s *streamedStageSink) Commit() (transferInfo, error) {
 	if s.closed {
 		return transferInfo{}, errors.New("sink_closed")
 	}
-	written, err := updater.CommitStreamedStage()
+	written, err := updater.CommitStreamedStage(s.xferID, s.generation)
 	if err != nil {
 		return transferInfo{}, err
 	}
 	s.closed = true
-	return transferInfo{BytesWritten: written}, nil
+	return transferInfo{BytesWritten: written, Generation: s.generation}, nil
 }
 
 func (s *streamedStageSink) Apply() error { return nil }
 
 func (s *streamedStageSink) Abort(reason string) error {
-	_ = reason
-	updater.AbortStreamedStage()
+	updater.AbortStreamedStage(s.xferID, s.generation, reason)
 	s.closed = true
 	return nil
 }
 
-// Bytes returns nil because the TinyGo RP2350 default path streams directly
-// into the inactive slot. fabric still calls updater/main staging; the updater
-// consumes the pre-staged descriptor instead of an in-RAM artefact.
+// Bytes returns nil because the TinyGo RP2350 default path verifies the signed
+// container while streaming and writes only the authenticated payload into the
+// inactive slot. fabric still calls updater/main staging; the updater consumes
+// the verified staged descriptor instead of an in-RAM artefact.
 func (s *streamedStageSink) Bytes() []byte { return nil }

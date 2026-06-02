@@ -23,6 +23,13 @@ func strPtrOrNil(v string) *string {
 	return &v
 }
 
+func int32PtrOrNil(v int32) *int32 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
 // PublishUpdater emits the retained state/self/updater fact with the
 // canonical {state, last_error, pending_version} shape. Called on
 // every state transition (via transitionTo) and as part of the post-
@@ -36,6 +43,7 @@ func (s *Service) PublishUpdater() {
 		PendingImageID: strPtrOrNil(s.pendingImageID),
 		StagedImageID:  strPtrOrNil(s.stagedImageID),
 		JobID:          strPtrOrNil(s.jobID),
+		BootBuyRC:      int32PtrOrNil(s.bootBuyRC),
 	}
 	s.mu.Unlock()
 	s.conn.Publish(s.conn.NewMessage(TopicUpdaterFact, fact, true))

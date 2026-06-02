@@ -29,10 +29,13 @@ func (s State) Allowed() bool {
 }
 
 const (
-	PrepareTargetMCU           = "mcu"
-	TargetUpdaterMain          = "updater/main"
-	DigestAlgXXHash32          = "xxhash32"
-	DefaultMaxChunkSize uint32 = 2048
+	PrepareTargetMCU  = "mcu"
+	TargetUpdaterMain = "updater/main"
+	DigestAlgXXHash32 = "xxhash32"
+	// DefaultMaxChunkSize is the safe RP2350 Fabric OTA limit currently
+	// advertised by prepare-update. It is a target pacing limit, not a
+	// Fabric protocol maximum.
+	DefaultMaxChunkSize uint32 = 512
 )
 
 // PrepareRequest mirrors the current prepare-update payload.
@@ -73,22 +76,21 @@ type Reply struct {
 
 // Refusal error strings — the Lua side compares against these.
 const (
-	ErrBusy           = "busy"
-	ErrNothingStaged  = "nothing_staged"
-	ErrTargetMismatch = "target_mismatch"
+	ErrBusy              = "busy"
+	ErrNothingStaged     = "nothing_staged"
+	ErrTargetMismatch    = "target_mismatch"
+	ErrABUpdateBuyFailed = "abupdate_buy_failed"
 	// ErrApplyUnavailable is returned when the commit RPC sees a valid
 	// staged descriptor but no Applier is wired to actually trigger
-	// the slot-switch + reboot. fabric-update ships with a refusing
-	// Applier so we never lie to the CM5 about apply success on a
-	// branch where the apply path doesn't exist; fabric-security
-	// supplies a real Applier and the refusal goes away.
+	// the slot-switch + reboot. Refusing by default means we never lie
+	// to the CM5 about apply success when the hardware apply path is not
+	// wired.
 	ErrApplyUnavailable = "apply_unavailable"
 )
 
-// SoftwareFact is the retained payload at state/self/software per
-// docs/firmware-alignment-update.md §"Identity facts". `boot_id` is
-// generated per boot (W6, RAM-only); `payload_sha256` is bare 64-char
-// lower-hex sourced from the abupdate metadata block.
+// SoftwareFact is the retained payload at state/self/software.
+// `boot_id` is generated per boot and kept in RAM only; `payload_sha256`
+// is bare 64-char lower-hex sourced from the abupdate metadata block.
 type SoftwareFact struct {
 	Version       string `json:"version"`
 	BuildID       string `json:"build_id"`
@@ -107,6 +109,7 @@ type UpdaterFact struct {
 	PendingImageID *string `json:"pending_image_id"`
 	StagedImageID  *string `json:"staged_image_id"`
 	JobID          *string `json:"job_id"`
+	BootBuyRC      *int32  `json:"boot_buy_rc,omitempty"`
 }
 
 // HealthFact is the retained payload at state/self/health. Lua extracts
@@ -134,14 +137,15 @@ type StagedDescriptor struct {
 // the older meta.receiver/raw-member receive path; the CM5 supplies only
 // target="updater/main" on the wire.
 type StagePayload struct {
-	LinkID    string `json:"link_id"`
-	XferID    string `json:"xfer_id"`
-	Target    string `json:"target"`
-	Size      uint32 `json:"size"`
-	DigestAlg string `json:"digest_alg"`
-	Digest    string `json:"digest"`
-	Meta      any    `json:"meta,omitempty"`
-	Artefact  []byte `json:"artefact,omitempty"`
+	LinkID     string `json:"link_id"`
+	XferID     string `json:"xfer_id"`
+	Generation uint64 `json:"generation,omitempty"`
+	Target     string `json:"target"`
+	Size       uint32 `json:"size"`
+	DigestAlg  string `json:"digest_alg"`
+	Digest     string `json:"digest"`
+	Meta       any    `json:"meta,omitempty"`
+	Artefact   []byte `json:"artefact,omitempty"`
 }
 
 type StageReply struct {

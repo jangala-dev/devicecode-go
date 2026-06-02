@@ -53,6 +53,42 @@ func waitFabricDone(done <-chan struct{}, timeout time.Duration) bool {
 	}
 }
 
+func waitForUpdaterCriticalFacts(ctx context.Context, conn *bus.Connection) bool {
+	if conn == nil {
+		return false
+	}
+	swSub := conn.Subscribe(updater.TopicSoftwareFact)
+	defer conn.Unsubscribe(swSub)
+	upSub := conn.Subscribe(updater.TopicUpdaterFact)
+	defer conn.Unsubscribe(upSub)
+	healthSub := conn.Subscribe(updater.TopicHealthFact)
+	defer conn.Unsubscribe(healthSub)
+
+	softwareReady := false
+	updaterReady := false
+	healthReady := false
+
+	for !(softwareReady && updaterReady && healthReady) {
+		select {
+		case <-ctx.Done():
+			return false
+		case msg, ok := <-swSub.Channel():
+			if ok && msg != nil && msg.Payload != nil {
+				softwareReady = true
+			}
+		case msg, ok := <-upSub.Channel():
+			if ok && msg != nil && msg.Payload != nil {
+				updaterReady = true
+			}
+		case msg, ok := <-healthSub.Channel():
+			if ok && msg != nil && msg.Payload != nil {
+				healthReady = true
+			}
+		}
+	}
+	return true
+}
+
 // -----------------------------------------------------------------------------
 // Thresholds & timing
 // -----------------------------------------------------------------------------
@@ -197,20 +233,30 @@ type Reactor struct {
 	ledTick   int // throttles breathe commands
 
 	// misc
-	now time.Time
+	now       time.Time
+	bootBuyRC int32
 
 	// updater service handle used by the post-hello_ack republish hook.
 	updater *updater.Service
 }
 
+type Options struct {
+	BootBuyRC int32
+}
+
 func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
+	return NewReactorWithOptions(b, uiConn, Options{})
+}
+
+func NewReactorWithOptions(b *bus.Bus, uiConn *bus.Connection, opts Options) *Reactor {
 	return &Reactor{
-		bus:     b,
-		uiConn:  uiConn,
-		levelUp: true,
-		state:   stateOff,
-		now:     time.Now(),
-		ledTick: 0,
+		bus:       b,
+		uiConn:    uiConn,
+		levelUp:   true,
+		state:     stateOff,
+		now:       time.Now(),
+		bootBuyRC: opts.BootBuyRC,
+		ledTick:   0,
 	}
 }
 
@@ -445,13 +491,17 @@ func (r *Reactor) Run(ctx context.Context) {
 	updaterConn := r.bus.NewConnection("updater")
 	identity := firmwareIdentity()
 	updaterSvc := updater.New(updater.Options{
-		Conn:     updaterConn,
-		Verifier: updater.PassthroughVerifier(identity),
-		Applier:  updater.ProductionApplier(),
-		Identity: identity,
+		Conn:      updaterConn,
+		Verifier:  updater.PassthroughVerifier(identity),
+		Applier:   updater.ProductionApplier(),
+		Identity:  identity,
+		BootBuyRC: r.bootBuyRC,
 	})
 	go updaterSvc.Run(ctx)
 	r.updater = updaterSvc
+	if !waitForUpdaterCriticalFacts(ctx, r.bus.NewConnection("updater-ready")) {
+		return
+	}
 
 	// Telemetry service: subscribes to HAL value topics and republishes
 	// at state/self/* with integer engineering units; runs the charger

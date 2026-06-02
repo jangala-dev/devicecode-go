@@ -44,6 +44,12 @@ var (
 	wireUpdaterCommit  = []string{"cap", "self", "updater", "main", "rpc", "commit-update"}
 )
 
+var criticalExportTopics = []bus.Topic{
+	bus.T("state", "self", "software"),
+	bus.T("state", "self", "updater"),
+	bus.T("state", "self", "health"),
+}
+
 // cap/self/updater/main/rpc/{prepare-update,commit-update} land here from
 // the wire and are routed to local rpc/updater/{prepare,commit} where the
 // updater service binds. The updater package re-uses the same local topic
@@ -94,6 +100,18 @@ func exportTopic(t bus.Topic) []string {
 
 func exportPatterns() []bus.Topic {
 	return exportPatternsFor(exportPublishRules)
+}
+
+func isCriticalExportTopic(t bus.Topic) bool {
+	if t == nil {
+		return false
+	}
+	for _, want := range criticalExportTopics {
+		if topicEquals(t, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func exportCallTopic(t bus.Topic) []string {

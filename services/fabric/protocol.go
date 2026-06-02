@@ -52,13 +52,11 @@ type protoHelloAck struct {
 
 type protoPing struct {
 	Type string `json:"type"`
-	TS   int64  `json:"ts"`
 	SID  string `json:"sid,omitempty"`
 }
 
 type protoPong struct {
 	Type string `json:"type"`
-	TS   int64  `json:"ts"`
 	SID  string `json:"sid,omitempty"`
 }
 
@@ -177,6 +175,14 @@ func marshal(v any) []byte {
 // Returns "" if the line isn't a JSON object, the top-level "type" key
 // is missing, or its value isn't a string.
 func protoType(line []byte) string {
+	return protoTopString(line, "type")
+}
+
+func protoXferID(line []byte) string {
+	return protoTopString(line, "xfer_id")
+}
+
+func protoTopString(line []byte, field string) string {
 	n := len(line)
 	i := skipJSONSpace(line, 0)
 	if i >= n || line[i] != '{' {
@@ -213,10 +219,7 @@ func protoType(line []byte) string {
 		if i >= n {
 			return ""
 		}
-		isType := keyEnd-1-keyStart == 4 &&
-			line[keyStart] == 't' && line[keyStart+1] == 'y' &&
-			line[keyStart+2] == 'p' && line[keyStart+3] == 'e'
-		if isType {
+		if jsonKeyEquals(line[keyStart:keyEnd-1], field) {
 			if line[i] != '"' {
 				return ""
 			}
@@ -232,6 +235,18 @@ func protoType(line []byte) string {
 			return ""
 		}
 	}
+}
+
+func jsonKeyEquals(key []byte, field string) bool {
+	if len(key) != len(field) {
+		return false
+	}
+	for i := 0; i < len(field); i++ {
+		if key[i] != field[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func skipJSONSpace(line []byte, i int) int {

@@ -10,7 +10,7 @@ import "errors"
 // Lane assignment for outbound MCU frames mirrors protocol.lua's
 // FRAME_CLASS map. The MCU never originates xfer_chunk so the bulk lane
 // is currently unused on the MCU side; it is wired in for symmetry and
-// for future fabric-update telemetry that may want to route bulk frames.
+// for future MCU-originated bulk-frame users.
 
 type lane uint8
 

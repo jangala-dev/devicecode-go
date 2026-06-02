@@ -18,13 +18,25 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 	}
 
 	s.mu.Lock()
-	if s.preparing || s.state == StateCommitting || s.state == StateRebooting {
+	if s.preparing ||
+		s.streamLeaseActive ||
+		s.state == StateReceiving ||
+		s.state == StateCommitting ||
+		s.state == StateRebooting {
 		s.mu.Unlock()
 		s.reply(msg, Reply{OK: false, Error: ErrBusy})
 		return
 	}
 	s.preparing = true
 	s.mu.Unlock()
+	prepareActive := true
+	finishPrepare := func() {
+		if prepareActive {
+			s.markPrepareDone()
+			prepareActive = false
+		}
+	}
+	defer finishPrepare()
 	s.setJobContext(req.JobID, req.ExpectedImageID)
 	s.transitionTo(StatePreparing, "", "")
 
@@ -34,13 +46,19 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 	// which would be a real safety bug since the user-intent on
 	// prepare(B) is "I want to stage B, throw away A".
 	if err := s.metadataWrite.ClearStagedDescriptor(); err != nil {
-		s.markPrepareDone()
-		s.reply(msg, Reply{OK: false, Error: "metadata_clear_failed:" + err.Error()})
+		errMsg := "metadata_clear_failed:" + err.Error()
+		s.transitionTo(StateFailed, errMsg, "")
+		finishPrepare()
+		s.reply(msg, Reply{OK: false, Error: errMsg})
 		return
 	}
 
+	s.mu.Lock()
+	s.openStageGenerationLocked()
+	s.mu.Unlock()
+
 	s.transitionTo(StateReady, "", "")
-	s.markPrepareDone()
+	finishPrepare()
 	s.reply(msg, PrepareReply{
 		Ready:        true,
 		Target:       TargetUpdaterMain,
@@ -62,8 +80,13 @@ func (s *Service) handleCommit(msg *bus.Message) {
 	s.mu.Lock()
 	stagedInState := s.state == StateStaged
 	pendingImageID := s.pendingImageID
+	streamActive := s.streamLeaseActive
 	s.mu.Unlock()
 
+	if streamActive {
+		s.reply(msg, Reply{OK: false, Error: ErrBusy})
+		return
+	}
 	if !present || !stagedInState {
 		s.reply(msg, Reply{OK: false, Error: ErrNothingStaged})
 		return

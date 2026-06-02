@@ -79,7 +79,7 @@ func bringUp(t *testing.T, cm5 Transport) protoHelloAck {
 
 func unlockExports(t *testing.T, cm5 Transport) {
 	t.Helper()
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 77, SID: testCM5SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: testCM5SID})
 	pong := readMsg[protoPong](t, cm5)
 	if pong.Type != "pong" {
 		t.Fatalf("expected pong, got %q", pong.Type)
@@ -115,8 +115,8 @@ func TestCodecAllTypes(t *testing.T) {
 	}{
 		{protoHello{Type: "hello"}, "hello"},
 		{protoHelloAck{Type: "hello_ack"}, "hello_ack"},
-		{protoPing{Type: "ping", TS: 1}, "ping"},
-		{protoPong{Type: "pong", TS: 2}, "pong"},
+		{protoPing{Type: "ping"}, "ping"},
+		{protoPong{Type: "pong"}, "pong"},
 		{protoPub{Type: "pub", Topic: []string{"a"}}, "pub"},
 		{protoUnretain{Type: "unretain", Topic: []string{"a"}}, "unretain"},
 		{protoCall{Type: "call", ID: "c1"}, "call"},
@@ -182,11 +182,11 @@ func TestTransportRoundTrip(t *testing.T) {
 			t.Errorf("ReadLine: %v", err)
 			return
 		}
-		if string(line) != `{"type":"ping","ts":99}` {
+		if string(line) != `{"type":"ping","sid":"s1"}` {
 			t.Errorf("got %q", line)
 		}
 	}()
-	sendMsg(t, a, protoPing{Type: "ping", TS: 99})
+	sendMsg(t, a, protoPing{Type: "ping", SID: "s1"})
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -195,8 +195,8 @@ func TestTransportRoundTrip(t *testing.T) {
 }
 
 func TestOversizeLineRecovery(t *testing.T) {
-	big := `{"type":"ping","ts":0,"x":"` + strings.Repeat("x", maxLineLen+100) + `"}`
-	input := big + "\n" + `{"type":"ping","ts":3}` + "\n"
+	big := `{"type":"test","n":0,"x":"` + strings.Repeat("x", maxLineLen+100) + `"}`
+	input := big + "\n" + `{"type":"test","n":3}` + "\n"
 	tr := newRWTransport(strings.NewReader(input), io.Discard)
 	_, err := tr.ReadLine()
 	if !errors.Is(err, ErrLineTooLong) {
@@ -206,7 +206,7 @@ func TestOversizeLineRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ReadLine: %v", err)
 	}
-	if string(line) != `{"type":"ping","ts":3}` {
+	if string(line) != `{"type":"test","n":3}` {
 		t.Errorf("got %q", line)
 	}
 }
@@ -233,21 +233,21 @@ func TestShmringTransportRoundTrip(t *testing.T) {
 	mcuTr := NewShmringTransport(rx, tx)
 	defer mcuTr.Close()
 
-	rx.TryWriteFrom([]byte(`{"type":"ping","ts":42}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"test","n":42}` + "\n"))
 	line, err := mcuTr.ReadLine()
 	if err != nil {
 		t.Fatalf("ReadLine: %v", err)
 	}
-	if string(line) != `{"type":"ping","ts":42}` {
+	if string(line) != `{"type":"test","n":42}` {
 		t.Errorf("got %q", line)
 	}
 
-	if err := mcuTr.WriteLine([]byte(`{"type":"pong","ts":42}`)); err != nil {
+	if err := mcuTr.WriteLine([]byte(`{"type":"test","n":42}`)); err != nil {
 		t.Fatalf("WriteLine: %v", err)
 	}
 	var out [128]byte
 	n := tx.TryReadInto(out[:])
-	if string(out[:n]) != `{"type":"pong","ts":42}`+"\n" {
+	if string(out[:n]) != `{"type":"test","n":42}`+"\n" {
 		t.Errorf("tx got %q", out[:n])
 	}
 }
@@ -256,13 +256,13 @@ func TestShmringTransportMultiLine(t *testing.T) {
 	rx := shmring.New(256)
 	tr := NewShmringTransport(rx, shmring.New(256))
 	defer tr.Close()
-	rx.TryWriteFrom([]byte(`{"type":"ping","ts":1}` + "\n" + `{"type":"ping","ts":2}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"test","n":1}` + "\n" + `{"type":"test","n":2}` + "\n"))
 	line1, _ := tr.ReadLine()
 	line2, _ := tr.ReadLine()
-	if string(line1) != `{"type":"ping","ts":1}` {
+	if string(line1) != `{"type":"test","n":1}` {
 		t.Errorf("line1 = %q", line1)
 	}
-	if string(line2) != `{"type":"ping","ts":2}` {
+	if string(line2) != `{"type":"test","n":2}` {
 		t.Errorf("line2 = %q", line2)
 	}
 }
@@ -314,7 +314,7 @@ func TestShmringTransportWriteLineWrapsAcrossSegments(t *testing.T) {
 }
 
 func TestShmringTransportOversize(t *testing.T) {
-	// Ring must be larger than maxLineLen+100 + newline + the trailing ping
+	// Ring must be larger than maxLineLen+100 + newline + the trailing test
 	// frame so the producer can deposit both lines without blocking. The rx
 	// ring used to be 4096 when maxLineLen=2048, leaving comfortable
 	// headroom; now that maxLineLen=4096, bump to 8192.
@@ -327,7 +327,7 @@ func TestShmringTransportOversize(t *testing.T) {
 	}
 	rx.TryWriteFrom(big)
 	rx.TryWriteFrom([]byte("\n"))
-	rx.TryWriteFrom([]byte(`{"type":"ping","ts":7}` + "\n"))
+	rx.TryWriteFrom([]byte(`{"type":"test","n":7}` + "\n"))
 	_, err := tr.ReadLine()
 	if !errors.Is(err, ErrLineTooLong) {
 		t.Fatalf("expected ErrLineTooLong, got %v", err)
@@ -336,7 +336,7 @@ func TestShmringTransportOversize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ReadLine: %v", err)
 	}
-	if string(line) != `{"type":"ping","ts":7}` {
+	if string(line) != `{"type":"test","n":7}` {
 		t.Errorf("got %q", line)
 	}
 }
@@ -370,9 +370,9 @@ func TestHandshake(t *testing.T) {
 		t.Errorf("bad ack: %+v", ack)
 	}
 	time.Sleep(50 * time.Millisecond)
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 99, SID: "s1"})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: "s1"})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 99 || pong.SID != ack.SID {
+	if pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
 	}
 }
@@ -390,10 +390,77 @@ func TestSessionReset(t *testing.T) {
 	if ack.SID == "" || ack.Proto != protocolName {
 		t.Errorf("bad hello_ack: %+v", ack)
 	}
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 55, SID: "s2"})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: "s2"})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 55 || pong.SID != ack.SID {
+	if pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
+	}
+}
+
+func TestDuplicateSameSIDHelloRefreshesWithoutReset(t *testing.T) {
+	tr := &captureTransport{}
+	sink := &fakeTransferSink{}
+	s := session{
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		peerSID:  "s1",
+		peerNode: "bigbox-cm5",
+		incomingTransfer: &incomingTransfer{
+			meta: transferMeta{ID: "xfer-1"},
+			sink: sink,
+		},
+	}
+
+	s.onHello(&protoHello{Type: msgHello, Proto: protocolName, Node: "bigbox-cm5", SID: "s1"})
+
+	if len(tr.writes) != 1 {
+		t.Fatalf("hello_ack writes = %d, want 1", len(tr.writes))
+	}
+	var ack protoHelloAck
+	if err := json.Unmarshal(tr.writes[0], &ack); err != nil {
+		t.Fatalf("hello_ack decode failed: %v", err)
+	}
+	if ack.Type != msgHelloAck || ack.SID != "mcu-sid-test" || ack.Node != "mcu" {
+		t.Fatalf("bad hello_ack: %+v", ack)
+	}
+	if s.incomingTransfer == nil || len(sink.abortReasons) != 0 {
+		t.Fatalf("same-SID hello reset transfer: incoming=%v aborts=%v", s.incomingTransfer != nil, sink.abortReasons)
+	}
+	if s.peerSID != "s1" || s.peerNode != "bigbox-cm5" {
+		t.Fatalf("peer identity changed incorrectly: sid=%q node=%q", s.peerSID, s.peerNode)
+	}
+}
+
+func TestDuplicateSameSIDHelloAckRefreshesWithoutReset(t *testing.T) {
+	tr := &captureTransport{}
+	sink := &fakeTransferSink{}
+	s := session{
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		peerSID:  "s1",
+		peerNode: "bigbox-cm5",
+		incomingTransfer: &incomingTransfer{
+			meta: transferMeta{ID: "xfer-1"},
+			sink: sink,
+		},
+	}
+
+	s.onHelloAck(&protoHelloAck{Type: msgHelloAck, Proto: protocolName, Node: "bigbox-cm5", SID: "s1"})
+
+	if len(tr.writes) != 0 {
+		t.Fatalf("hello_ack refresh wrote %d frames, want 0", len(tr.writes))
+	}
+	if s.incomingTransfer == nil || len(sink.abortReasons) != 0 {
+		t.Fatalf("same-SID hello_ack reset transfer: incoming=%v aborts=%v", s.incomingTransfer != nil, sink.abortReasons)
+	}
+	if s.peerSID != "s1" || s.peerNode != "bigbox-cm5" {
+		t.Fatalf("peer identity changed incorrectly: sid=%q node=%q", s.peerSID, s.peerNode)
 	}
 }
 
@@ -430,6 +497,20 @@ func TestRejectsWrongNode(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no hello_ack for correct peer")
+	}
+}
+
+func TestRejectsWrongNodeHelloAck(t *testing.T) {
+	s := session{peerID: "bigbox-cm5"}
+	s.onHelloAck(&protoHelloAck{
+		Type:  msgHelloAck,
+		Proto: protocolName,
+		Node:  "cm5-wrong",
+		SID:   "s1",
+	})
+
+	if s.link == linkUp || s.peerSID != "" || s.peerNode != "" {
+		t.Fatalf("wrong-node hello_ack changed session: link=%v peer_sid=%q peer_node=%q", s.link, s.peerSID, s.peerNode)
 	}
 }
 
@@ -478,9 +559,9 @@ func TestPingPong(t *testing.T) {
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	ack := bringUp(t, cm5)
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 42, SID: "s1"})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: "s1"})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 42 || pong.SID != ack.SID {
+	if pong.SID != ack.SID {
 		t.Errorf("bad pong: %+v ack=%+v", pong, ack)
 	}
 }
@@ -493,11 +574,11 @@ func TestEchoedPingIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	ack := bringUp(t, cm5)
 
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 41, SID: ack.SID})
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 42, SID: testCM5SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: ack.SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: testCM5SID})
 
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 42 || pong.SID != ack.SID {
+	if pong.SID != ack.SID {
 		t.Errorf("bad pong after echoed ping: %+v ack=%+v", pong, ack)
 	}
 }
@@ -511,10 +592,10 @@ func TestEchoedTransferControlIgnored(t *testing.T) {
 	bringUp(t, cm5)
 
 	sendMsg(t, cm5, protoXferNeed{Type: msgXferNeed, XferID: "echoed", Next: 0})
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 42, SID: testCM5SID})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: testCM5SID})
 
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 42 {
+	if pong.Type != msgPong {
 		t.Errorf("bad pong after echoed transfer control: %+v", pong)
 	}
 }
@@ -558,19 +639,38 @@ func TestSessionPingsUnconditionally(t *testing.T) {
 }
 
 func TestReadyHeldUntilExportHoldoff(t *testing.T) {
-	// session_ctl.lua / rpc_bridge.lua: ready == established and rpc_ready,
-	// where rpc_ready edges true only after retained replay completes.
 	// The Go side gates rpcReady on exportReadyAt elapsing post-handshake.
 	mcu, cm5 := pipePair()
 	b := newBus()
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(bus.T("state", "fabric", "link", "mcu-uart0"))
 	defer observer.Unsubscribe(sub)
+	publisher := b.NewConnection("publisher")
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "running"},
+		true,
+	))
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	bringUp(t, cm5)
+	go func() {
+		for i := 0; i < len(criticalExportTopics); i++ {
+			_, _ = cm5.ReadLine()
+		}
+	}()
 
 	var sawNotReady, sawReady bool
 	deadline := time.After(3 * time.Second)
@@ -858,10 +958,10 @@ func TestUnknownTypeIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte(`{"type":"future_msg"}`))
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 1})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: testCM5SID})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 1 {
-		t.Errorf("pong.TS = %d", pong.TS)
+	if pong.Type != msgPong {
+		t.Errorf("bad pong: %+v", pong)
 	}
 }
 
@@ -873,10 +973,10 @@ func TestMalformedJSONIgnored(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	bringUp(t, cm5)
 	cm5.WriteLine([]byte("not json"))
-	sendMsg(t, cm5, protoPing{Type: "ping", TS: 2})
+	sendMsg(t, cm5, protoPing{Type: "ping", SID: testCM5SID})
 	pong := readMsg[protoPong](t, cm5)
-	if pong.TS != 2 {
-		t.Errorf("pong.TS = %d", pong.TS)
+	if pong.Type != msgPong {
+		t.Errorf("bad pong: %+v", pong)
 	}
 }
 
@@ -904,12 +1004,33 @@ func TestLinkStatePublishedOnHandshake(t *testing.T) {
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(bus.T("state", "fabric", "link", "mcu-uart0"))
 	defer observer.Unsubscribe(sub)
+	publisher := b.NewConnection("publisher")
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "running"},
+		true,
+	))
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 
 	ack := bringUp(t, cm5)
+	go func() {
+		for i := 0; i < len(criticalExportTopics); i++ {
+			_, _ = cm5.ReadLine()
+		}
+	}()
 
 	var sawOpening bool
 	deadline := time.After(2 * time.Second)
@@ -1130,8 +1251,8 @@ func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
 	defer s.teardownExports()
 
 	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "runtime", "memory"),
-		map[string]int{"alloc_bytes": 241376},
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
 		true,
 	))
 	s.drainExports()
@@ -1174,12 +1295,22 @@ func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
 	})
 
 	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
 		bus.T("state", "self", "updater"),
 		map[string]any{
 			"state":            "ready",
 			"pending_image_id": "mcu-dev-13.0",
 			"job_id":           "job-1",
 		},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
 		true,
 	))
 	s.drainExports()
@@ -1197,18 +1328,485 @@ func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
 	}
 }
 
+func TestDrainExportsAllowsOnlyCriticalFactsDuringPostTransferQuiet(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+	s := session{
+		conn:                fabricConn,
+		tr:                  tr,
+		link:                linkUp,
+		exportsEnabled:      true,
+		exportReadyAt:       time.Now().Add(-time.Second),
+		transferQuietUntil:  time.Now().Add(time.Second),
+		transferQuietReason: "xfer_done",
+	}
+
+	s.setupExports()
+	defer s.teardownExports()
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"alloc_bytes": 241376},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "rebooting"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
+
+	for i := 0; i < len(criticalExportTopics)+4; i++ {
+		s.drainExports()
+	}
+	if len(tr.writes) != len(criticalExportTopics) {
+		t.Fatalf("writes during post-transfer quiet = %d, want %d critical facts",
+			len(tr.writes), len(criticalExportTopics))
+	}
+	want := [][]string{
+		{"state", "self", "software"},
+		{"state", "self", "updater"},
+		{"state", "self", "health"},
+	}
+	for i, topic := range want {
+		pub := decodePubWrite(t, tr.writes[i])
+		if !slicesEqual(pub.Topic, topic) {
+			t.Fatalf("write %d topic = %v, want %v", i, pub.Topic, topic)
+		}
+	}
+}
+
+func TestDrainExportsPrioritizesCriticalRetainedFacts(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"alloc_bytes": 241376},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "running"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+
+	s := session{
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	for i := 0; i < 3; i++ {
+		s.drainExports()
+	}
+	if len(tr.writes) != 3 {
+		t.Fatalf("writes after critical drains = %d, want 3", len(tr.writes))
+	}
+
+	want := [][]string{
+		{"state", "self", "software"},
+		{"state", "self", "updater"},
+		{"state", "self", "health"},
+	}
+	for i, topic := range want {
+		pub := decodePubWrite(t, tr.writes[i])
+		if !slicesEqual(pub.Topic, topic) {
+			t.Fatalf("write %d topic = %v, want %v", i, pub.Topic, topic)
+		}
+		if !pub.Retain {
+			t.Fatalf("write %d retain = false, want true", i)
+		}
+	}
+
+	for i := 0; i < 8; i++ {
+		s.drainExports()
+	}
+	counts := map[string]int{}
+	for _, write := range tr.writes {
+		pub := decodePubWrite(t, write)
+		counts[wireTopicString(pub.Topic)]++
+	}
+	for _, topic := range want {
+		key := wireTopicString(topic)
+		if counts[key] != 1 {
+			t.Fatalf("critical topic %s sent %d times, want exactly once", key, counts[key])
+		}
+	}
+	if counts["state/self/runtime/memory"] != 1 {
+		t.Fatalf("telemetry topic sent %d times, want once", counts["state/self/runtime/memory"])
+	}
+}
+
+func TestDrainCriticalExportsCoalescesLatestRetainedFact(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "old", "boot_id": "boot-old"},
+		true,
+	))
+
+	s := session{
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "new", "boot_id": "boot-new"},
+		true,
+	))
+
+	s.drainExports()
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes = %d, want 1", len(tr.writes))
+	}
+	pub := decodePubWrite(t, tr.writes[0])
+	if !slicesEqual(pub.Topic, []string{"state", "self", "software"}) {
+		t.Fatalf("topic = %v, want state/self/software", pub.Topic)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(pub.Payload, &payload); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if payload["image_id"] != "new" || payload["boot_id"] != "boot-new" {
+		t.Fatalf("payload = %+v, want newest software fact", payload)
+	}
+}
+
+func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	watchConn := b.NewConnection("watch")
+	linkSub := watchConn.Subscribe(bus.T("state", "fabric", "link", defaultLinkID))
+	defer watchConn.Unsubscribe(linkSub)
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "idle"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
+
+	s := session{
+		linkID:         defaultLinkID,
+		peerID:         "mcu",
+		localSID:       "mcu-sid",
+		peerSID:        "cm5-sid",
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	s.tickReady(time.Now())
+	if s.rpcReady {
+		t.Fatal("rpcReady raised before critical replay drain")
+	}
+	if _, ok := readLinkState(linkSub); ok {
+		t.Fatal("link state published before critical replay drain")
+	}
+
+	for i := 0; i < len(criticalExportTopics)-1; i++ {
+		s.drainExports()
+		s.tickReady(time.Now())
+		if s.rpcReady {
+			t.Fatalf("rpcReady raised after %d critical writes, want still false", i+1)
+		}
+		if _, ok := readLinkState(linkSub); ok {
+			t.Fatalf("link state published after %d critical writes, want none", i+1)
+		}
+	}
+
+	s.drainExports()
+	s.tickReady(time.Now())
+	if !s.rpcReady {
+		t.Fatal("rpcReady did not raise after critical replay drain")
+	}
+	state, ok := readLinkState(linkSub)
+	if !ok {
+		t.Fatal("missing ready link state publish")
+	}
+	if !state.Ready || state.Status != statusReady {
+		t.Fatalf("link state = %+v, want ready", state)
+	}
+	if len(tr.writes) != len(criticalExportTopics) {
+		t.Fatalf("critical writes = %d, want %d", len(tr.writes), len(criticalExportTopics))
+	}
+}
+
+func TestReadyBlocksWhenCriticalReplayFactsAreAbsentAndSuppressesTelemetry(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"alloc_bytes": 241376},
+		true,
+	))
+
+	s := session{
+		linkID:         defaultLinkID,
+		peerID:         "mcu",
+		localSID:       "mcu-sid",
+		peerSID:        "cm5-sid",
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	s.tickReady(time.Now())
+	if s.rpcReady {
+		t.Fatal("rpcReady raised before critical replay drain")
+	}
+	for i := 0; i < 3; i++ {
+		s.drainExports()
+		s.tickReady(time.Now())
+	}
+	if s.rpcReady {
+		t.Fatal("rpcReady raised after absent critical replay facts")
+	}
+	if len(tr.writes) != 0 {
+		t.Fatalf("writes = %d, want no telemetry while critical replay is absent", len(tr.writes))
+	}
+}
+
+func TestLateCriticalExportsDrainBeforeWildcardTelemetryAndReady(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"alloc_bytes": 241376},
+		true,
+	))
+
+	s := session{
+		linkID:         defaultLinkID,
+		peerID:         "mcu",
+		localSID:       "mcu-sid",
+		peerSID:        "cm5-sid",
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	s.drainExports()
+	s.tickReady(time.Now())
+	if s.rpcReady {
+		t.Fatal("rpcReady raised before initial critical replay facts")
+	}
+	if len(tr.writes) != 0 {
+		t.Fatalf("initial writes = %d, want no telemetry before critical replay", len(tr.writes))
+	}
+	start := len(tr.writes)
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "cpu"),
+		map[string]int{"load_pct": 42},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "running"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+
+	wantCritical := [][]string{
+		{"state", "self", "software"},
+		{"state", "self", "updater"},
+		{"state", "self", "health"},
+	}
+	for i, topic := range wantCritical {
+		s.drainExports()
+		pub := decodePubWrite(t, tr.writes[start+i])
+		if !slicesEqual(pub.Topic, topic) {
+			t.Fatalf("post-ready write %d topic = %v, want %v", i, pub.Topic, topic)
+		}
+		s.tickReady(time.Now())
+		if i < len(wantCritical)-1 && s.rpcReady {
+			t.Fatalf("rpcReady raised after %d critical writes, want still false", i+1)
+		}
+	}
+	if !s.rpcReady {
+		t.Fatal("rpcReady did not raise after all critical facts were exported")
+	}
+
+	for i := 0; i < 8; i++ {
+		s.drainExports()
+	}
+	counts := map[string]int{}
+	for _, write := range tr.writes[start:] {
+		pub := decodePubWrite(t, write)
+		counts[wireTopicString(pub.Topic)]++
+	}
+	for _, topic := range wantCritical {
+		key := wireTopicString(topic)
+		if counts[key] != 1 {
+			t.Fatalf("post-ready critical topic %s sent %d times, want exactly once", key, counts[key])
+		}
+	}
+	if counts["state/self/runtime/cpu"] != 1 {
+		t.Fatalf("post-ready telemetry sent %d times, want once", counts["state/self/runtime/cpu"])
+	}
+
+	start = len(tr.writes)
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "temperature"),
+		map[string]int{"deci_c": 421},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok", "reason": "ready-edge"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "idle"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-newer", "boot_id": "boot-newer"},
+		true,
+	))
+	for i, topic := range wantCritical {
+		s.drainExports()
+		pub := decodePubWrite(t, tr.writes[start+i])
+		if !slicesEqual(pub.Topic, topic) {
+			t.Fatalf("post-ready write %d topic = %v, want %v", i, pub.Topic, topic)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		s.drainExports()
+	}
+	counts = map[string]int{}
+	for _, write := range tr.writes[start:] {
+		pub := decodePubWrite(t, write)
+		counts[wireTopicString(pub.Topic)]++
+	}
+	for _, topic := range wantCritical {
+		key := wireTopicString(topic)
+		if counts[key] != 1 {
+			t.Fatalf("post-ready critical topic %s sent %d times, want exactly once", key, counts[key])
+		}
+	}
+	if counts["state/self/runtime/temperature"] != 1 {
+		t.Fatalf("post-ready telemetry sent %d times, want once", counts["state/self/runtime/temperature"])
+	}
+}
+
+func decodePubWrite(t *testing.T, line []byte) protoPub {
+	t.Helper()
+	var pub protoPub
+	if err := json.Unmarshal(line, &pub); err != nil {
+		t.Fatalf("Unmarshal pub %q: %v", line, err)
+	}
+	if pub.Type != msgPub {
+		t.Fatalf("frame type = %q, want %q", pub.Type, msgPub)
+	}
+	return pub
+}
+
+func readLinkState(sub *bus.Subscription) (linkStatePayload, bool) {
+	select {
+	case msg, ok := <-sub.Channel():
+		if !ok || msg == nil {
+			return linkStatePayload{}, false
+		}
+		state, ok := msg.Payload.(linkStatePayload)
+		return state, ok
+	default:
+		return linkStatePayload{}, false
+	}
+}
+
 func TestPongAllowedDuringIncomingTransfer(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
 		tr:       tr,
 		link:     linkUp,
 		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
 		incomingTransfer: &incomingTransfer{
 			meta: transferMeta{ID: "xfer-1"},
 		},
 	}
 
-	s.onPing(&protoPing{Type: msgPing, TS: 42, SID: "cm5-sid"})
+	s.onPing(&protoPing{Type: msgPing, SID: "cm5-sid"})
 
 	if len(tr.writes) != 1 {
 		t.Fatalf("pong writes during transfer = %d, want 1", len(tr.writes))
@@ -1217,25 +1815,99 @@ func TestPongAllowedDuringIncomingTransfer(t *testing.T) {
 	if err := json.Unmarshal(tr.writes[0], &pong); err != nil {
 		t.Fatalf("pong decode failed: %v", err)
 	}
-	if pong.Type != msgPong || pong.SID != "mcu-sid-test" || pong.TS != 42 {
+	if pong.Type != msgPong || pong.SID != "mcu-sid-test" {
 		t.Fatalf("bad pong: %+v", pong)
 	}
 }
 
-func TestPongSuppressedDuringPrepareQuiet(t *testing.T) {
+func TestPongAllowedDuringPrepareQuietForEstablishedPeer(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
 		tr:                  tr,
 		link:                linkUp,
 		localSID:            "mcu-sid-test",
+		peerSID:             "cm5-sid",
 		transferQuietUntil:  time.Now().Add(time.Second),
 		transferQuietReason: "prepare_call_rx",
 	}
 
-	s.onPing(&protoPing{Type: msgPing, TS: 42, SID: "cm5-sid"})
+	s.onPing(&protoPing{Type: msgPing, SID: "cm5-sid"})
+
+	if len(tr.writes) != 1 {
+		t.Fatalf("pong writes during prepare quiet = %d, want 1", len(tr.writes))
+	}
+	var pong protoPong
+	if err := json.Unmarshal(tr.writes[0], &pong); err != nil {
+		t.Fatalf("pong decode failed: %v", err)
+	}
+	if pong.Type != msgPong || pong.SID != "mcu-sid-test" {
+		t.Fatalf("bad pong: %+v", pong)
+	}
+}
+
+func TestPongRejectsWrongSIDDuringPrepareQuiet(t *testing.T) {
+	tr := &captureTransport{}
+	s := session{
+		tr:                  tr,
+		link:                linkUp,
+		localSID:            "mcu-sid-test",
+		peerSID:             "cm5-sid",
+		transferQuietUntil:  time.Now().Add(time.Second),
+		transferQuietReason: "prepare_call_rx",
+	}
+
+	s.onPing(&protoPing{Type: msgPing, SID: "other-sid"})
 
 	if len(tr.writes) != 0 {
-		t.Fatalf("pong writes during prepare quiet = %d, want 0", len(tr.writes))
+		t.Fatalf("pong writes for wrong sid = %d, want 0", len(tr.writes))
+	}
+}
+
+func TestWrongSIDPingPongDoNotRefreshLiveness(t *testing.T) {
+	tr := &captureTransport{}
+	oldRx := time.Now().Add(-time.Hour)
+	s := session{
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
+		lastRxAt: oldRx,
+	}
+
+	s.dispatch(marshal(protoPing{Type: msgPing, SID: "other-sid"}))
+	if !s.lastRxAt.Equal(oldRx) {
+		t.Fatalf("wrong-sid ping refreshed liveness: got %v want %v", s.lastRxAt, oldRx)
+	}
+	if len(tr.writes) != 0 {
+		t.Fatalf("pong writes for wrong sid = %d, want 0", len(tr.writes))
+	}
+
+	s.dispatch(marshal(protoPong{Type: msgPong, SID: "other-sid"}))
+	if !s.lastRxAt.Equal(oldRx) {
+		t.Fatalf("wrong-sid pong refreshed liveness: got %v want %v", s.lastRxAt, oldRx)
+	}
+
+	s.dispatch(marshal(protoPong{Type: msgPong, SID: "cm5-sid"}))
+	if !s.lastRxAt.After(oldRx) {
+		t.Fatalf("current peer pong did not refresh liveness: got %v old %v", s.lastRxAt, oldRx)
+	}
+}
+
+func TestPongRejectsSelfSIDDuringPrepareQuiet(t *testing.T) {
+	tr := &captureTransport{}
+	s := session{
+		tr:                  tr,
+		link:                linkUp,
+		localSID:            "mcu-sid-test",
+		peerSID:             "mcu-sid-test",
+		transferQuietUntil:  time.Now().Add(time.Second),
+		transferQuietReason: "prepare_call_rx",
+	}
+
+	s.onPing(&protoPing{Type: msgPing, SID: "mcu-sid-test"})
+
+	if len(tr.writes) != 0 {
+		t.Fatalf("pong writes for self sid = %d, want 0", len(tr.writes))
 	}
 }
 

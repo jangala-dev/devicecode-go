@@ -1,9 +1,11 @@
 package fabric
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"time"
 
@@ -50,15 +52,18 @@ const (
 	exportTickInterval = 50 * time.Millisecond
 	errPayloadMarshal  = "payload_marshal_failed"
 
-	// The USB/UART path used during OTA echoes MCU-originated JSONL back into
-	// the MCU receiver. If exported retained state is in flight while CM5 starts
-	// an OTA transfer, the echoed line can contain CM5's xfer_begin spliced into
-	// the middle of the state pub. Hold exports quiet from prepare until either
-	// xfer_begin arrives or this window expires.
+	// Temporary transport recovery policy: the USB/UART path used during OTA
+	// can echo MCU-originated JSONL back into the MCU receiver. If exported
+	// retained state is in flight while CM5 starts an OTA transfer, the echoed
+	// line can contain CM5's xfer_begin spliced into the middle of the state pub.
+	// Hold exports quiet from prepare until either xfer_begin arrives or this
+	// window expires. Revisit after CM5 update-admission hardening so this does
+	// not become OTA semantics.
 	transferPrepareQuiet = 10 * time.Second
-	// Keep telemetry/state exports quiet long enough for the host to send the
-	// follow-up updater commit call after xfer_done. On echo-prone UART links,
-	// retained export backlog can otherwise splice into the commit JSONL frame.
+	// Temporary transport recovery policy: keep telemetry/state exports quiet
+	// long enough for the host to send the follow-up updater commit call after
+	// xfer_done. On echo-prone UART links, retained export backlog can otherwise
+	// splice into the commit JSONL frame.
 	transferCompleteQuiet = 10 * time.Second
 )
 
@@ -141,21 +146,24 @@ type session struct {
 	exportReadyAt  time.Time
 	exportsEnabled bool
 
-	exportSubs          []*bus.Subscription
-	exportCallSubs      []*bus.Subscription
-	inboundCalls        []*inboundCall
-	outboundCalls       []*outboundCall
-	nextOutboundID      uint64
-	nextPingAt          time.Time
-	txControl           txLane
-	txRPC               txLane
-	txBulk              txLane
-	importedRetained    []bus.Topic // local topics currently retained on the bus due to wire imports
-	rpcReady            bool        // bridge replay complete; gates linkStatePayload.Ready
-	incomingTransfer    *incomingTransfer
-	transferQuietUntil  time.Time
-	transferQuietReason string
-	beginTransfer       func(transferMeta) (transferSink, error)
+	criticalExportSubs          []*bus.Subscription
+	criticalExportReplayPending []bool
+	exportSubs                  []*bus.Subscription
+	exportCallSubs              []*bus.Subscription
+	inboundCalls                []*inboundCall
+	outboundCalls               []*outboundCall
+	nextOutboundID              uint64
+	nextPingAt                  time.Time
+	txControl                   txLane
+	txRPC                       txLane
+	txBulk                      txLane
+	importedRetained            []bus.Topic // local topics currently retained on the bus due to wire imports
+	rpcReady                    bool        // bridge replay complete; gates linkStatePayload.Ready
+	incomingTransfer            *incomingTransfer
+	completedTransfers          []completedTransfer
+	transferQuietUntil          time.Time
+	transferQuietReason         string
+	beginTransfer               func(transferMeta) (transferSink, error)
 }
 
 func (s *session) log(msg string) {
@@ -237,8 +245,11 @@ func (s *session) run(ctx context.Context) {
 				s.handleLinkDown(reasonTransportDown, res.err.Error())
 				return
 			}
+			beforeRx := s.lastRxAt
 			s.dispatch(res.line)
-			resetTimer(stale, s.cfg.LivenessTimeout)
+			if s.lastRxAt.After(beforeRx) {
+				resetTimer(stale, s.cfg.LivenessTimeout)
+			}
 
 		case <-exportTick.C:
 			now := time.Now()
@@ -345,6 +356,7 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.teardownOutbound(pendingReason)
 	s.teardownImportedRetained()
 	s.abortTransfer(pendingReason)
+	s.clearCompletedTransfers()
 	s.publishLinkState(reason, err)
 	if err != "" {
 		s.logKV("link down", "err", err)
@@ -374,6 +386,7 @@ func (s *session) promoteLink(reason string) {
 		s.teardownInbound()
 		s.teardownOutbound(reason)
 		s.teardownImportedRetained()
+		s.clearCompletedTransfers()
 	}
 	s.link = linkUp
 	s.rpcReady = false
@@ -413,13 +426,16 @@ func (s *session) untrackImportedRetain(t bus.Topic) {
 }
 
 // tickReady promotes rpcReady once the post-handshake export holdoff has
-// elapsed, mirroring rpc_bridge.lua's emit_rpc_ready(true) after retained
-// replay. Re-publishes link state so consumers observe the ready edge.
+// elapsed and the initial exact critical retained replay has been drained.
+// Re-publishes link state so consumers observe the ready edge.
 func (s *session) tickReady(now time.Time) {
 	if s.link != linkUp || s.rpcReady {
 		return
 	}
 	if s.exportReadyAt.IsZero() || now.Before(s.exportReadyAt) {
+		return
+	}
+	if !s.criticalExportReplayDrained() {
 		return
 	}
 	s.rpcReady = true
@@ -434,14 +450,13 @@ func (s *session) dispatch(line []byte) {
 		s.logMalformed(line, nil)
 		return
 	}
-	s.markRx()
 
 	switch t {
 	case msgHello:
-		typedDispatch(s, line, s.onHello)
+		typedDispatch(s, t, line, s.onHello)
 		return
 	case msgHelloAck:
-		typedDispatch(s, line, s.onHelloAck)
+		typedDispatch(s, t, line, s.onHelloAck)
 		return
 	}
 
@@ -451,25 +466,25 @@ func (s *session) dispatch(line []byte) {
 
 	switch t {
 	case msgPing:
-		typedDispatch(s, line, s.onPing)
+		typedDispatch(s, t, line, s.onPing)
 	case msgPong:
-		typedDispatch(s, line, s.onPong)
+		typedDispatch(s, t, line, s.onPong)
 	case msgPub:
-		typedDispatch(s, line, s.onPub)
+		typedDispatch(s, t, line, s.onPub)
 	case msgUnretain:
-		typedDispatch(s, line, s.onUnretain)
+		typedDispatch(s, t, line, s.onUnretain)
 	case msgCall:
-		typedDispatch(s, line, s.onCall)
+		typedDispatch(s, t, line, s.onCall)
 	case msgReply:
-		typedDispatch(s, line, s.onReply)
+		typedDispatch(s, t, line, s.onReply)
 	case msgXferBegin:
-		typedDispatch(s, line, s.onTransferBegin)
+		typedDispatch(s, t, line, s.onTransferBegin)
 	case msgXferChunk:
-		typedDispatch(s, line, s.onTransferChunk)
+		typedDispatch(s, t, line, s.onTransferChunk)
 	case msgXferCommit:
-		typedDispatch(s, line, s.onTransferCommit)
+		typedDispatch(s, t, line, s.onTransferCommit)
 	case msgXferAbort:
-		typedDispatch(s, line, s.onTransferAbort)
+		typedDispatch(s, t, line, s.onTransferAbort)
 	case msgXferReady, msgXferNeed, msgXferDone:
 		s.logKV("echoed transfer control ignored", "type", t)
 	default:
@@ -477,13 +492,45 @@ func (s *session) dispatch(line []byte) {
 	}
 }
 
-func typedDispatch[T any](s *session, line []byte, handler func(*T)) {
+func typedDispatch[T any](s *session, msgType string, line []byte, handler func(*T)) {
 	var msg T
-	if err := json.Unmarshal(line, &msg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&msg); err != nil {
 		s.logMalformed(line, err)
+		s.retryMalformedTransferFrame(msgType, line)
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing_json")
+		}
+		s.logMalformed(line, err)
+		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
 	handler(&msg)
+}
+
+func (s *session) retryMalformedTransferFrame(msgType string, line []byte) {
+	if msgType != msgXferChunk {
+		return
+	}
+	cur := s.incomingTransfer
+	if cur == nil {
+		return
+	}
+	id := protoXferID(line)
+	if id == "" {
+		s.logKV("malformed xfer_chunk dropped", "why", "missing_xfer_id")
+		return
+	}
+	if id != cur.meta.ID {
+		s.logKV("malformed xfer_chunk dropped", "id", id)
+		return
+	}
+	s.retryCorruptTransferFrame("bad_message")
 }
 
 func (s *session) requireLinkUp(t string) bool {
@@ -511,20 +558,9 @@ func (s *session) logMalformed(line []byte, err error) {
 		)
 	}
 
-	// If a transfer is in flight, the dropped frame was very likely a
-	// corrupted xfer_chunk. Without an explicit signal CM5 keeps
-	// streaming chunks past the gap and the receiver silently drops
-	// them as out-of-order; the transfer eventually fails on the
-	// phase timeout. Re-request the next expected byte so CM5
-	// retransmits from the gap. Cheap if it wasn't actually a chunk
-	// (the sender just gets one stale need frame and ignores it once
-	// it has caught up).
-	if cur := s.incomingTransfer; cur != nil {
-		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
-		// Refresh the idle-chunk deadline so a stream of malformed frames can
-		// recover instead of tripping phase_timeout mid-retry.
-		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
-	}
+	// Transfer retry signaling is handled by typedDispatch only for
+	// malformed active xfer_chunk frames. Other malformed frames are logged
+	// and dropped without consuming the transfer corruption budget.
 }
 
 // notePeerIdentity records the remote peer's node, SID, and protocol name.
@@ -590,6 +626,18 @@ func wireTopicString(topic []string) string {
 	return strings.Join(topic, "/")
 }
 
+func validWireTopic(topic []string) bool {
+	if len(topic) == 0 {
+		return false
+	}
+	for _, part := range topic {
+		if part == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *session) extendTransferQuiet(reason string, d time.Duration) {
 	now := time.Now()
 	until := now.Add(d)
@@ -613,6 +661,15 @@ func (s *session) transferQuiet(now time.Time) (bool, string) {
 	return false, ""
 }
 
+func quietAllowsCriticalExports(reason string) bool {
+	switch reason {
+	case "xfer_commit_target", "xfer_target_rejected", "xfer_done":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *session) onHello(msg *protoHello) {
 	if msg.Proto != protocolName {
 		s.log("hello dropped: unsupported proto")
@@ -626,6 +683,7 @@ func (s *session) onHello(msg *protoHello) {
 		s.log("hello dropped: wrong node")
 		return
 	}
+	s.markRx()
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
@@ -638,7 +696,9 @@ func (s *session) onHello(msg *protoHello) {
 		return
 	}
 	s.log("hello_ack tx")
-	s.promoteLink(reason)
+	if s.link != linkUp || reason != "" {
+		s.promoteLink(reason)
+	}
 }
 
 func (s *session) onHelloAck(msg *protoHelloAck) {
@@ -654,21 +714,29 @@ func (s *session) onHelloAck(msg *protoHelloAck) {
 		s.log("hello_ack dropped: missing identity")
 		return
 	}
+	if s.peerID != "" && msg.Node != s.peerID {
+		s.log("hello_ack dropped: wrong node")
+		return
+	}
+	s.markRx()
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello_ack rx", "peer_sid", msg.SID)
-	s.promoteLink(reason)
+	if s.link != linkUp || reason != "" {
+		s.promoteLink(reason)
+	}
 }
 
 func (s *session) onPing(msg *protoPing) {
+	if s.link != linkUp || msg.SID != s.peerSID {
+		return
+	}
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed ping ignored")
 		return
 	}
-	if !s.transferQuietUntil.IsZero() && time.Now().Before(s.transferQuietUntil) {
-		return
-	}
+	s.markRx()
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.sendControl(marshal(protoPong{Type: msgPong, TS: msg.TS, SID: s.localSID})) {
+	if !s.sendControl(marshal(protoPong{Type: msgPong, SID: s.localSID})) {
 		return
 	}
 	s.log("pong tx")
@@ -691,21 +759,29 @@ func (s *session) tickPing(now time.Time) {
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
 		return
 	}
-	if !s.sendControl(marshal(protoPing{Type: msgPing, TS: now.UnixMilli(), SID: s.localSID})) {
+	if !s.sendControl(marshal(protoPing{Type: msgPing, SID: s.localSID})) {
 		return
 	}
 	s.nextPingAt = now.Add(s.cfg.PingInterval)
 }
 
 func (s *session) onPong(msg *protoPong) {
+	if s.link != linkUp || msg.SID != s.peerSID {
+		return
+	}
 	if s.isSelfControlFrame("", msg.SID) {
 		s.log("echoed pong ignored")
 		return
 	}
+	s.markRx()
 	s.lastPongAt = s.lastRxAt
 }
 
 func (s *session) onPub(msg *protoPub) {
+	if !validWireTopic(msg.Topic) {
+		s.log("incoming pub dropped: bad_topic")
+		return
+	}
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		if hasWirePrefix(msg.Topic, []string{"state"}) {
@@ -716,6 +792,7 @@ func (s *session) onPub(msg *protoPub) {
 		return
 	}
 
+	s.markRx()
 	s.conn.Publish(s.conn.NewMessage(localTopic, msg.Payload, msg.Retain))
 	if msg.Retain {
 		s.trackImportedRetain(localTopic)
@@ -728,16 +805,37 @@ func (s *session) onPub(msg *protoPub) {
 }
 
 func (s *session) onUnretain(msg *protoUnretain) {
+	if !validWireTopic(msg.Topic) {
+		s.log("incoming unretain dropped: bad_topic")
+		return
+	}
 	localTopic := importPublishTopic(msg.Topic)
 	if localTopic == nil {
 		s.log("incoming unretain dropped: no_route")
 		return
 	}
+	s.markRx()
 	s.conn.Publish(s.conn.NewMessage(localTopic, nil, true))
 	s.untrackImportedRetain(localTopic)
 }
 
 func (s *session) onCall(msg *protoCall) {
+	if msg.ID == "" {
+		s.log("incoming call dropped: missing_id")
+		return
+	}
+	if !validWireTopic(msg.Topic) {
+		s.log("incoming call dropped: bad_topic")
+		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "bad_topic"}))
+		return
+	}
+	for _, call := range s.inboundCalls {
+		if call.id == msg.ID {
+			s.logKV("incoming call dropped", "err", "duplicate_call_id")
+			s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "duplicate_call_id"}))
+			return
+		}
+	}
 	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
 		s.log("incoming call dropped: busy")
 		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
@@ -751,6 +849,7 @@ func (s *session) onCall(msg *protoCall) {
 		return
 	}
 
+	s.markRx()
 	isTransferPrepare := wireTopicEquals(msg.Topic, wireUpdaterPrepare)
 	if isTransferPrepare {
 		s.extendTransferQuiet("prepare_call_rx", transferPrepareQuiet)
@@ -773,10 +872,15 @@ func (s *session) onCall(msg *protoCall) {
 }
 
 func (s *session) onReply(msg *protoReply) {
+	if msg.Corr == "" {
+		s.log("reply dropped: missing_id")
+		return
+	}
 	for i, call := range s.outboundCalls {
 		if call.id != msg.Corr {
 			continue
 		}
+		s.markRx()
 		s.outboundCalls = append(s.outboundCalls[:i], s.outboundCalls[i+1:]...)
 		if !call.req.CanReply() {
 			return
@@ -842,6 +946,10 @@ func (s *session) setupExports() {
 	if s.conn == nil {
 		return
 	}
+	for _, p := range criticalExportTopics {
+		s.criticalExportSubs = append(s.criticalExportSubs, s.conn.Subscribe(p))
+		s.criticalExportReplayPending = append(s.criticalExportReplayPending, true)
+	}
 	for _, p := range exportPatterns() {
 		s.exportSubs = append(s.exportSubs, s.conn.Subscribe(p))
 	}
@@ -851,6 +959,11 @@ func (s *session) setupExports() {
 }
 
 func (s *session) teardownExports() {
+	for _, sub := range s.criticalExportSubs {
+		s.conn.Unsubscribe(sub)
+	}
+	s.criticalExportSubs = nil
+	s.criticalExportReplayPending = nil
 	for _, sub := range s.exportSubs {
 		s.conn.Unsubscribe(sub)
 	}
@@ -880,6 +993,100 @@ func (s *session) teardownOutbound(reason string) {
 	s.outboundCalls = nil
 }
 
+func (s *session) sendExportMessage(m *bus.Message) (bool, bool) {
+	if m == nil {
+		return false, true
+	}
+	wire := exportTopic(m.Topic)
+	if wire == nil {
+		return false, true
+	}
+	if m.Retained && m.Payload == nil {
+		if !s.sendRPC(marshal(protoUnretain{
+			Type:  msgUnretain,
+			Topic: wire,
+		})) {
+			return false, false
+		}
+		return true, true
+	}
+	payload, err := marshalPayload(m.Payload)
+	if err != nil {
+		s.logKV("export payload dropped", "err", err.Error())
+		return false, true
+	}
+	if fabricTraceEnabled {
+		println(
+			"[fabric]", "sid", s.localSID,
+			"export pub tx",
+			"topic", wireTopicString(wire),
+			"retain", m.Retained,
+			"payload_len", strconvx.Itoa(len(payload)),
+		)
+	}
+	if !s.sendRPC(marshal(protoPub{
+		Type:    msgPub,
+		Topic:   wire,
+		Payload: payload,
+		Retain:  m.Retained,
+	})) {
+		return false, false
+	}
+	return true, true
+}
+
+func latestSubscriptionMessage(sub *bus.Subscription) *bus.Message {
+	var latest *bus.Message
+	for {
+		select {
+		case m, ok := <-sub.Channel():
+			if !ok {
+				return latest
+			}
+			if m != nil {
+				latest = m
+			}
+		default:
+			return latest
+		}
+	}
+}
+
+func (s *session) criticalExportReplayDrained() bool {
+	for _, pending := range s.criticalExportReplayPending {
+		if pending {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *session) drainCriticalExports(total *int) bool {
+	for i, sub := range s.criticalExportSubs {
+		if *total >= exportMaxPerTick {
+			return true
+		}
+		m := latestSubscriptionMessage(sub)
+		if m == nil {
+			if i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
+				return true
+			}
+			continue
+		}
+		sent, ok := s.sendExportMessage(m)
+		if !ok {
+			return false
+		}
+		if sent && i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
+			s.criticalExportReplayPending[i] = false
+		}
+		if sent {
+			(*total)++
+		}
+	}
+	return true
+}
+
 // drainExports does a non-blocking read of each export subscription
 // and writes any messages to the wire. Called from the main loop.
 func (s *session) drainExports() {
@@ -887,19 +1094,29 @@ func (s *session) drainExports() {
 		return
 	}
 	now := time.Now()
-	if quiet, _ := s.transferQuiet(now); quiet {
-		// Avoid colliding telemetry/state exports with prepare/xfer traffic on
-		// echo-prone links. Queued retained state can be exported after the OTA
-		// control/data path has gone quiet.
-		return
-	}
+	quiet, quietReason := s.transferQuiet(now)
 	if !s.exportsEnabled {
 		return
 	}
 	if !s.exportReadyAt.IsZero() && now.Before(s.exportReadyAt) {
 		return
 	}
+	if quiet && !quietAllowsCriticalExports(quietReason) {
+		// Avoid colliding telemetry/state exports with prepare/xfer traffic on
+		// echo-prone links. Post-transfer quiet allows critical facts below so
+		// state=rebooting can reach CM5 before the reboot arm.
+		return
+	}
 	total := 0
+	if !s.drainCriticalExports(&total) {
+		return
+	}
+	if quiet {
+		return
+	}
+	if !s.criticalExportReplayDrained() {
+		return
+	}
 	for _, sub := range s.exportSubs {
 		for {
 			if total >= exportMaxPerTick {
@@ -910,43 +1127,16 @@ func (s *session) drainExports() {
 				if !ok || m == nil {
 					goto nextSub
 				}
-				wire := exportTopic(m.Topic)
-				if wire == nil {
+				if len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic) {
 					continue
 				}
-				if m.Retained && m.Payload == nil {
-					if !s.sendRPC(marshal(protoUnretain{
-						Type:  msgUnretain,
-						Topic: wire,
-					})) {
-						return
-					}
-					total++
-					continue
-				}
-				payload, err := marshalPayload(m.Payload)
-				if err != nil {
-					s.logKV("export payload dropped", "err", err.Error())
-					continue
-				}
-				if fabricTraceEnabled {
-					println(
-						"[fabric]", "sid", s.localSID,
-						"export pub tx",
-						"topic", wireTopicString(wire),
-						"retain", m.Retained,
-						"payload_len", strconvx.Itoa(len(payload)),
-					)
-				}
-				if !s.sendRPC(marshal(protoPub{
-					Type:    msgPub,
-					Topic:   wire,
-					Payload: payload,
-					Retain:  m.Retained,
-				})) {
+				sent, ok := s.sendExportMessage(m)
+				if !ok {
 					return
 				}
-				total++
+				if sent {
+					total++
+				}
 			default:
 				goto nextSub
 			}

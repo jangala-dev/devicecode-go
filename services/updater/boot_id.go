@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// boot_id contract per master plan R3 / docs/firmware-alignment-update.md §W6:
+// boot_id contract:
 //   - Opaque 16-character lower-hex marker that must change on every
 //     successful boot.
 //   - Generated from 8 bytes of crypto/rand AFTER HAL init succeeds and
@@ -15,12 +15,11 @@ import (
 //     publish on hello_ack.
 //   - Held in RAM only. Not persisted to flash. Not added to the
 //     abupdate metadata block (the regression guard test in
-//     fabric-update tests checks that abupdate metadata never grows a
-//     boot_id field).
+//     tests check that abupdate metadata never grows a boot_id field).
 //
 // The fallback path on rand failure is documented inline; this branch
 // drops to a process-startup counter rather than panicking, with a
-// clear log so the failure-mode test suite (master R3) can assert it.
+// clear log so failure-mode tests can assert it.
 
 var (
 	cachedBootID atomic.Pointer[string]

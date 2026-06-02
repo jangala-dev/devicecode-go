@@ -14,6 +14,8 @@ import (
 
 const transferTargetUpdaterMain = "updater/main"
 const transferIdleRetryLimit = 3
+const transferCorruptRetryLimit = 3
+const completedTransferCacheLimit = 4
 
 // transferMeta captures xfer_begin contents. The transfer target is explicit
 // on the wire; firmware update uses target="updater/main". meta remains opaque
@@ -33,6 +35,7 @@ type transferMeta struct {
 type transferInfo struct {
 	BytesWritten uint32
 	SlotXIPAddr  uint32
+	Generation   uint64
 }
 
 // transferSink is the firmware-side write target for an incoming transfer.
@@ -54,16 +57,30 @@ type transferSink interface {
 }
 
 type incomingTransfer struct {
-	meta         transferMeta
-	sink         transferSink
-	bytesWritten uint32
-	chunksSeen   uint32
-	hasher       *xxhash.Hasher
-	idleRetries  uint8
+	meta                   transferMeta
+	sink                   transferSink
+	bytesWritten           uint32
+	chunksSeen             uint32
+	hasher                 *xxhash.Hasher
+	idleRetries            uint8
+	corruptRetryOffset     uint32
+	corruptRetriesAtOffset uint8
 	// deadline is the idle-chunk watchdog: bumped on every accepted chunk
 	// and on initial xfer_begin. checkTransferTimeout fires if now > deadline.
 	// Mirrors transfer_mgr.lua: `active.deadline = runtime.now() + phase_timeout`.
 	deadline time.Time
+}
+
+type completedTransfer struct {
+	meta transferMeta
+}
+
+func sameTransferTuple(a, b transferMeta) bool {
+	return a.ID == b.ID &&
+		a.Target == b.Target &&
+		a.Size == b.Size &&
+		a.DigestAlg == b.DigestAlg &&
+		a.Digest == b.Digest
 }
 
 func lowerHex(s string) string {
@@ -174,6 +191,54 @@ func (s *session) checkTransferTimeout(now time.Time) {
 	s.sendTransferAbort(id, "timeout")
 }
 
+func (s *session) retryCorruptTransferFrame(reason string) bool {
+	cur := s.incomingTransfer
+	if cur == nil {
+		return false
+	}
+	if cur.corruptRetryOffset != cur.bytesWritten {
+		cur.corruptRetryOffset = cur.bytesWritten
+		cur.corruptRetriesAtOffset = 0
+	}
+	if cur.corruptRetriesAtOffset >= transferCorruptRetryLimit {
+		id := cur.meta.ID
+		s.abortTransfer(reason)
+		s.sendTransferAbort(id, reason)
+		return false
+	}
+	cur.corruptRetriesAtOffset++
+	s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+	return true
+}
+
+func (s *session) completedTransferFor(id string) (transferMeta, bool) {
+	for _, rec := range s.completedTransfers {
+		if rec.meta.ID == id {
+			return rec.meta, true
+		}
+	}
+	return transferMeta{}, false
+}
+
+func (s *session) recordCompletedTransfer(meta transferMeta) {
+	for i, rec := range s.completedTransfers {
+		if rec.meta.ID == meta.ID {
+			s.completedTransfers = append(s.completedTransfers[:i], s.completedTransfers[i+1:]...)
+			break
+		}
+	}
+	s.completedTransfers = append(s.completedTransfers, completedTransfer{meta: meta})
+	if len(s.completedTransfers) > completedTransferCacheLimit {
+		copy(s.completedTransfers, s.completedTransfers[len(s.completedTransfers)-completedTransferCacheLimit:])
+		s.completedTransfers = s.completedTransfers[:completedTransferCacheLimit]
+	}
+}
+
+func (s *session) clearCompletedTransfers() {
+	s.completedTransfers = nil
+}
+
 func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 	if msg.XferID == "" {
 		return transferMeta{}, "xfer_begin.xfer_id"
@@ -214,21 +279,31 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		s.logKV("xfer_begin dropped", "err", errStr)
 		return
 	}
+	s.markRx()
+	now := time.Now()
 	if s.incomingTransfer != nil {
 		cur := s.incomingTransfer
-		if cur.meta.ID == meta.ID &&
-			cur.meta.Size == meta.Size &&
-			cur.meta.Target == meta.Target &&
-			cur.meta.DigestAlg == meta.DigestAlg &&
-			cur.meta.Digest == meta.Digest {
+		if sameTransferTuple(cur.meta, meta) {
 			s.logKV("xfer_begin duplicate", "id", meta.ID)
 			if s.sendTransferReady(meta.ID) {
 				s.sendTransferNeed(meta.ID, cur.bytesWritten)
 			}
-			cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+			cur.deadline = now.Add(s.cfg.PhaseTimeout)
 			return
 		}
-		s.sendTransferAbort(meta.ID, "busy")
+		reason := "busy"
+		if cur.meta.ID == meta.ID {
+			reason = "conflicting_transfer"
+		}
+		s.sendTransferAbort(meta.ID, reason)
+		return
+	}
+	if done, ok := s.completedTransferFor(meta.ID); ok {
+		if sameTransferTuple(done, meta) {
+			s.sendTransferDone(meta.ID)
+			return
+		}
+		s.sendTransferAbort(meta.ID, "conflicting_transfer")
 		return
 	}
 	beginFn := s.beginTransfer
@@ -244,7 +319,7 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		meta:     meta,
 		sink:     sink,
 		hasher:   xxhash.New(0),
-		deadline: time.Now().Add(s.cfg.PhaseTimeout),
+		deadline: now.Add(s.cfg.PhaseTimeout),
 	}
 	if s.sendTransferReady(meta.ID) {
 		s.sendTransferNeed(meta.ID, 0)
@@ -259,19 +334,20 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	}
 	id := cur.meta.ID
 	if msg.Offset < cur.bytesWritten {
+		s.markRx()
 		s.sendTransferNeed(id, cur.bytesWritten)
 		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 		return
 	}
 	if msg.Offset > cur.bytesWritten {
+		s.markRx()
 		s.sendTransferNeed(id, cur.bytesWritten)
 		return
 	}
 	raw, errStr := decodeChunkData(msg.Data)
 	if errStr != "" {
 		s.logKV("xfer_chunk decode retry", "err", errStr)
-		s.sendTransferNeed(id, cur.bytesWritten)
-		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+		s.retryCorruptTransferFrame(errStr)
 		return
 	}
 	if len(raw) == 0 {
@@ -292,32 +368,15 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	// byte offset instead of clearing the transfer.
 	want, ok := canonicalXXHash32Hex(msg.ChunkDigest)
 	if !ok {
-		reason := "invalid_chunk_digest"
-		if msg.ChunkDigest == "" {
-			reason = "missing_chunk_digest"
-		}
-		println(
-			"[fabric-xfer]", "abort_tx",
-			"id", id,
-			"reason", reason,
-			"offset", u32s(msg.Offset),
-			"digest_len", strconvx.Itoa(len(msg.ChunkDigest)),
-			"digest", msg.ChunkDigest,
-			"data_len", strconvx.Itoa(len(msg.Data)),
-		)
-		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		s.retryCorruptTransferFrame("bad_message")
 		return
 	}
 	got := xxhashHex(xxhash.Sum32(raw, 0))
 	if got != want {
-		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
-		// Recovery counts as progress — bump the deadline so a burst
-		// of digest-mismatched chunks doesn't trip the idle watchdog
-		// mid-recovery.
-		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+		s.retryCorruptTransferFrame("chunk_digest_mismatch")
 		return
 	}
+	s.markRx()
 	if err := cur.sink.WriteChunk(msg.Offset, raw); err != nil {
 		reason := err.Error()
 		s.logKV("transfer write failed", "err", reason)
@@ -329,6 +388,8 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	cur.bytesWritten += uint32(len(raw))
 	cur.chunksSeen++
 	cur.idleRetries = 0
+	cur.corruptRetryOffset = cur.bytesWritten
+	cur.corruptRetriesAtOffset = 0
 	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 	raw = nil
 	// Keep transfer memory bounded on TinyGo. The receiver allocates while
@@ -368,7 +429,8 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		s.sendTransferAbort(id, "digest_mismatch")
 		return
 	}
-	_, err := cur.sink.Commit()
+	s.markRx()
+	info, err := cur.sink.Commit()
 	if err != nil {
 		s.logKV("transfer commit failed", "err", err.Error())
 		reason := err.Error()
@@ -382,35 +444,37 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 	s.clearTransfer()
 
 	bytesPayload := sink.Bytes()
-	ok, reason := s.invokeTransferTarget(meta, id, bytesPayload)
+	ok, reason := s.invokeTransferTarget(meta, id, info, bytesPayload)
 	if !ok {
 		s.extendTransferQuiet("xfer_target_rejected", transferCompleteQuiet)
 		s.sendTransferAbort(id, reason)
 		return
 	}
 	s.extendTransferQuiet("xfer_done", transferCompleteQuiet)
+	s.recordCompletedTransfer(meta)
 	s.sendTransferDone(id)
 }
 
-const targetCallTimeout = 5 * time.Second
+var targetCallTimeout = 5 * time.Second
 
 // invokeTransferTarget calls the local updater staging RPC named by
 // xfer_begin.target. The wire no longer carries raw/member receiver topics;
 // target="updater/main" maps to an internal bus RPC owned by the updater
 // service. The reply gates whether fabric sends xfer_done or xfer_abort.
-func (s *session) invokeTransferTarget(meta transferMeta, xferID string, artefact []byte) (bool, string) {
+func (s *session) invokeTransferTarget(meta transferMeta, xferID string, info transferInfo, artefact []byte) (bool, string) {
 	if meta.Target != transferTargetUpdaterMain {
 		return false, "unsupported_target"
 	}
 	payload := updater.StagePayload{
-		LinkID:    s.linkID,
-		XferID:    xferID,
-		Target:    meta.Target,
-		Size:      meta.Size,
-		DigestAlg: meta.DigestAlg,
-		Digest:    meta.Digest,
-		Meta:      meta.Meta,
-		Artefact:  artefact,
+		LinkID:     s.linkID,
+		XferID:     xferID,
+		Generation: info.Generation,
+		Target:     meta.Target,
+		Size:       meta.Size,
+		DigestAlg:  meta.DigestAlg,
+		Digest:     meta.Digest,
+		Meta:       meta.Meta,
+		Artefact:   artefact,
 	}
 	msg := s.conn.NewMessage(updater.TopicStageRPC, payload, false)
 	replySub := s.conn.Request(msg)
@@ -419,14 +483,17 @@ func (s *session) invokeTransferTarget(meta transferMeta, xferID string, artefac
 	select {
 	case rep, ok := <-replySub.Channel():
 		if !ok || rep == nil {
+			updater.CancelStreamedStage(xferID, info.Generation, "stage_no_reply")
 			return false, "stage_no_reply"
 		}
 		ok, reason := decodeStageReply(rep.Payload)
 		if !ok {
+			updater.CancelStreamedStage(xferID, info.Generation, reason)
 			return false, reason
 		}
 		return true, ""
 	case <-time.After(targetCallTimeout):
+		updater.CancelStreamedStage(xferID, info.Generation, "stage_timeout")
 		return false, "stage_timeout"
 	}
 }
@@ -495,6 +562,7 @@ func (s *session) onTransferAbort(msg *protoXferAbort) {
 	if reason == "" {
 		reason = "remote_abort"
 	}
+	s.markRx()
 	s.abortTransfer(reason)
 }
 

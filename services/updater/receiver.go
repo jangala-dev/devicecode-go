@@ -2,6 +2,7 @@ package updater
 
 import (
 	"bytes"
+	"errors"
 
 	"devicecode-go/bus"
 )
@@ -34,17 +35,33 @@ func (s *Service) handleStage(msg *bus.Message) {
 		s.reply(msg, StageReply{OK: false, Err: "unsupported_digest_alg"})
 		return
 	}
-	s.transitionTo(StateReceiving, "", "")
+	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+		s.reply(msg, StageReply{OK: false, Err: err.Error()})
+		return
+	}
 
 	if len(payload.Artefact) == 0 {
-		staged, ok := consumeStreamedStage()
+		staged, ok := consumeStreamedStageResult()
 		if !ok {
-			s.clearStagedImage()
-			s.transitionTo(StateFailed, "artefact_missing", "")
+			s.failStage(payload, "artefact_missing")
 			s.reply(msg, StageReply{OK: false, Err: "artefact_missing"})
 			return
 		}
+		if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+			s.failLateStage(payload, err)
+			s.reply(msg, StageReply{OK: false, Err: err.Error()})
+			return
+		}
 		stageIdentity, _ := identityFromStageMeta(s.identity, payload.Meta)
+		if staged.Version != "" {
+			stageIdentity.Version = staged.Version
+		}
+		if staged.BuildID != "" {
+			stageIdentity.Build = staged.BuildID
+		}
+		if staged.ImageID != "" {
+			stageIdentity.ImageID = staged.ImageID
+		}
 		desc := StagedDescriptor{
 			Version:       stageIdentity.Version,
 			BuildID:       stageIdentity.Build,
@@ -54,10 +71,19 @@ func (s *Service) handleStage(msg *bus.Message) {
 			PayloadSHA256: staged.PayloadSHA256,
 		}
 		if err := s.metadataWrite.WriteStagedDescriptor(desc); err != nil {
-			_ = s.metadataWrite.ClearStagedDescriptor()
-			s.clearStagedImage()
-			s.transitionTo(StateFailed, "metadata_write_failed:"+err.Error(), "")
+			s.failStage(payload, "metadata_write_failed:"+err.Error())
 			s.reply(msg, StageReply{OK: false, Err: "metadata_write_failed"})
+			return
+		}
+		if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+			s.failLateStage(payload, err)
+			s.reply(msg, StageReply{OK: false, Err: err.Error()})
+			return
+		}
+		if !s.releaseStreamedStageLease(payload.XferID, payload.Generation) {
+			err := errors.New("stage_cancelled")
+			s.failLateStage(payload, err)
+			s.reply(msg, StageReply{OK: false, Err: err.Error()})
 			return
 		}
 		s.setStagedImage(desc.ImageID, desc.Version)
@@ -68,33 +94,27 @@ func (s *Service) handleStage(msg *bus.Message) {
 
 	sink, err := newSlotSink(uint32(len(payload.Artefact)))
 	if err != nil {
-		s.clearStagedImage()
-		s.transitionTo(StateFailed, "sink_init_failed:"+err.Error(), "")
+		s.failStage(payload, "sink_init_failed:"+err.Error())
 		s.reply(msg, StageReply{OK: false, Err: "sink_init_failed"})
+		return
+	}
+	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+		_ = sink.Abort()
+		s.failLateStage(payload, err)
+		s.reply(msg, StageReply{OK: false, Err: err.Error()})
 		return
 	}
 	manifest, err := s.verifier.Verify(bytes.NewReader(payload.Artefact), sink)
 	if err != nil {
 		// Verifier rejected the artefact. Clear any prior descriptor so a
 		// following commit cannot apply stale firmware from an older stage.
-		_ = s.metadataWrite.ClearStagedDescriptor()
-		s.clearStagedImage()
-		s.transitionTo(StateFailed, err.Error(), "")
+		s.failStage(payload, err.Error())
 		s.reply(msg, StageReply{OK: false, Err: err.Error()})
 		return
 	}
-
-	// On verifier success the sink holds the verified payload bytes.
-	// Persist the staged descriptor via the abupdate metadata writer
-	// (W11) so the next prepare/commit RPC and the next boot's
-	// software fact see payload_sha256 + descriptor. The fabric-update
-	// branch ships an in-memory writer; fabric-security replaces it
-	// with a flash-backed implementation that survives reboots.
-	if err := sink.Commit(); err != nil {
-		_ = s.metadataWrite.ClearStagedDescriptor()
-		s.clearStagedImage()
-		s.transitionTo(StateFailed, "sink_commit_failed:"+err.Error(), "")
-		s.reply(msg, StageReply{OK: false, Err: "sink_commit_failed"})
+	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+		s.failLateStage(payload, err)
+		s.reply(msg, StageReply{OK: false, Err: err.Error()})
 		return
 	}
 	desc := StagedDescriptor{
@@ -102,22 +122,53 @@ func (s *Service) handleStage(msg *bus.Message) {
 		BuildID:       manifest.BuildID,
 		ImageID:       manifest.ImageID,
 		Length:        manifest.PayloadLength,
-		Slot:          0, // slot-pick comes from abupdate when fabric-security wires it
+		Slot:          0, // slot-pick comes from abupdate when hardware apply is wired
 		PayloadSHA256: manifest.PayloadSHA256,
 	}
 	if err := s.metadataWrite.WriteStagedDescriptor(desc); err != nil {
-		_ = s.metadataWrite.ClearStagedDescriptor()
-		s.clearStagedImage()
-		s.transitionTo(StateFailed, "metadata_write_failed:"+err.Error(), "")
+		s.failStage(payload, "metadata_write_failed:"+err.Error())
 		s.reply(msg, StageReply{OK: false, Err: "metadata_write_failed"})
 		return
 	}
+	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
+		s.failLateStage(payload, err)
+		s.reply(msg, StageReply{OK: false, Err: err.Error()})
+		return
+	}
 
+	if !s.releaseStreamedStageLease(payload.XferID, payload.Generation) {
+		err := errors.New("stage_cancelled")
+		s.failLateStage(payload, err)
+		s.reply(msg, StageReply{OK: false, Err: err.Error()})
+		return
+	}
 	s.setStagedImage(desc.ImageID, manifest.Version)
 	s.transitionTo(StateStaged, "", manifest.Version)
 	// Do not republish the software fact here: PayloadSHA256 describes the
 	// running image, while this descriptor describes the staged image.
 	s.reply(msg, StageReply{OK: true, Stage: "staged"})
+}
+
+func (s *Service) failStage(payload StagePayload, reason string) {
+	_ = s.metadataWrite.ClearStagedDescriptor()
+	s.clearStagedImage()
+	if payload.Generation != 0 {
+		s.cancelStreamedStageLease(payload.XferID, payload.Generation, reason)
+	}
+	s.transitionTo(StateFailed, reason, "")
+}
+
+func (s *Service) failLateStage(payload StagePayload, err error) {
+	reason := "stage_cancelled"
+	if err != nil {
+		reason = err.Error()
+	}
+	_ = s.metadataWrite.ClearStagedDescriptor()
+	s.clearStagedImage()
+	if payload.Generation != 0 {
+		s.cancelStreamedStageLease(payload.XferID, payload.Generation, reason)
+	}
+	s.transitionTo(StateFailed, reason, "")
 }
 
 type stageMetadata struct {

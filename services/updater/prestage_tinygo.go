@@ -25,10 +25,7 @@ var (
 	streamedStageLen  uint32
 )
 
-// BeginStreamedStage prepares the inactive slot for a raw incoming transfer.
-// The caller must subsequently call WriteStreamedStage and CommitStreamedStage
-// or AbortStreamedStage.
-func BeginStreamedStage(size uint32) error {
+func startStreamedStage(size uint32) error {
 	// A fresh prepare invalidates any prior stage, and retrying an update in
 	// the same boot must not inherit abupdate's previous writing/complete
 	// state. Recreate the updater before resolving the inactive slot.
@@ -49,7 +46,7 @@ func BeginStreamedStage(size uint32) error {
 	return nil
 }
 
-func WriteStreamedStage(data []byte) error {
+func writeStreamedStage(data []byte) error {
 	if len(data) == 0 {
 		return errors.New("empty_chunk")
 	}
@@ -65,30 +62,33 @@ func WriteStreamedStage(data []byte) error {
 	return nil
 }
 
-func CommitStreamedStage() (uint32, error) {
+func commitStreamedStage() (streamedStage, error) {
 	u, err := ensureUpdaterInited()
 	if err != nil {
-		return 0, err
+		return streamedStage{}, err
 	}
 	if rc := u.FlushFinal(); rc != 0 {
-		return 0, errFromRC("flush_final", rc)
+		return streamedStage{}, errFromRC("flush_final", rc)
 	}
 	streamedStageDesc = streamedStage{
 		Length:        streamedStageLen,
 		PayloadSHA256: hex.EncodeToString(streamedStageHash.Sum(nil)),
 	}
 	streamedStageOK = true
-	return u.BytesWritten(), nil
+	if written := u.BytesWritten(); written != streamedStageDesc.Length {
+		streamedStageDesc.Length = written
+	}
+	return streamedStageDesc, nil
 }
 
-func AbortStreamedStage() {
+func abortStreamedStage() {
 	streamedStageDesc = streamedStage{}
 	streamedStageOK = false
 	streamedStageLen = 0
 	streamedStageHash.Reset()
 }
 
-func consumeStreamedStage() (streamedStage, bool) {
+func consumeStreamedStageResult() (streamedStage, bool) {
 	if !streamedStageOK {
 		return streamedStage{}, false
 	}
@@ -98,4 +98,8 @@ func consumeStreamedStage() (streamedStage, bool) {
 	streamedStageLen = 0
 	streamedStageHash.Reset()
 	return out, true
+}
+
+func discardStreamedStageResult() {
+	abortStreamedStage()
 }

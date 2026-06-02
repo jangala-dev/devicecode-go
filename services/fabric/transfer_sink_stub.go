@@ -7,5 +7,5 @@
 package fabric
 
 func beginTransfer(meta transferMeta) (transferSink, error) {
-	return newBufferSink(meta), nil
+	return newBufferSink(meta)
 }

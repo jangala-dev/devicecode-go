@@ -10,6 +10,7 @@ import (
 	"devicecode-go/services/updater"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
+	"pico2-a-b/abupdate"
 )
 
 // HAL
@@ -35,6 +36,11 @@ func main() {
 	time.Sleep(3 * time.Second)
 	log.SetStart(time.Now())
 
+	bootBuyRC := abupdate.CheckAndBuy()
+	if bootBuyRC != 0 {
+		log.Println("[main] abupdate CheckAndBuy rc =", bootBuyRC)
+	}
+
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
@@ -58,8 +64,8 @@ func main() {
 		}
 	}
 
-	// boot_id (master R3 / fabric-update W6): generate AFTER HAL ready
-	// and BEFORE the reactor opens fabric. RAM-only — never persisted.
+	// boot_id: generate AFTER HAL ready and BEFORE the reactor opens
+	// fabric. RAM-only — never persisted.
 	bootID := updater.GenerateBootID()
 	log.Println("[main] boot_id =", bootID)
 
@@ -68,7 +74,7 @@ func main() {
 	reactor.FirmwareImageID = FirmwareImageID
 
 	// Reactor
-	r := reactor.NewReactor(b, uiConn)
+	r := reactor.NewReactorWithOptions(b, uiConn, reactor.Options{BootBuyRC: bootBuyRC})
 	r.Run(ctx)
 }
 
