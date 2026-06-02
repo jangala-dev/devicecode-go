@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
 	"devicecode-go/types"
 	"devicecode-go/x/strconvx"
 )
@@ -478,6 +479,10 @@ func (s *session) dispatch(line []byte) {
 	case msgReply:
 		typedDispatch(s, t, line, s.onReply)
 	case msgXferBegin:
+		otadiag.Event(
+			"[fabric-xfer]", "begin_route_start", protoXferID(line),
+			otadiag.KV("line_len", len(line)),
+		)
 		typedDispatch(s, t, line, s.onTransferBegin)
 	case msgXferChunk:
 		typedDispatch(s, t, line, s.onTransferChunk)
@@ -497,6 +502,14 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 	dec := json.NewDecoder(bytes.NewReader(line))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&msg); err != nil {
+		if msgType == msgXferBegin {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
+				otadiag.KV("err", err.Error()),
+				otadiag.KV("line_len", len(line)),
+			)
+			otadiag.StopUpdateWindow("begin_decode_error")
+		}
 		s.logMalformed(line, err)
 		s.retryMalformedTransferFrame(msgType, line)
 		return
@@ -506,11 +519,22 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 		if err == nil {
 			err = errors.New("trailing_json")
 		}
+		if msgType == msgXferBegin {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
+				otadiag.KV("err", err.Error()),
+				otadiag.KV("line_len", len(line)),
+			)
+			otadiag.StopUpdateWindow("begin_decode_error")
+		}
 		s.logMalformed(line, err)
 		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
 	handler(&msg)
+	if msgType == msgXferBegin {
+		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+	}
 }
 
 func (s *session) retryMalformedTransferFrame(msgType string, line []byte) {

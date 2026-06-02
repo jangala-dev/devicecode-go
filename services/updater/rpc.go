@@ -1,18 +1,32 @@
 package updater
 
-import "devicecode-go/bus"
+import (
+	"time"
+
+	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
+)
 
 // handlePrepare processes cap/self/updater/main/rpc/prepare-update after
 // Fabric remaps it to the local bus. Success returns the current contract's
 // prepare acknowledgement, including the required transfer target and maximum
 // raw chunk size.
 func (s *Service) handlePrepare(msg *bus.Message) {
+	prepareAt := time.Now()
 	req, ok := jsonDecode[PrepareRequest](msg.Payload)
 	if !ok {
+		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", "bad_request"))
 		s.reply(msg, Reply{OK: false, Error: "bad_request"})
 		return
 	}
+	otadiag.Event(
+		"[updater-stream]", "prepare_rx", otadiag.XferNone,
+		otadiag.KV("target", req.Target),
+		otadiag.KV("job_id", req.JobID),
+		otadiag.KV("expected_image_id", req.ExpectedImageID),
+	)
 	if req.Target != "" && req.Target != PrepareTargetMCU {
+		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrTargetMismatch))
 		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
 		return
 	}
@@ -24,11 +38,14 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 		s.state == StateCommitting ||
 		s.state == StateRebooting {
 		s.mu.Unlock()
+		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrBusy))
 		s.reply(msg, Reply{OK: false, Error: ErrBusy})
 		return
 	}
 	s.preparing = true
 	s.mu.Unlock()
+	otadiag.StartUpdateWindow("prepare", otadiag.XferNone)
+	otadiag.Event("[updater-stream]", "prepare_start", otadiag.XferNone)
 	prepareActive := true
 	finishPrepare := func() {
 		if prepareActive {
@@ -49,16 +66,30 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 		errMsg := "metadata_clear_failed:" + err.Error()
 		s.transitionTo(StateFailed, errMsg, "")
 		finishPrepare()
+		otadiag.Event(
+			"[updater-stream]", "prepare_error", otadiag.XferNone,
+			otadiag.KV("err", errMsg),
+			otadiag.KV("dur_ms", int(time.Since(prepareAt)/time.Millisecond)),
+		)
+		otadiag.StopUpdateWindow("prepare_error")
 		s.reply(msg, Reply{OK: false, Error: errMsg})
 		return
 	}
 
 	s.mu.Lock()
-	s.openStageGenerationLocked()
+	gen := s.openStageGenerationLocked()
+	snap := s.diagSnapshotLocked()
 	s.mu.Unlock()
+	setDiagSnapshot(snap)
+	otadiag.Event("[updater-stream]", "prepare_generation", otadiag.XferNone, otadiag.KV("generation", gen))
 
 	s.transitionTo(StateReady, "", "")
 	finishPrepare()
+	otadiag.Event(
+		"[updater-stream]", "prepare_done", otadiag.XferNone,
+		otadiag.KV("generation", gen),
+		otadiag.KV("dur_ms", int(time.Since(prepareAt)/time.Millisecond)),
+	)
 	s.reply(msg, PrepareReply{
 		Ready:        true,
 		Target:       TargetUpdaterMain,

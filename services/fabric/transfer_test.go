@@ -7,10 +7,12 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
 	"devicecode-go/services/updater"
 	"devicecode-go/x/xxhash"
 )
@@ -57,6 +59,140 @@ func (s *fakeTransferSink) Abort(reason string) error {
 // Bytes returns nil because the test fake doesn't retain a RAM copy
 // of the transferred bytes — it tracks per-chunk writes instead.
 func (s *fakeTransferSink) Bytes() []byte { return nil }
+
+type diagCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func captureOTADiag(t *testing.T) *diagCapture {
+	t.Helper()
+	c := &diagCapture{}
+	restore := otadiag.SetSinkForTest(func(line string) {
+		c.mu.Lock()
+		c.lines = append(c.lines, line)
+		c.mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return c
+}
+
+func (c *diagCapture) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...)
+}
+
+func assertDiagContains(t *testing.T, lines []string, want ...string) {
+	t.Helper()
+	for _, line := range lines {
+		matched := true
+		for _, part := range want {
+			if !strings.Contains(line, part) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return
+		}
+	}
+	t.Fatalf("diagnostics missing %v in:\n%s", want, strings.Join(lines, "\n"))
+}
+
+func waitDiagContains(t *testing.T, c *diagCapture, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		lines := c.snapshot()
+		for _, line := range lines {
+			matched := true
+			for _, part := range want {
+				if !strings.Contains(line, part) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			assertDiagContains(t, lines, want...)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertDiagNotContains(t *testing.T, lines []string, want ...string) {
+	t.Helper()
+	for _, line := range lines {
+		matched := true
+		for _, part := range want {
+			if !strings.Contains(line, part) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			t.Fatalf("diagnostics unexpectedly contained %v in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func assertDiagOrder(t *testing.T, lines []string, wants ...[]string) {
+	t.Helper()
+	next := 0
+	for _, line := range lines {
+		if next >= len(wants) {
+			return
+		}
+		matched := true
+		for _, part := range wants[next] {
+			if !strings.Contains(line, part) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			next++
+		}
+	}
+	if next < len(wants) {
+		t.Fatalf("diagnostics missing ordered item %d %v in:\n%s", next, wants[next], strings.Join(lines, "\n"))
+	}
+}
+
+func waitDiagOrder(t *testing.T, c *diagCapture, wants ...[]string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		lines := c.snapshot()
+		next := 0
+		for _, line := range lines {
+			if next >= len(wants) {
+				return
+			}
+			matched := true
+			for _, part := range wants[next] {
+				if !strings.Contains(line, part) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				next++
+			}
+		}
+		if next >= len(wants) {
+			return
+		}
+		if time.Now().After(deadline) {
+			assertDiagOrder(t, lines, wants...)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 type blockingVerifier struct {
 	entered  chan struct{}
@@ -278,6 +414,7 @@ func writeRawLine(t *testing.T, tr Transport, line string) {
 }
 
 func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
 	defer cancelUpdater()
@@ -294,9 +431,12 @@ func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
 	if abort.Type != msgXferAbort || abort.XferID != "xfer-no-prepare" || abort.Err != "stage_not_prepared" {
 		t.Fatalf("xfer_begin without prepare frame = %+v, want stage_not_prepared abort", abort)
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-no-prepare", "ev begin_transfer_error", "err stage_not_prepared", "abort_tx true")
+	waitDiagContains(t, diag, "[updater-stream]", "xfer_id xfer-no-prepare", "ev lease_error", "err stage_not_prepared")
 }
 
 func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
 	defer cancelUpdater()
@@ -318,9 +458,21 @@ func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
 	waitUpdaterFactForFabricTest(t, upSub, func(f updater.UpdaterFact) bool {
 		return f.State == updater.StateReceiving
 	})
+	waitDiagOrder(t, diag,
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_route_start"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_rx"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_validate_ok", "target updater/main"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_transfer_start"},
+		[]string{"[updater-stream]", "xfer_id xfer-prepared", "ev begin_entry"},
+		[]string{"[updater-stream]", "xfer_id xfer-prepared", "ev begin_exit"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_transfer_done"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev ready_tx", "ok true"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev need_tx", "next 0", "ok true"},
+	)
 }
 
-func TestInvalidTransferBeginRejectsNoActiveTransfer(t *testing.T) {
+func TestInvalidTransferBeginEmitsRejectDiagnosticNoActiveTransfer(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -355,6 +507,7 @@ func TestInvalidTransferBeginRejectsNoActiveTransfer(t *testing.T) {
 	if beginCount != 0 {
 		t.Fatalf("beginTransfer called %d times for invalid begin, want 0", beginCount)
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-invalid", "ev begin_reject", "reason bad_message:unsupported_target", "abort_tx true")
 }
 
 func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
@@ -548,7 +701,8 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	}
 }
 
-func TestTransferAcceptedChunkAdvancesNeed(t *testing.T) {
+func TestTransferAcceptedChunkEmitsProcessingDiagnostics(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -567,9 +721,54 @@ func TestTransferAcceptedChunkAdvancesNeed(t *testing.T) {
 	if need.Next != uint32(len(payload)) {
 		t.Fatalf("xfer_need.next = %d, want %d", need.Next, len(payload))
 	}
+	waitDiagOrder(t, diag,
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_rx", "offset 0", "expected 0"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_decode_done", "ok true", "raw_len 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_digest_done", "ok true"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_start", "offset 0", "raw_len 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_done", "next 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_start", "next 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_done", "next 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev need_tx", "next 4", "ok true", "accepted true"},
+	)
+	assertDiagNotContains(t, diag.snapshot(), "[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev transfer_mem_sample")
+}
+
+func TestTransferAcceptedChunkEmitsSparseMemorySample(t *testing.T) {
+	diag := captureOTADiag(t)
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := make([]byte, transferMemSampleStride)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	sendMsg(t, cm5, xferBegin("xfer-mem-diag", payload, nil))
+	readTransferReady(t, cm5, "xfer-mem-diag", 0)
+
+	const chunkSize = 2048
+	for off := 0; off < len(payload); off += chunkSize {
+		end := off + chunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		sendMsg(t, cm5, xferChunk("xfer-mem-diag", uint32(off), payload[off:end]))
+		need := readMsg[protoXferNeed](t, cm5)
+		if need.Next != uint32(end) {
+			t.Fatalf("xfer_need.next = %d, want %d", need.Next, end)
+		}
+	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-mem-diag", "ev transfer_mem_sample", "next 65536", "alloc", "heap")
 }
 
 func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -596,6 +795,7 @@ func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
 	if len(sink.abortReasons) != 0 {
 		t.Fatalf("sink.Abort called on recoverable future offset: %v", sink.abortReasons)
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-future-offset", "ev chunk_future_offset", "offset 7", "expected 0")
 
 	sendMsg(t, cm5, xferChunk("xfer-future-offset", 0, payload))
 	need = readMsg[protoXferNeed](t, cm5)
@@ -617,6 +817,7 @@ func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
 }
 
 func TestTransferChunkStaleOffsetRequestsCurrentAndCompletes(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -648,6 +849,7 @@ func TestTransferChunkStaleOffsetRequestsCurrentAndCompletes(t *testing.T) {
 	if len(sink.abortReasons) != 0 {
 		t.Fatalf("sink.Abort called on recoverable stale offset: %v", sink.abortReasons)
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-stale-offset", "ev chunk_stale_offset", "offset 0", "expected 3")
 
 	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 3, []byte("def")))
 	need = readMsg[protoXferNeed](t, cm5)
@@ -782,6 +984,7 @@ func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
 }
 
 func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -809,6 +1012,10 @@ func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
 	if len(sink.writes) != 0 {
 		t.Fatalf("sink received %d writes before digest passed", len(sink.writes))
 	}
+	lines := diag.snapshot()
+	assertDiagContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev chunk_digest_done", "ok false", "reason chunk_digest_mismatch")
+	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev sink_write_start")
+	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev gc_start")
 
 	sendMsg(t, cm5, xferChunk("xfer-bad-chunk-digest", 0, payload))
 	need = readMsg[protoXferNeed](t, cm5)
@@ -817,7 +1024,8 @@ func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
 	}
 }
 
-func TestTransferChunkWriteErrorAborts(t *testing.T) {
+func TestTransferChunkWriteErrorEmitsAbortDiagnostic(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -833,6 +1041,9 @@ func TestTransferChunkWriteErrorAborts(t *testing.T) {
 
 	sendMsg(t, cm5, xferChunk("xfer-write-error", 0, payload))
 	readTransferAbort(t, cm5, "xfer-write-error", "write_boom")
+
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-write-error", "ev sink_write_error", "reason write_boom")
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-write-error", "ev abort_tx", "reason write_boom", "ok true")
 }
 
 func TestTransferChunkDigestMismatchRetriesThenAborts(t *testing.T) {
@@ -1223,6 +1434,7 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 }
 
 func TestCompletedTransferDuplicateBeginSameTupleReplaysDone(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1282,9 +1494,11 @@ func TestCompletedTransferDuplicateBeginSameTupleReplaysDone(t *testing.T) {
 		t.Fatalf("duplicate completed begin restaged transfer: %+v", p)
 	default:
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-completed-replay", "ev begin_duplicate_done", "done_tx true")
 }
 
 func TestCompletedTransferDuplicateBeginConflictingTupleAborts(t *testing.T) {
+	diag := captureOTADiag(t)
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1325,6 +1539,7 @@ func TestCompletedTransferDuplicateBeginConflictingTupleAborts(t *testing.T) {
 	if beginCount != 1 {
 		t.Fatalf("conflicting completed begin reopened sink: beginCount=%d", beginCount)
 	}
+	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-completed-conflict", "ev begin_reject", "reason conflicting_transfer", "abort_tx true")
 }
 
 func TestTransferTargetRejectAbortsTransfer(t *testing.T) {

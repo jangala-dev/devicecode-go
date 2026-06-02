@@ -2,10 +2,9 @@ package telemetry
 
 import "devicecode-go/types"
 
-// chargerAlertFSM implements W8 from docs/firmware-alignment-update.md:
-// hold previous bitfield state; on bit-set transition for a kind, emit
-// one normal event with the canonical kind name. The 14 canonical kinds
-// split into:
+// chargerAlertFSM holds previous bitfield state; on bit-set transition
+// for a kind, it emits one normal event with the canonical kind name.
+// The 14 canonical kinds split into:
 //   - 11 bit-driven kinds (state[] + status[]), compared against the
 //     previous ChargerValue snapshot
 //   - 3 analog kinds (vin_lo / vin_hi / bsr_high), compared against
@@ -75,7 +74,7 @@ type AlertEvent struct {
 // the spec one place to grow if severity refines later.
 func alertSeverity(k AlertKind) string {
 	switch k {
-	case AlertBatMissing, AlertBatShort, AlertMaxChargeTimeFault, AlertBsrHigh:
+	case AlertBatMissing, AlertBatShort, AlertMaxChargeTimeFault, AlertVinLo, AlertVinHi, AlertBsrHigh:
 		return "warning"
 	default:
 		return "info"

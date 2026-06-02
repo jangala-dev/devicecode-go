@@ -4,7 +4,9 @@ package updater
 
 import (
 	"errors"
+	"time"
 
+	"devicecode-go/services/otadiag"
 	"pico2-a-b/abupdate"
 )
 
@@ -42,9 +44,21 @@ func (s *abupdateSink) Write(p []byte) (int, error) {
 	if s.closed {
 		return 0, errors.New("abupdate_sink: closed")
 	}
+	start := time.Now()
+	emitABUpdateDiag("abupdate_write_start", otadiag.KV("len", len(p)))
 	if rc := s.u.WriteChunk(p); rc != 0 {
+		emitABUpdateDiag(
+			"abupdate_write_error",
+			otadiag.KV("rc", rc),
+			otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
+		)
 		return 0, errFromRC("write_chunk", rc)
 	}
+	emitABUpdateDiag(
+		"abupdate_write_done",
+		otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
+		otadiag.KV("written", s.u.BytesWritten()),
+	)
 	return len(p), nil
 }
 

@@ -19,6 +19,7 @@ type Device struct {
 	id   string
 	aBat core.CapAddr // power/battery/<name>
 	aChg core.CapAddr // power/charger/<name>
+	aCfg core.CapAddr // power/charger_config/<name>
 	aTmp core.CapAddr // power/charger/<name>/temperature
 
 	res  core.Resources
@@ -42,6 +43,7 @@ type Device struct {
 	lastVinLo, lastVinHi           int32
 	lastVsysLo, lastVsysHi         int32
 	lastVbatLoCell, lastVbatHiCell int32
+	lastBSRHigh                    uint32
 	lastNTCHi, lastNTCLo           uint16
 
 	// Desired alert sources (user intent). Auto re-arming always applies.
@@ -91,6 +93,10 @@ func (d *Device) Capabilities() []core.CapabilitySpec {
 			Info: types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: ci},
 		},
 		{
+			Domain: d.aCfg.Domain, Kind: types.KindChargerConfig, Name: d.aCfg.Name,
+			Info: types.Info{SchemaVersion: 1, Driver: "ltc4015", Detail: ci},
+		},
+		{
 			Domain: d.aTmp.Domain, Kind: types.KindTemperature, Name: d.aTmp.Name,
 			Info: types.Info{
 				SchemaVersion: 1, Driver: "ltc4015",
@@ -119,6 +125,7 @@ func (d *Device) Init(ctx context.Context) error {
 	// Advertise initial state as degraded until the first good sample.
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aBat, Err: "initialising"})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: "initialising"})
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aCfg, Err: "initialising"})
 	_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "initialising"})
 
 	go d.worker(d.ctx)
@@ -429,6 +436,7 @@ func (d *Device) worker(ctx context.Context) {
 					d.applyConfigure(c)
 					// After any configure: re-arm (opposite edge) then publish.
 					d.rearm()
+					d.publishConfig()
 					d.sampleAndPublish()
 				}
 
@@ -537,6 +545,7 @@ func (d *Device) applyConfigure(c types.ChargerConfigure) {
 	if c.BSRHigh_uOhmPerCell != nil {
 		if err := d.dev.SetBSRHigh_uOhmPerCell(*c.BSRHigh_uOhmPerCell); err == nil {
 			d.desiredLimit |= ltc4015.BSRHi
+			d.lastBSRHigh = *c.BSRHigh_uOhmPerCell
 		} else {
 			d.errChg("set_bsr_high_failed", err)
 		}
@@ -768,6 +777,16 @@ func (d *Device) sampleAndPublish() {
 			_ = d.res.Pub.Emit(core.Event{Addr: d.aTmp, Err: "ntc_ratio_invalid"})
 		}
 	}
+}
+
+func (d *Device) publishConfig() {
+	_ = d.res.Pub.Emit(core.Event{Addr: d.aCfg, Payload: types.ChargerConfigValue{
+		Source:              "ltc4015-programmed",
+		VinLo_mV:            d.lastVinLo,
+		VinHi_mV:            d.lastVinHi,
+		BSRHigh_uOhmPerCell: d.lastBSRHigh,
+		AlertMaskBits:       uint16(d.desiredLimit),
+	}})
 }
 
 // ---- Errors ----

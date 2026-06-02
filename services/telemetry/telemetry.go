@@ -1,5 +1,5 @@
-// Package telemetry implements the W7/W8 retained-state and sparse-
-// alert publishers from docs/firmware-alignment-update.md. It
+// Package telemetry implements the retained-state and sparse-alert
+// publishers from ../docs/updating.md. It
 // subscribes to the existing HAL value topics (hal/cap/env/...,
 // hal/cap/power/...) and republishes them under the canonical
 // state/self/* surface using integer engineering units, plus runs the
@@ -23,8 +23,7 @@ import (
 	"devicecode-go/types"
 )
 
-// Topic constants. Mirrors the canonical fact schema in
-// docs/firmware-alignment-update.md §"Telemetry/state facts".
+// Topic constants mirror the canonical fact schema in ../docs/updating.md.
 var (
 	TopicBattery     = bus.T("state", "self", "power", "battery")
 	TopicCharger     = bus.T("state", "self", "power", "charger")
@@ -35,7 +34,7 @@ var (
 
 	TopicChargerAlert = bus.T("event", "self", "power", "charger", "alert")
 
-	// TopicFabricLink mirrors the updater's W10 watcher — telemetry
+	// TopicFabricLink mirrors the updater's link-ready watcher: telemetry
 	// republishes the charger config retain on every link-ready edge
 	// so the CM5 sees a fresh config fact on every newly established
 	// session, warm or cold. (Per-value retains like
@@ -57,9 +56,8 @@ var (
 const MemSnapshotInterval = 3 * time.Second
 
 // ChargerThresholds carries the analog comparison thresholds used by
-// both the state/self/power/charger/config retained fact (W7 finish)
-// and the charger alert FSM's analog kinds (W8 finish — vin_lo,
-// vin_hi, bsr_high).
+// both the state/self/power/charger/config retained fact and the charger
+// alert FSM's analog kinds: vin_lo, vin_hi, and bsr_high.
 //
 // These ARE the LTC4015 effective config in production; on this
 // branch they default to conservative bring-up values.
@@ -70,11 +68,9 @@ type ChargerThresholds struct {
 }
 
 // ChargerAlertMask is the 14-bool mask matching the 14 canonical alert
-// kinds. Pre-fabric-security the mask is informational only — the
-// alert FSM ignores it for emission. Once the LTC4015 driver
-// programs the chip's alert-enable register from this and reports it
-// back, masking can flow through to the FSM. Names here are
-// spec-frozen to match docs/firmware-alignment-update.md.
+// kinds. The mask is informational until the LTC4015 driver programs the
+// chip's alert-enable register from this and reports it back; after that,
+// masking can flow through to the FSM. Names here are wire-stable.
 type ChargerAlertMask struct {
 	VinLo              bool `json:"vin_lo"`
 	VinHi              bool `json:"vin_hi"`
@@ -192,7 +188,7 @@ func (s *Service) Run(ctx context.Context) {
 	memTick := time.NewTicker(MemSnapshotInterval)
 	defer memTick.Stop()
 
-	prevReady := map[string]bool{}
+	linkState := map[string]linkObservation{}
 
 	for {
 		select {
@@ -221,15 +217,15 @@ func (s *Service) Run(ctx context.Context) {
 			if !ok || msg == nil {
 				continue
 			}
-			linkID, ready := decodeLinkReady(msg)
+			linkID, obs := decodeLinkReady(msg)
 			if linkID == "" {
 				continue
 			}
-			was := prevReady[linkID]
-			if ready && !was {
+			prev, hadPrev := linkState[linkID]
+			if linkReadyEdgeReason(prev, obs, hadPrev) != "" {
 				s.publishChargerConfig()
 			}
-			prevReady[linkID] = ready
+			linkState[linkID] = obs
 		case <-memTick.C:
 			s.publishRuntimeMem()
 		}
@@ -239,37 +235,67 @@ func (s *Service) Run(ctx context.Context) {
 // decodeLinkReady mirrors services/updater's helper but local to the
 // telemetry package — kept duplicated rather than reaching into
 // updater (cleaner package boundary).
-func decodeLinkReady(msg *bus.Message) (string, bool) {
+type linkObservation struct {
+	Ready    bool
+	PeerSID  string
+	LocalSID string
+}
+
+func linkReadyEdgeReason(prev, cur linkObservation, hadPrev bool) string {
+	if !cur.Ready {
+		return ""
+	}
+	if !hadPrev || !prev.Ready {
+		return "ready_edge"
+	}
+	if prev.PeerSID != cur.PeerSID {
+		return "peer_sid_changed"
+	}
+	if prev.LocalSID != cur.LocalSID {
+		return "local_sid_changed"
+	}
+	return ""
+}
+
+func decodeLinkReady(msg *bus.Message) (string, linkObservation) {
+	var obs linkObservation
 	if msg == nil {
-		return "", false
+		return "", obs
 	}
 	t := msg.Topic
 	if t == nil || t.Len() < 4 {
-		return "", false
+		return "", obs
 	}
 	id, _ := t.At(t.Len() - 1).(string)
 	if id == "" {
-		return "", false
+		return "", obs
 	}
 	switch p := msg.Payload.(type) {
 	case nil:
-		return id, false
+		return id, obs
 	case map[string]any:
-		ready, _ := p["ready"].(bool)
-		return id, ready
+		obs.Ready, _ = p["ready"].(bool)
+		obs.PeerSID, _ = p["peer_sid"].(string)
+		obs.LocalSID, _ = p["local_sid"].(string)
+		return id, obs
 	}
 	// Probe via JSON for the typed-struct payload fabric publishes.
 	b, err := json.Marshal(msg.Payload)
 	if err != nil {
-		return id, false
+		return id, obs
 	}
 	var probe struct {
-		Ready bool `json:"ready"`
+		Ready    bool   `json:"ready"`
+		PeerSID  string `json:"peer_sid"`
+		LocalSID string `json:"local_sid"`
 	}
 	if err := json.Unmarshal(b, &probe); err != nil {
-		return id, false
+		return id, obs
 	}
-	return id, probe.Ready
+	obs.Ready = probe.Ready
+	obs.PeerSID = probe.PeerSID
+	obs.LocalSID = probe.LocalSID
+	return id, obs
 }
 
 // dispatchPower splits the power-domain wildcard into per-kind
@@ -285,7 +311,26 @@ func (s *Service) dispatchPower(msg *bus.Message) {
 	case types.ChargerValue:
 		s.publishCharger(v)
 		s.alertFSM.observe(s, v)
+	case types.ChargerConfigValue:
+		s.applyChargerConfig(v)
 	}
+}
+
+func (s *Service) applyChargerConfig(v types.ChargerConfigValue) {
+	source := v.Source
+	if source == "" {
+		source = "ltc4015-programmed"
+	}
+	s.chargerCfg = ChargerConfig{
+		Source: source,
+		Thresholds: ChargerThresholds{
+			VinLoMV:            v.VinLo_mV,
+			VinHiMV:            v.VinHi_mV,
+			BSRHighUohmPerCell: v.BSRHigh_uOhmPerCell,
+		},
+		AlertMaskBits: v.AlertMaskBits,
+	}
+	s.publishChargerConfig()
 }
 
 // uptimeMs returns a service-monotonic uptime — close enough to a
@@ -294,7 +339,7 @@ func (s *Service) uptimeMs() int64 {
 	return time.Since(s.startedAt).Milliseconds()
 }
 
-// ---- W7: retained-state publishers ---------------------------------
+// ---- retained-state publishers -------------------------------------
 
 // BatteryFact is the retained payload at state/self/power/battery.
 // All units are integer engineering units per the spec.
@@ -325,8 +370,8 @@ func (s *Service) publishBattery(v types.BatteryValue) {
 // Carries raw bitfields AND 3 decoded boolean objects.
 //
 // The canonical key names below come from
-// docs/firmware-alignment-update.md §"Telemetry/state facts" — they
-// are NOT the existing display names in types.ChargerStateTable etc.
+// ../docs/updating.md. They are NOT the existing display names in
+// types.ChargerStateTable etc.
 // (those drop the `_charge` / `_active` / `_fault` suffixes for
 // log-line brevity). The wire-canonical names are spec-frozen because
 // the Lua import side keys off them; renaming any of these is a
@@ -438,7 +483,7 @@ func (s *Service) publishCharger(v types.ChargerValue) {
 // operating-state booleans (charger_enabled, ok_to_charge, etc.) —
 // those live on state/self/power/charger.
 type ChargerConfigFact struct {
-	Schema        int               `json:"schema"`
+	Schema        string            `json:"schema"`
 	Source        string            `json:"source"`
 	Thresholds    ChargerThresholds `json:"thresholds"`
 	AlertMaskBits uint16            `json:"alert_mask_bits"`
@@ -457,7 +502,7 @@ func (s *Service) publishChargerConfig() {
 		source = "ltc4015-default"
 	}
 	fact := ChargerConfigFact{
-		Schema:        1,
+		Schema:        "charger-config/1",
 		Source:        source,
 		Thresholds:    cfg.Thresholds,
 		AlertMaskBits: cfg.AlertMaskBits,

@@ -14,12 +14,53 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
 	"pico2-a-b/imagev1"
 )
 
 // ---- helpers --------------------------------------------------------
 
 func newTestBus() *bus.Bus { return bus.NewBus(8, "+", "#") }
+
+type updaterDiagCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func captureUpdaterDiag(t *testing.T) *updaterDiagCapture {
+	t.Helper()
+	c := &updaterDiagCapture{}
+	restore := otadiag.SetSinkForTest(func(line string) {
+		c.mu.Lock()
+		c.lines = append(c.lines, line)
+		c.mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return c
+}
+
+func (c *updaterDiagCapture) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...)
+}
+
+func assertUpdaterDiagContains(t *testing.T, lines []string, want ...string) {
+	t.Helper()
+	for _, line := range lines {
+		ok := true
+		for _, part := range want {
+			if !strings.Contains(line, part) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+	}
+	t.Fatalf("diagnostics missing %v in:\n%s", want, strings.Join(lines, "\n"))
+}
 
 type fakeVerifierAccept struct {
 	manifest Manifest
@@ -476,6 +517,37 @@ func TestPrepareTransitionsToReady(t *testing.T) {
 	}
 }
 
+func TestPrepareEmitsGenerationBreadcrumbs(t *testing.T) {
+	diag := captureUpdaterDiag(t)
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+
+	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{
+		Target:          PrepareTargetMCU,
+		JobID:           "job-diag",
+		ExpectedImageID: "image-diag",
+	}, false)
+	replySub := caller.Request(req)
+	defer caller.Unsubscribe(replySub)
+	select {
+	case msg := <-replySub.Channel():
+		if _, ok := msg.Payload.(PrepareReply); !ok {
+			t.Fatalf("prepare reply = %#v, want PrepareReply", msg.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for prepare reply")
+	}
+
+	lines := diag.snapshot()
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_rx", "job_id job-diag", "expected_image_id image-diag")
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_generation", "generation 1")
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_done", "generation 1")
+}
+
 func prepareUpdaterForLease(t *testing.T, caller *bus.Connection) {
 	t.Helper()
 	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
@@ -592,6 +664,73 @@ func TestPrepareAndCommitRejectWhileStreamLeaseActive(t *testing.T) {
 	commitReply, ok := commitPayload.(Reply)
 	if !ok || commitReply.OK || commitReply.Error != ErrBusy {
 		t.Fatalf("commit while stream active = %#v, want busy", commitPayload)
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnBufferedCommit(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-commit", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	if err := CommitBufferedStage("xfer-hook-commit", gen); err != nil {
+		t.Fatalf("CommitBufferedStage: %v", err)
+	}
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after buffered commit")
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnAbort(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-abort", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	AbortStreamedStage("xfer-hook-abort", gen, "test_abort")
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after abort")
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnCommitError(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-commit-error", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	if _, err := CommitStreamedStage("xfer-hook-commit-error", gen); err == nil {
+		t.Fatal("CommitStreamedStage returned nil error, want host streamed_stage_not_supported")
+	}
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after commit error")
 	}
 }
 
