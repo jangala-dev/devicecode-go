@@ -969,6 +969,50 @@ func TestCommitWithoutStagedStateRefusesEvenWithDescriptor(t *testing.T) {
 	}
 }
 
+func TestCommitUsesPreparedExpectedImageOverCommitPayload(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	memMD := NewMemoryMetadata()
+	if err := memMD.WriteStagedDescriptor(StagedDescriptor{
+		Version:       "9.9.9",
+		BuildID:       "build-b",
+		ImageID:       "image-B",
+		Length:        4096,
+		Slot:          1,
+		PayloadSHA256: strings.Repeat("b", 64),
+	}); err != nil {
+		t.Fatalf("write staged descriptor: %v", err)
+	}
+	app := &fakeApplier{rebootCh: make(chan StagedDescriptor, 1)}
+	svc, cancel := runService(t, b, Options{
+		Conn:          conn,
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+		Applier:       app,
+	})
+	defer cancel()
+
+	svc.setJobContext("job-image-a", "image-A")
+	svc.transitionTo(StateStaged, "", "9.9.9")
+
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{ExpectedImageID: "image-B"})
+	reply, ok := payload.(Reply)
+	if !ok || reply.OK || reply.Error != ErrTargetMismatch {
+		t.Fatalf("commit reply = %#v, want target mismatch", payload)
+	}
+	canCalls, rebootCalls := app.callCounts()
+	if canCalls != 0 || rebootCalls != 0 {
+		t.Fatalf("applier called despite target mismatch: can=%d reboot=%d", canCalls, rebootCalls)
+	}
+	select {
+	case d := <-app.rebootCh:
+		t.Fatalf("unexpected reboot descriptor: %+v", d)
+	default:
+	}
+}
+
 func TestCommitWithoutApplierReturnsApplyUnavailable(t *testing.T) {
 	// Spec safety: the commit RPC must not claim success when the MCU
 	// has no apply hook wired (the production default RefusingApplier

@@ -870,6 +870,74 @@ func TestTransferChunkStaleOffsetRequestsCurrentAndCompletes(t *testing.T) {
 	}
 }
 
+func TestTransferStaleLowerOffsetDoesNotRefreshPhaseDeadline(t *testing.T) {
+	tr := &captureTransport{}
+	sink := &fakeTransferSink{}
+	oldDeadline := time.Now().Add(-time.Second)
+	s := &session{
+		tr:  tr,
+		cfg: LinkConfig{PhaseTimeout: time.Second},
+		incomingTransfer: &incomingTransfer{
+			meta:         transferMeta{ID: "xfer-stale-deadline", Size: 6},
+			sink:         sink,
+			bytesWritten: 3,
+			deadline:     oldDeadline,
+		},
+	}
+
+	s.onTransferChunk(&protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-stale-deadline",
+		Offset:      0,
+		Data:        rawURL([]byte("abc")),
+		ChunkDigest: xxhashStr([]byte("abc")),
+	})
+
+	if !s.incomingTransfer.deadline.Equal(oldDeadline) {
+		t.Fatalf("stale lower offset refreshed deadline: got %v want %v",
+			s.incomingTransfer.deadline, oldDeadline)
+	}
+	if len(tr.writes) != 1 {
+		t.Fatalf("stale lower offset wrote %d frames, want one xfer_need", len(tr.writes))
+	}
+	if len(sink.writes) != 0 {
+		t.Fatalf("stale lower offset rewrote sink: %d writes", len(sink.writes))
+	}
+}
+
+func TestTransferCurrentCorruptChunkRefreshesLinkLiveness(t *testing.T) {
+	tr := &captureTransport{}
+	oldRx := time.Now().Add(-time.Second)
+	s := &session{
+		tr:       tr,
+		lastRxAt: oldRx,
+		cfg:      LinkConfig{PhaseTimeout: time.Second},
+		incomingTransfer: &incomingTransfer{
+			meta:     transferMeta{ID: "xfer-corrupt-liveness", Size: 4},
+			sink:     &fakeTransferSink{},
+			deadline: time.Now().Add(time.Second),
+		},
+	}
+
+	s.onTransferChunk(&protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-corrupt-liveness",
+		Offset:      0,
+		Data:        rawURL([]byte("abcd")),
+		ChunkDigest: "00000000",
+	})
+
+	if !s.lastRxAt.After(oldRx) {
+		t.Fatalf("current corrupt chunk did not refresh liveness: got %v old %v", s.lastRxAt, oldRx)
+	}
+	if got := s.incomingTransfer.corruptRetriesAtOffset; got != 1 {
+		t.Fatalf("corrupt retries = %d, want 1", got)
+	}
+	if len(tr.writes) != 1 {
+		t.Fatalf("current corrupt chunk wrote %d frames, want one retry xfer_need", len(tr.writes))
+	}
+}
+
 func TestTransferChunkDecodeFailureRequestsSameOffset(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()

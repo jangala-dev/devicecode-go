@@ -201,6 +201,7 @@ func (s *session) retryCorruptTransferFrame(reason string) bool {
 	if cur == nil {
 		return false
 	}
+	s.markRx()
 	if cur.corruptRetryOffset != cur.bytesWritten {
 		cur.corruptRetryOffset = cur.bytesWritten
 		cur.corruptRetriesAtOffset = 0
@@ -422,7 +423,6 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 			otadiag.KV("expected", u32s(cur.bytesWritten)),
 			otadiag.KV("need_tx", needOK),
 		)
-		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 		return
 	}
 	if msg.Offset > cur.bytesWritten {

@@ -122,9 +122,9 @@ func (s *Service) handleCommit(msg *bus.Message) {
 		s.reply(msg, Reply{OK: false, Error: ErrNothingStaged})
 		return
 	}
-	expectedImageID := req.ExpectedImageID
+	expectedImageID := pendingImageID
 	if expectedImageID == "" {
-		expectedImageID = pendingImageID
+		expectedImageID = req.ExpectedImageID
 	}
 	if expectedImageID != "" && desc.ImageID != expectedImageID {
 		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
