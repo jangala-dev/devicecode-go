@@ -18,6 +18,7 @@ type Field struct {
 var (
 	startedAt = time.Now()
 	nextSeq   atomic.Uint64
+	verbose   atomic.Bool
 
 	sinkMu sync.Mutex
 	sink   func(string)
@@ -40,6 +41,9 @@ func KV(key string, value any) Field {
 }
 
 func Event(prefix, event, xferID string, fields ...Field) {
+	if !allowEvent(prefix, event, fields) {
+		return
+	}
 	if xferID == "" {
 		xferID = XferNone
 	}
@@ -71,12 +75,23 @@ func Event(prefix, event, xferID string, fields ...Field) {
 func SetSinkForTest(fn func(string)) func() {
 	sinkMu.Lock()
 	prev := sink
+	prevVerbose := verbose.Load()
 	sink = fn
+	verbose.Store(true)
 	sinkMu.Unlock()
 	return func() {
 		sinkMu.Lock()
 		sink = prev
+		verbose.Store(prevVerbose)
 		sinkMu.Unlock()
+	}
+}
+
+func SetVerboseForTest(enabled bool) func() {
+	prev := verbose.Load()
+	verbose.Store(enabled)
+	return func() {
+		verbose.Store(prev)
 	}
 }
 
@@ -196,6 +211,74 @@ func emit(line string) {
 		return
 	}
 	println(line)
+}
+
+func allowEvent(prefix, event string, fields []Field) bool {
+	if verbose.Load() {
+		return true
+	}
+	switch prefix {
+	case "[serial-raw]", "[fabric-rx]", "[fabric-rpc]", "[fabric-handshake]":
+		return true
+	case "[mcu-ota]":
+		return event == "heartbeat_start" || event == "heartbeat_stop"
+	case "[fabric-xfer]":
+		return allowFabricXferEvent(event, fields)
+	case "[updater-stream]":
+		return allowUpdaterStreamEvent(event)
+	default:
+		return true
+	}
+}
+
+func allowFabricXferEvent(event string, fields []Field) bool {
+	if strings.HasPrefix(event, "begin_") {
+		return true
+	}
+	switch event {
+	case "abort_local", "abort_tx", "done_tx", "ready_tx", "malformed_retry", "transfer_mem_sample":
+		return true
+	case "need_tx":
+		next := fieldValue(fields, "next")
+		return next == "0" ||
+			fieldValue(fields, "ok") == "false" ||
+			fieldValue(fields, "duplicate") == "true" ||
+			fieldValue(fields, "retry") == "true" ||
+			fieldValue(fields, "skipped") != ""
+	case "chunk_decode_done", "chunk_digest_done":
+		return fieldValue(fields, "ok") == "false"
+	case "chunk_stale_offset", "chunk_future_offset", "chunk_size_overflow",
+		"sink_write_error", "chunk_write_error":
+		return true
+	default:
+		return strings.HasSuffix(event, "_error") ||
+			strings.Contains(event, "reject") ||
+			strings.Contains(event, "abort")
+	}
+}
+
+func allowUpdaterStreamEvent(event string) bool {
+	if strings.HasPrefix(event, "prepare_") {
+		return true
+	}
+	switch event {
+	case "begin_entry", "lease_ok", "begin_exit",
+		"flash_erase_start", "flash_erase_done", "flash_erase_error",
+		"flash_program_error", "program_page_error":
+		return true
+	default:
+		return strings.HasSuffix(event, "_error") ||
+			strings.Contains(event, "reject")
+	}
+}
+
+func fieldValue(fields []Field, key string) string {
+	for _, f := range fields {
+		if f.Key == key {
+			return f.Value
+		}
+	}
+	return ""
 }
 
 func blank(v string) string {
