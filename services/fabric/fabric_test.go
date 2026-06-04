@@ -23,6 +23,23 @@ func pipePair() (*rwTransport, *rwTransport) {
 
 func newBus() *bus.Bus { return bus.NewBus(3, "+", "#") }
 
+func TestShouldLogFabricReadSkipsIdleDataFrames(t *testing.T) {
+	longRead := 3 * time.Second
+	longGap := 3 * time.Second
+
+	for _, msgType := range []string{msgPub, msgPing, msgPong, msgUnretain} {
+		if shouldLogFabricRead(msgType, longRead, longGap) {
+			t.Fatalf("idle %s frame should not be logged", msgType)
+		}
+	}
+
+	for _, msgType := range []string{msgHello, msgHelloAck, msgCall, msgReply, msgXferBegin, msgXferCommit, msgXferAbort} {
+		if !shouldLogFabricRead(msgType, 0, 0) {
+			t.Fatalf("control %s frame should be logged", msgType)
+		}
+	}
+}
+
 type captureTransport struct {
 	writes   [][]byte
 	writeErr error

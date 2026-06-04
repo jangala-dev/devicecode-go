@@ -190,19 +190,47 @@ func (s *session) run(ctx context.Context) {
 
 	go func() {
 		defer close(lines)
+		lastLineAt := time.Now()
 		for {
+			started := time.Now()
 			line, err := s.tr.ReadLine()
+			now := time.Now()
+			readDur := now.Sub(started)
+			sinceLine := now.Sub(lastLineAt)
 			if err != nil {
 				if errors.Is(err, ErrLineTooLong) {
+					otadiag.Event(
+						"[fabric-rx]", "read_error", otadiag.XferNone,
+						otadiag.KV("reason", "line_too_long"),
+						otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+						otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+					)
 					s.log("oversized line dropped")
 					continue
 				}
+				otadiag.Event(
+					"[fabric-rx]", "read_error", otadiag.XferNone,
+					otadiag.KV("reason", err.Error()),
+					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+				)
 				select {
 				case lines <- readResult{err: err}:
 				case <-ctx.Done():
 				}
 				return
 			}
+			t := protoType(line)
+			if shouldLogFabricRead(t, readDur, sinceLine) {
+				otadiag.Event(
+					"[fabric-rx]", "read_line", protoXferID(line),
+					otadiag.KV("type", t),
+					otadiag.KV("line_len", len(line)),
+					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+				)
+			}
+			lastLineAt = now
 			cp := make([]byte, len(line))
 			copy(cp, line)
 			select {
@@ -274,6 +302,14 @@ func (s *session) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func shouldLogFabricRead(msgType string, _, _ time.Duration) bool {
+	switch msgType {
+	case msgHello, msgHelloAck, msgCall, msgReply, msgXferBegin, msgXferCommit, msgXferAbort:
+		return true
+	}
+	return false
 }
 
 func resetTimer(t *time.Timer, d time.Duration) {
