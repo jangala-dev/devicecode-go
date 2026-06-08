@@ -56,10 +56,6 @@ func (s *fakeTransferSink) Abort(reason string) error {
 	return nil
 }
 
-// Bytes returns nil because the test fake doesn't retain a RAM copy
-// of the transferred bytes — it tracks per-chunk writes instead.
-func (s *fakeTransferSink) Bytes() []byte { return nil }
-
 type diagCapture struct {
 	mu    sync.Mutex
 	lines []string
@@ -1427,18 +1423,6 @@ func TestTransferCommitDigestMismatchAborts(t *testing.T) {
 	}
 }
 
-// bufferingSinkAdapter wraps the production bufferSink so transfer tests
-// can assert the bytes passed to updater/main staging.
-type bufferingSinkAdapter struct {
-	*bufferSink
-	abortReasons []string
-}
-
-func (b *bufferingSinkAdapter) Abort(reason string) error {
-	b.abortReasons = append(b.abortReasons, reason)
-	return b.bufferSink.Abort(reason)
-}
-
 func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 	// With target=updater/main, fabric calls the local updater stage RPC
 	// after xfer_commit and before xfer_done. The wire never names a
@@ -1450,7 +1434,7 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 
 	gotPayload := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
 
-	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	sink := &fakeTransferSink{commitInfo: transferInfo{BytesWritten: 4, Generation: 7}}
 	s := session{
 		linkID:   defaultLinkID,
 		nodeID:   "mcu",
@@ -1459,7 +1443,6 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
 		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			sink.bufferSink.meta = meta
 			return sink, nil
 		},
 	}
@@ -1488,8 +1471,8 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 		if p.Target != updater.TargetUpdaterMain || p.DigestAlg != updater.DigestAlgXXHash32 || p.Digest != xxhashStr(payload) {
 			t.Fatalf("stage contract fields wrong: %+v", p)
 		}
-		if string(p.Artefact) != string(payload) {
-			t.Fatalf("stage artefact = %v, want %q", p.Artefact, payload)
+		if p.Size != uint32(len(payload)) || p.Generation != 7 {
+			t.Fatalf("stage size/generation wrong: %+v", p)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for stage call")
@@ -1620,7 +1603,7 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 
 	_ = installStageResponder(t, b, updater.StageReply{OK: false, Err: "manifest_check_failed"})
 
-	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	sink := &fakeTransferSink{commitInfo: transferInfo{BytesWritten: 4, Generation: 7}}
 	s := session{
 		linkID:   defaultLinkID,
 		nodeID:   "mcu",
@@ -1629,7 +1612,6 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
 		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			sink.bufferSink.meta = meta
 			return sink, nil
 		},
 	}

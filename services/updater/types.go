@@ -132,10 +132,10 @@ type StagedDescriptor struct {
 	PayloadSHA256 string `json:"payload_sha256"`
 }
 
-// StagePayload is the local updater/main staging RPC invoked by fabric
-// after xfer_commit has verified size and transfer digest. It replaces
-// the older meta.receiver/raw-member receive path; the CM5 supplies only
-// target="updater/main" on the wire.
+// StagePayload is the local updater/main staging RPC invoked by Fabric after
+// xfer_commit has verified size and transfer digest and committed the streamed
+// staging lease. The payload carries only metadata and the lease generation; it
+// must never carry the whole artefact as a []byte on MCU builds.
 type StagePayload struct {
 	LinkID     string `json:"link_id"`
 	XferID     string `json:"xfer_id"`
@@ -145,7 +145,6 @@ type StagePayload struct {
 	DigestAlg  string `json:"digest_alg"`
 	Digest     string `json:"digest"`
 	Meta       any    `json:"meta,omitempty"`
-	Artefact   []byte `json:"artefact,omitempty"`
 }
 
 type StageReply struct {

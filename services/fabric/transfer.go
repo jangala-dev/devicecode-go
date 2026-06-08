@@ -46,17 +46,14 @@ type transferInfo struct {
 // canonical wire fields). No sequence number is passed — the caller has
 // already validated offset against expected progress.
 //
-// Bytes() returns the committed payload bytes for target invocation.
-// Only valid after Commit() has succeeded. May return nil if the sink
-// streamed the bytes elsewhere (e.g. the RP2350 sink writes directly to
-// flash and doesn't keep a RAM copy); updater/main consumes that staged
-// stream from the updater package.
+// The sink owns transfer bytes. Fabric never asks it for a whole-image
+// []byte; after Commit succeeds the updater/main stage RPC consumes the
+// committed streamed stage by xfer_id/generation.
 type transferSink interface {
 	WriteChunk(offset uint32, data []byte) error
 	Commit() (transferInfo, error)
 	Apply() error
 	Abort(reason string) error
-	Bytes() []byte
 }
 
 type incomingTransfer struct {
@@ -638,11 +635,10 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
-	sink := cur.sink
 	meta := cur.meta
 	s.clearTransfer()
 
-	if reason := s.startTransferTargetCall(meta, id, info, sink.Bytes()); reason != "" {
+	if reason := s.startTransferTargetCall(meta, id, info); reason != "" {
 		abortOK := s.sendTransferAbort(id, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
@@ -653,7 +649,7 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 // blocking the Fabric session reactor. The reply is observed by drainTargetCall
 // on the normal session tick path; until then the session continues to process
 // pings, exports, replies and link events.
-func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info transferInfo, artefact []byte) string {
+func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info transferInfo) string {
 	if meta.Target != transferTargetUpdaterMain {
 		return "unsupported_target"
 	}
@@ -669,7 +665,6 @@ func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info
 		DigestAlg:  meta.DigestAlg,
 		Digest:     meta.Digest,
 		Meta:       meta.Meta,
-		Artefact:   artefact,
 	}
 	msg := s.conn.NewMessage(updater.TopicStageRPC, payload, false)
 	s.pendingTargetCall = &pendingTargetCall{

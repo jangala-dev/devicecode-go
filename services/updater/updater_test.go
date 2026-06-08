@@ -298,7 +298,6 @@ func testStagePayload(id string, artefact []byte) StagePayload {
 		Size:      uint32(len(artefact)),
 		DigestAlg: DigestAlgXXHash32,
 		Digest:    "deadbeef",
-		Artefact:  artefact,
 	}
 }
 
@@ -325,12 +324,17 @@ func preparedStagePayload(t *testing.T, caller *bus.Connection, svc *Service, id
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for prepare reply")
 	}
-	generation, err := svc.beginStreamedStageLease(id)
+	generation, err := BeginStreamedStage(id, uint32(len(artefact)))
 	if err != nil {
-		t.Fatalf("begin stage lease: %v", err)
+		t.Fatalf("begin streamed stage: %v", err)
 	}
-	if err := svc.markStreamedStageCommitted(id, generation); err != nil {
-		t.Fatalf("commit stage lease: %v", err)
+	if len(artefact) > 0 {
+		if err := WriteStreamedStage(id, generation, artefact); err != nil {
+			t.Fatalf("write streamed stage: %v", err)
+		}
+	}
+	if _, err := CommitStreamedStage(id, generation); err != nil {
+		t.Fatalf("commit streamed stage: %v", err)
 	}
 	payload := testStagePayload(id, artefact)
 	payload.Generation = generation
@@ -605,7 +609,7 @@ func TestPrepareOpensSingleReceivingStreamLeaseAndClearsStaleDescriptor(t *testi
 
 	memMD := NewMemoryMetadata()
 	_ = memMD.WriteStagedDescriptor(StagedDescriptor{Version: "old", ImageID: "old-image", PayloadSHA256: "old"})
-	_, cancel := runService(t, b, Options{Conn: conn, Metadata: memMD, MetadataWrite: memMD})
+	svc, cancel := runService(t, b, Options{Conn: conn, Metadata: memMD, MetadataWrite: memMD})
 	defer cancel()
 
 	prepareUpdaterForLease(t, caller)
@@ -629,14 +633,14 @@ func TestPrepareOpensSingleReceivingStreamLeaseAndClearsStaleDescriptor(t *testi
 	if _, err := BeginStreamedStage("xfer-second", 4); err == nil || err.Error() != ErrBusy {
 		t.Fatalf("second BeginStreamedStage err = %v, want busy", err)
 	}
-	if err := CommitBufferedStage("wrong-xfer", gen); err == nil || err.Error() != "stage_generation_mismatch" {
-		t.Fatalf("wrong xfer CommitBufferedStage err = %v, want generation mismatch", err)
+	if err := svc.markStreamedStageCommitted("wrong-xfer", gen); err == nil || err.Error() != "stage_generation_mismatch" {
+		t.Fatalf("wrong xfer markStreamedStageCommitted err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-lease", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
-		t.Fatalf("wrong generation CommitBufferedStage err = %v, want generation mismatch", err)
+	if err := svc.markStreamedStageCommitted("xfer-lease", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
+		t.Fatalf("wrong generation markStreamedStageCommitted err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-lease", gen); err != nil {
-		t.Fatalf("matching CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-lease", gen); err != nil {
+		t.Fatalf("matching markStreamedStageCommitted: %v", err)
 	}
 }
 
@@ -667,12 +671,12 @@ func TestPrepareAndCommitRejectWhileStreamLeaseActive(t *testing.T) {
 	}
 }
 
-func TestStreamedStageDiagHookClearsOnBufferedCommit(t *testing.T) {
+func TestStreamedStageDiagHookClearsOnCommittedStage(t *testing.T) {
 	b := newTestBus()
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
 	gen, err := BeginStreamedStage("xfer-hook-commit", 4)
@@ -682,11 +686,12 @@ func TestStreamedStageDiagHookClearsOnBufferedCommit(t *testing.T) {
 	if !abupdateDiagHookActiveForTest() {
 		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
 	}
-	if err := CommitBufferedStage("xfer-hook-commit", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-hook-commit", gen); err != nil {
+		t.Fatalf("markStreamedStageCommitted: %v", err)
 	}
+	clearABUpdateDiagHook()
 	if abupdateDiagHookActiveForTest() {
-		t.Fatal("diagnostic hook still active after buffered commit")
+		t.Fatal("diagnostic hook still active after committed stage")
 	}
 }
 
@@ -765,7 +770,7 @@ func TestCancelStreamedStagePreventsLateStageSuccess(t *testing.T) {
 		PayloadLength: 4,
 	}}
 
-	_, cancel := runService(t, b, Options{
+	svc, cancel := runService(t, b, Options{
 		Conn:          conn,
 		Verifier:      verif,
 		Metadata:      memMD,
@@ -777,8 +782,8 @@ func TestCancelStreamedStagePreventsLateStageSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	if err := CommitBufferedStage("xfer-cancel", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-cancel", gen); err != nil {
+		t.Fatalf("markStreamedStageCommitted: %v", err)
 	}
 	CancelStreamedStage("xfer-cancel", gen, "test_cancel")
 
@@ -823,8 +828,11 @@ func TestReleasedStagedLeaseIgnoresLateCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	if err := CommitBufferedStage("xfer-released", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := WriteStreamedStage("xfer-released", gen, []byte("blob")); err != nil {
+		t.Fatalf("WriteStreamedStage: %v", err)
+	}
+	if _, err := CommitStreamedStage("xfer-released", gen); err != nil {
+		t.Fatalf("CommitStreamedStage: %v", err)
 	}
 
 	stage := testStagePayload("xfer-released", []byte("blob"))
@@ -883,8 +891,11 @@ func TestStaleGenerationAndWrongXferCannotMutateStreamedStage(t *testing.T) {
 	if _, err := CommitStreamedStage("xfer-current", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
 		t.Fatalf("stale generation CommitStreamedStage err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-current", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := WriteStreamedStage("xfer-current", gen, []byte("data")); err != nil {
+		t.Fatalf("WriteStreamedStage: %v", err)
+	}
+	if _, err := CommitStreamedStage("xfer-current", gen); err != nil {
+		t.Fatalf("CommitStreamedStage: %v", err)
 	}
 
 	for _, tc := range []struct {

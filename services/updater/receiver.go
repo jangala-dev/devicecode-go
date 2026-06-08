@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"bytes"
 	"errors"
 
 	"devicecode-go/bus"
@@ -40,66 +39,10 @@ func (s *Service) handleStage(msg *bus.Message) {
 		return
 	}
 
-	if len(payload.Artefact) == 0 {
-		staged, ok := consumeStreamedStageResult()
-		if !ok {
-			s.failStage(payload, "artefact_missing")
-			s.reply(msg, StageReply{OK: false, Err: "artefact_missing"})
-			return
-		}
-		if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
-			s.failLateStage(payload, err)
-			s.reply(msg, StageReply{OK: false, Err: err.Error()})
-			return
-		}
-		desc := StagedDescriptor{
-			Version:       staged.Version,
-			BuildID:       staged.BuildID,
-			ImageID:       staged.ImageID,
-			Length:        staged.Length,
-			Slot:          0,
-			PayloadSHA256: staged.PayloadSHA256,
-		}
-		if err := s.metadataWrite.WriteStagedDescriptor(desc); err != nil {
-			s.failStage(payload, "metadata_write_failed:"+err.Error())
-			s.reply(msg, StageReply{OK: false, Err: "metadata_write_failed"})
-			return
-		}
-		if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
-			s.failLateStage(payload, err)
-			s.reply(msg, StageReply{OK: false, Err: err.Error()})
-			return
-		}
-		if !s.releaseStreamedStageLease(payload.XferID, payload.Generation) {
-			err := errors.New("stage_cancelled")
-			s.failLateStage(payload, err)
-			s.reply(msg, StageReply{OK: false, Err: err.Error()})
-			return
-		}
-		s.setStagedImage(desc.ImageID, desc.Version)
-		s.transitionTo(StateStaged, "", desc.Version)
-		s.reply(msg, StageReply{OK: true, Stage: "staged"})
-		return
-	}
-
-	sink, err := newSlotSink(uint32(len(payload.Artefact)))
-	if err != nil {
-		s.failStage(payload, "sink_init_failed:"+err.Error())
-		s.reply(msg, StageReply{OK: false, Err: "sink_init_failed"})
-		return
-	}
-	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
-		_ = sink.Abort()
-		s.failLateStage(payload, err)
-		s.reply(msg, StageReply{OK: false, Err: err.Error()})
-		return
-	}
-	manifest, err := s.verifier.Verify(bytes.NewReader(payload.Artefact), sink)
-	if err != nil {
-		// Verifier rejected the artefact. Clear any prior descriptor so a
-		// following commit cannot apply stale firmware from an older stage.
-		s.failStage(payload, err.Error())
-		s.reply(msg, StageReply{OK: false, Err: err.Error()})
+	staged, ok := consumeStreamedStageResult()
+	if !ok {
+		s.failStage(payload, "artefact_missing")
+		s.reply(msg, StageReply{OK: false, Err: "artefact_missing"})
 		return
 	}
 	if err := s.checkStreamedStageLease(payload.XferID, payload.Generation, true); err != nil {
@@ -108,12 +51,12 @@ func (s *Service) handleStage(msg *bus.Message) {
 		return
 	}
 	desc := StagedDescriptor{
-		Version:       manifest.Version,
-		BuildID:       manifest.BuildID,
-		ImageID:       manifest.ImageID,
-		Length:        manifest.PayloadLength,
-		Slot:          0, // slot-pick comes from abupdate when hardware apply is wired
-		PayloadSHA256: manifest.PayloadSHA256,
+		Version:       staged.Version,
+		BuildID:       staged.BuildID,
+		ImageID:       staged.ImageID,
+		Length:        staged.Length,
+		Slot:          0,
+		PayloadSHA256: staged.PayloadSHA256,
 	}
 	if err := s.metadataWrite.WriteStagedDescriptor(desc); err != nil {
 		s.failStage(payload, "metadata_write_failed:"+err.Error())
@@ -125,17 +68,14 @@ func (s *Service) handleStage(msg *bus.Message) {
 		s.reply(msg, StageReply{OK: false, Err: err.Error()})
 		return
 	}
-
 	if !s.releaseStreamedStageLease(payload.XferID, payload.Generation) {
 		err := errors.New("stage_cancelled")
 		s.failLateStage(payload, err)
 		s.reply(msg, StageReply{OK: false, Err: err.Error()})
 		return
 	}
-	s.setStagedImage(desc.ImageID, manifest.Version)
-	s.transitionTo(StateStaged, "", manifest.Version)
-	// Do not republish the software fact here: PayloadSHA256 describes the
-	// running image, while this descriptor describes the staged image.
+	s.setStagedImage(desc.ImageID, desc.Version)
+	s.transitionTo(StateStaged, "", desc.Version)
 	s.reply(msg, StageReply{OK: true, Stage: "staged"})
 }
 

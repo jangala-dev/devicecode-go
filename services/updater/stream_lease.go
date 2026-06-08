@@ -155,18 +155,6 @@ func CommitStreamedStage(xferID string, generation uint64) (uint32, error) {
 	return staged.Length, nil
 }
 
-func CommitBufferedStage(xferID string, generation uint64) error {
-	s := currentService()
-	if s == nil {
-		return errors.New("updater_not_running")
-	}
-	if err := s.markStreamedStageCommitted(xferID, generation); err != nil {
-		return err
-	}
-	clearABUpdateDiagHook()
-	return nil
-}
-
 func AbortStreamedStage(xferID string, generation uint64, reason string) {
 	abortStreamedStage()
 	clearABUpdateDiagHook()
