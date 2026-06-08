@@ -18,18 +18,27 @@ import (
 )
 
 type fakeTransferSink struct {
-	offs         []uint32
-	writes       [][]byte
-	writeErr     error
-	commitErr    error
-	applyErr     error
-	commitInfo   transferInfo
-	committed    bool
-	applied      bool
-	abortReasons []string
+	offs           []uint32
+	writes         [][]byte
+	writeErr       error
+	writeEntered   chan struct{}
+	writeEnterOnce sync.Once
+	writeRelease   chan struct{}
+	commitErr      error
+	applyErr       error
+	commitInfo     transferInfo
+	committed      bool
+	applied        bool
+	abortReasons   []string
 }
 
 func (s *fakeTransferSink) WriteChunk(off uint32, data []byte) error {
+	if s.writeEntered != nil {
+		s.writeEnterOnce.Do(func() { close(s.writeEntered) })
+	}
+	if s.writeRelease != nil {
+		<-s.writeRelease
+	}
 	if s.writeErr != nil {
 		return s.writeErr
 	}
@@ -728,6 +737,40 @@ func TestTransferAcceptedChunkEmitsProcessingDiagnostics(t *testing.T) {
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev need_tx", "next 4", "ok true", "accepted true"},
 	)
 	assertDiagNotContains(t, diag.snapshot(), "[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev transfer_mem_sample")
+}
+
+func TestTransferNeedIsSentOnlyAfterPendingChunkWriteCompletes(t *testing.T) {
+	diag := captureOTADiag(t)
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{
+		writeEntered: make(chan struct{}),
+		writeRelease: make(chan struct{}),
+	}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-pending-chunk", payload, nil))
+	readTransferReady(t, cm5, "xfer-pending-chunk", 0)
+
+	sendMsg(t, cm5, xferChunk("xfer-pending-chunk", 0, payload))
+	select {
+	case <-sink.writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("sink write did not start")
+	}
+	time.Sleep(100 * time.Millisecond)
+	assertDiagNotContains(t, diag.snapshot(), "[fabric-xfer]", "xfer_id xfer-pending-chunk", "ev need_tx", "accepted true")
+
+	close(sink.writeRelease)
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next = %d, want %d", need.Next, len(payload))
+	}
 }
 
 func TestTransferAcceptedChunkEmitsSparseMemorySample(t *testing.T) {

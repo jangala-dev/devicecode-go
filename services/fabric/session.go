@@ -272,6 +272,8 @@ func (s *session) run(ctx context.Context) {
 			s.drainExports()
 			s.drainInbound(now)
 			s.drainOutbound(now)
+			s.drainChunkWrite(now)
+			s.drainTransferCommit(now)
 			s.checkTransferTimeout(now)
 			s.drainTargetCall(now)
 			s.tickPing(now)
