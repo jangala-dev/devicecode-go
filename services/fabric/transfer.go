@@ -153,6 +153,22 @@ func (s *session) nextPendingDeadline(now time.Time) (time.Time, bool) {
 	if call := s.pendingTargetCall; call != nil && !call.deadline.IsZero() {
 		out, ok = earlierDeadline(out, ok, call.deadline, true)
 	}
+	for _, call := range s.inboundCalls {
+		if !call.deadline.IsZero() {
+			out, ok = earlierDeadline(out, ok, call.deadline, true)
+		}
+	}
+	for _, call := range s.outboundCalls {
+		if !call.deadline.IsZero() {
+			out, ok = earlierDeadline(out, ok, call.deadline, true)
+		}
+	}
+	if s.link == linkUp && !s.nextPingAt.IsZero() {
+		out, ok = earlierDeadline(out, ok, s.nextPingAt, true)
+	}
+	if s.link == linkUp && !s.rpcReady && !s.exportReadyAt.IsZero() {
+		out, ok = earlierDeadline(out, ok, s.exportReadyAt, true)
+	}
 	return out, ok
 }
 
@@ -162,6 +178,11 @@ func (s *session) handlePendingDeadline(now time.Time) {
 	if call != nil && !now.Before(call.deadline) {
 		s.finishTargetCall(call, false, "stage_timeout")
 	}
+	s.expireInbound(now)
+	s.expireOutbound(now)
+	s.tickPing(now)
+	s.tickReady(now)
+	s.drainQueuedExports()
 }
 
 func sameTransferTuple(a, b transferMeta) bool {
