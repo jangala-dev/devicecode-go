@@ -107,6 +107,63 @@ type pendingTargetCall struct {
 	deadline time.Time
 }
 
+func (s *session) pendingChunkReady() <-chan error {
+	cur := s.incomingTransfer
+	if cur == nil || cur.pendingChunk == nil {
+		return nil
+	}
+	return cur.pendingChunk.resultCh
+}
+
+func (s *session) pendingCommitReady() <-chan transferCommitResult {
+	cur := s.incomingTransfer
+	if cur == nil || cur.pendingCommit == nil {
+		return nil
+	}
+	return cur.pendingCommit.resultCh
+}
+
+func (s *session) pendingTargetReady() <-chan *bus.Message {
+	call := s.pendingTargetCall
+	if call == nil || call.sub == nil {
+		return nil
+	}
+	return call.sub.Channel()
+}
+
+func earlierDeadline(a time.Time, aOK bool, b time.Time, bOK bool) (time.Time, bool) {
+	if !aOK {
+		return b, bOK
+	}
+	if !bOK {
+		return a, true
+	}
+	if b.Before(a) {
+		return b, true
+	}
+	return a, true
+}
+
+func (s *session) nextPendingDeadline(now time.Time) (time.Time, bool) {
+	var out time.Time
+	var ok bool
+	if cur := s.incomingTransfer; cur != nil && !cur.deadline.IsZero() {
+		out, ok = earlierDeadline(out, ok, cur.deadline, true)
+	}
+	if call := s.pendingTargetCall; call != nil && !call.deadline.IsZero() {
+		out, ok = earlierDeadline(out, ok, call.deadline, true)
+	}
+	return out, ok
+}
+
+func (s *session) handlePendingDeadline(now time.Time) {
+	s.checkTransferTimeout(now)
+	call := s.pendingTargetCall
+	if call != nil && !now.Before(call.deadline) {
+		s.finishTargetCall(call, false, "stage_timeout")
+	}
+}
+
 func sameTransferTuple(a, b transferMeta) bool {
 	return a.ID == b.ID &&
 		a.Target == b.Target &&
@@ -481,70 +538,66 @@ func (s *session) startPendingChunkWrite(cur *incomingTransfer, offset uint32, r
 	}()
 }
 
-func (s *session) drainChunkWrite(now time.Time) {
+func (s *session) finishChunkWrite(now time.Time, err error) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingChunk == nil {
 		return
 	}
 	pending := cur.pendingChunk
-	select {
-	case err := <-pending.resultCh:
-		cur.pendingChunk = nil
-		if err != nil {
-			reason := err.Error()
-			otadiag.Event(
-				"[fabric-xfer]", "sink_write_error", pending.xferID,
-				otadiag.KV("reason", reason),
-				otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
-			)
-			s.logKV("transfer write failed", "err", reason)
-			s.abortTransfer(reason)
-			abortOK := s.sendTransferAbort(pending.xferID, reason)
-			otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
-			return
-		}
-		_, _ = cur.hasher.Write(pending.data)
-		cur.bytesWritten += uint32(len(pending.data))
-		cur.chunksSeen++
-		cur.idleRetries = 0
-		cur.corruptRetryOffset = cur.bytesWritten
-		cur.corruptRetriesAtOffset = 0
-		cur.deadline = now.Add(s.cfg.PhaseTimeout)
+	cur.pendingChunk = nil
+	if err != nil {
+		reason := err.Error()
 		otadiag.Event(
-			"[fabric-xfer]", "sink_write_done", pending.xferID,
+			"[fabric-xfer]", "sink_write_error", pending.xferID,
+			otadiag.KV("reason", reason),
 			otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
-			otadiag.KV("next", u32s(cur.bytesWritten)),
 		)
-		pending.data = nil
-		// Keep transfer memory bounded on TinyGo. The receiver allocates while
-		// unmarshalling JSON and decoding base64 chunks; without regular collection
-		// long updates can run out of heap before commit.
-		gcStart := time.Now()
-		otadiag.Event("[fabric-xfer]", "gc_start", pending.xferID, otadiag.KV("next", u32s(cur.bytesWritten)))
-		runtime.GC()
+		s.logKV("transfer write failed", "err", reason)
+		s.abortTransfer(reason)
+		abortOK := s.sendTransferAbort(pending.xferID, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
+		return
+	}
+	_, _ = cur.hasher.Write(pending.data)
+	cur.bytesWritten += uint32(len(pending.data))
+	cur.chunksSeen++
+	cur.idleRetries = 0
+	cur.corruptRetryOffset = cur.bytesWritten
+	cur.corruptRetriesAtOffset = 0
+	cur.deadline = now.Add(s.cfg.PhaseTimeout)
+	otadiag.Event(
+		"[fabric-xfer]", "sink_write_done", pending.xferID,
+		otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
+		otadiag.KV("next", u32s(cur.bytesWritten)),
+	)
+	pending.data = nil
+	// Keep transfer memory bounded on TinyGo. The receiver allocates while
+	// unmarshalling JSON and decoding base64 chunks; without regular collection
+	// long updates can run out of heap before commit.
+	gcStart := time.Now()
+	otadiag.Event("[fabric-xfer]", "gc_start", pending.xferID, otadiag.KV("next", u32s(cur.bytesWritten)))
+	runtime.GC()
+	otadiag.Event(
+		"[fabric-xfer]", "gc_done", pending.xferID,
+		otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
+		otadiag.KV("next", cur.bytesWritten),
+	)
+	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	otadiag.Event(
+		"[fabric-xfer]", "need_tx", cur.meta.ID,
+		otadiag.KV("next", cur.bytesWritten),
+		otadiag.KV("ok", needOK),
+		otadiag.KV("accepted", true),
+	)
+	if cur.bytesWritten != 0 && cur.bytesWritten%transferMemSampleStride == 0 {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
 		otadiag.Event(
-			"[fabric-xfer]", "gc_done", pending.xferID,
-			otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
+			"[fabric-xfer]", "transfer_mem_sample", cur.meta.ID,
 			otadiag.KV("next", cur.bytesWritten),
+			otadiag.KV("alloc", ms.Alloc),
+			otadiag.KV("heap", ms.HeapSys),
 		)
-		needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
-		otadiag.Event(
-			"[fabric-xfer]", "need_tx", cur.meta.ID,
-			otadiag.KV("next", cur.bytesWritten),
-			otadiag.KV("ok", needOK),
-			otadiag.KV("accepted", true),
-		)
-		if cur.bytesWritten != 0 && cur.bytesWritten%transferMemSampleStride == 0 {
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-			otadiag.Event(
-				"[fabric-xfer]", "transfer_mem_sample", cur.meta.ID,
-				otadiag.KV("next", cur.bytesWritten),
-				otadiag.KV("alloc", ms.Alloc),
-				otadiag.KV("heap", ms.HeapSys),
-			)
-		}
-	default:
 	}
 }
 
@@ -564,37 +617,33 @@ func (s *session) startPendingTransferCommit(cur *incomingTransfer) {
 	}()
 }
 
-func (s *session) drainTransferCommit(now time.Time) {
+func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingCommit == nil {
 		return
 	}
 	pending := cur.pendingCommit
-	select {
-	case res := <-pending.resultCh:
-		cur.pendingCommit = nil
-		if res.err != nil {
-			reason := res.err.Error()
-			s.logKV("transfer commit failed", "err", reason)
-			s.abortTransfer(reason)
-			abortOK := s.sendTransferAbort(pending.xferID, reason)
-			otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
-			return
-		}
-		meta := cur.meta
-		s.clearTransfer()
-		otadiag.Event(
-			"[fabric-xfer]", "transfer_commit_done", pending.xferID,
-			otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
-		)
-		if reason := s.startTransferTargetCall(meta, pending.xferID, res.info); reason != "" {
-			updater.CancelStreamedStage(pending.xferID, res.info.Generation, reason)
-			abortOK := s.sendTransferAbort(pending.xferID, reason)
-			otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
-		}
-	default:
-		_ = now
+	cur.pendingCommit = nil
+	if res.err != nil {
+		reason := res.err.Error()
+		s.logKV("transfer commit failed", "err", reason)
+		s.abortTransfer(reason)
+		abortOK := s.sendTransferAbort(pending.xferID, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
+		return
 	}
+	meta := cur.meta
+	s.clearTransfer()
+	otadiag.Event(
+		"[fabric-xfer]", "transfer_commit_done", pending.xferID,
+		otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
+	)
+	if reason := s.startTransferTargetCall(meta, pending.xferID, res.info); reason != "" {
+		updater.CancelStreamedStage(pending.xferID, res.info.Generation, reason)
+		abortOK := s.sendTransferAbort(pending.xferID, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
+	}
+	_ = now
 }
 
 func (s *session) onTransferChunk(msg *protoXferChunk) {
@@ -790,9 +839,9 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 }
 
 // startTransferTargetCall invokes the local updater/main staging RPC without
-// blocking the Fabric session reactor. The reply is observed by drainTargetCall
-// on the normal session tick path; until then the session continues to process
-// pings, exports, replies and link events.
+// blocking the Fabric session reactor. The reply channel is selected directly
+// by session.run, so completion wakes the reactor without waiting for a
+// periodic tick.
 func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info transferInfo) string {
 	if meta.Target != transferTargetUpdaterMain {
 		return "unsupported_target"
@@ -848,25 +897,17 @@ func (s *session) finishTargetCall(call *pendingTargetCall, ok bool, reason stri
 	otadiag.Event("[fabric-xfer]", "abort_tx", call.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 }
 
-func (s *session) drainTargetCall(now time.Time) {
+func (s *session) finishTargetReply(rep *bus.Message, ok bool) {
 	call := s.pendingTargetCall
 	if call == nil {
 		return
 	}
-	select {
-	case rep, ok := <-call.sub.Channel():
-		if !ok || rep == nil {
-			s.finishTargetCall(call, false, "stage_no_reply")
-			return
-		}
-		okReply, reason := decodeStageReply(rep.Payload)
-		s.finishTargetCall(call, okReply, reason)
+	if !ok || rep == nil {
+		s.finishTargetCall(call, false, "stage_no_reply")
 		return
-	default:
 	}
-	if !now.Before(call.deadline) {
-		s.finishTargetCall(call, false, "stage_timeout")
-	}
+	okReply, reason := decodeStageReply(rep.Payload)
+	s.finishTargetCall(call, okReply, reason)
 }
 
 func (s *session) cancelTargetCall(reason string) {

@@ -239,16 +239,24 @@ func (s *session) run(ctx context.Context) {
 	waitTick := time.NewTicker(waitLogEvery)
 	defer waitTick.Stop()
 
-	// Poll subscription channels periodically. Needed because select
-	// blocks until a line/timer fires; without this, exported bus
-	// messages and async call replies would sit in subscription channels.
+	// Poll export/RPC subscriptions periodically. Pending transfer/updater
+	// operations below are not polled here: their completion channels are
+	// selected directly so flash/stage progress wakes the reactor immediately.
 	exportTick := time.NewTicker(exportTickInterval)
 	defer exportTick.Stop()
+
+	pendingDeadline := time.NewTimer(time.Hour)
+	if !pendingDeadline.Stop() {
+		<-pendingDeadline.C
+	}
+	defer pendingDeadline.Stop()
 
 	s.publishLinkState("", "")
 	s.log("run start")
 
 	for {
+		pendingAt, pendingOK := s.nextPendingDeadline(time.Now())
+		pendingDeadlineCh := resetOptionalTimer(pendingDeadline, pendingAt, pendingOK)
 		select {
 		case <-ctx.Done():
 			return
@@ -267,15 +275,23 @@ func (s *session) run(ctx context.Context) {
 				resetTimer(stale, s.cfg.LivenessTimeout)
 			}
 
+		case err := <-s.pendingChunkReady():
+			s.finishChunkWrite(time.Now(), err)
+
+		case res := <-s.pendingCommitReady():
+			s.finishTransferCommit(time.Now(), res)
+
+		case rep, ok := <-s.pendingTargetReady():
+			s.finishTargetReply(rep, ok)
+
+		case <-pendingDeadlineCh:
+			s.handlePendingDeadline(time.Now())
+
 		case <-exportTick.C:
 			now := time.Now()
 			s.drainExports()
 			s.drainInbound(now)
 			s.drainOutbound(now)
-			s.drainChunkWrite(now)
-			s.drainTransferCommit(now)
-			s.checkTransferTimeout(now)
-			s.drainTargetCall(now)
 			s.tickPing(now)
 			s.tickReady(now)
 
@@ -298,6 +314,24 @@ func shouldLogFabricRead(msgType string, _, _ time.Duration) bool {
 		return true
 	}
 	return false
+}
+
+func resetOptionalTimer(t *time.Timer, deadline time.Time, ok bool) <-chan time.Time {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	if !ok || deadline.IsZero() {
+		return nil
+	}
+	d := time.Until(deadline)
+	if d < 0 {
+		d = 0
+	}
+	t.Reset(d)
+	return t.C
 }
 
 func resetTimer(t *time.Timer, d time.Duration) {

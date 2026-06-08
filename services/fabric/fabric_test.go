@@ -1251,7 +1251,7 @@ func TestDrainExportsWaitsForStartupHoldoff(t *testing.T) {
 	}
 }
 
-func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
+func TestDrainExportsContinuesDuringIncomingTransfer(t *testing.T) {
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1274,15 +1274,8 @@ func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
 	))
 	s.drainExports()
 
-	if len(tr.writes) != 0 {
-		t.Fatalf("writes during transfer = %d, want 0", len(tr.writes))
-	}
-
-	s.incomingTransfer = nil
-	s.drainExports()
-
 	if len(tr.writes) != 1 {
-		t.Fatalf("writes after transfer = %d, want 1", len(tr.writes))
+		t.Fatalf("writes during transfer = %d, want 1", len(tr.writes))
 	}
 }
 

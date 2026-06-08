@@ -1677,7 +1677,7 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 	}
 }
 
-func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing.T) {
+func TestTransferCommitTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing.T) {
 	b := newBus()
 	memMD := updater.NewMemoryMetadata()
 	verif := &blockingVerifier{
@@ -1719,17 +1719,17 @@ func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *te
 	select {
 	case <-verif.entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("verifier did not start before stage timeout")
+		t.Fatal("verifier did not start before commit timeout")
 	}
-	readTransferAbort(t, cm5, id, "stage_timeout")
+	readTransferAbort(t, cm5, id, "transfer_commit_timeout")
 	if _, ok := memMD.StagedDescriptor(); ok {
-		t.Fatal("stage timeout persisted descriptor before verifier returned")
+		t.Fatal("commit timeout persisted descriptor before verifier returned")
 	}
 
 	close(verif.release)
 	time.Sleep(50 * time.Millisecond)
 	if _, ok := memMD.StagedDescriptor(); ok {
-		t.Fatal("late verifier completion after stage timeout persisted descriptor")
+		t.Fatal("late verifier completion after commit timeout persisted descriptor")
 	}
 }
 
