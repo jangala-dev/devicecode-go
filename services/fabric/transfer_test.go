@@ -1675,14 +1675,13 @@ func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *te
 	caller := b.NewConnection("caller")
 	prepareUpdaterForFabricTest(t, caller)
 
-	oldTimeout := targetCallTimeout
-	targetCallTimeout = 20 * time.Millisecond
-	defer func() { targetCallTimeout = oldTimeout }()
+	cfg := DefaultLinkConfig()
+	cfg.TargetCallTimeout = 20 * time.Millisecond
 
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", cfg)
 	bringUp(t, cm5)
 
 	id := "xfer-stage-timeout"

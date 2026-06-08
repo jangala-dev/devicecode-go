@@ -211,39 +211,6 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 			"tx_size", strconvx.Itoa(txSize),
 		)
 
-		// --- Device-level hygiene: drain spurious RX before signalling link up ---
-		// Discard any pre-existing or immediately-arriving bytes on the UART RX path.
-		// Uses a short quiet window so this remains bounded and non-blocking.
-		{
-			const quiet = 5 * time.Millisecond     // time with no bytes before we stop
-			const maxTotal = 15 * time.Millisecond // absolute cap as a safeguard
-
-			tmp := make([]byte, 64)
-			tStart := time.Now()
-			tQuiet := time.Now().Add(quiet)
-
-			for {
-				// Non-blocking attempt to pull any pending bytes.
-				if n := d.port.TryRead(tmp); n > 0 {
-					// Extend the quiet window after activity.
-					tQuiet = time.Now().Add(quiet)
-				} else {
-					// No bytes right now. If we have been quiet long enough, or we have
-					// reached the absolute bound, stop draining.
-					now := time.Now()
-					if now.After(tQuiet) || now.Sub(tStart) >= maxTotal {
-						break
-					}
-					// Wait for either a UART RX edge or a very short back-off, then re-check.
-					select {
-					case <-d.port.Readable():
-					case <-time.After(time.Millisecond):
-					}
-				}
-			}
-		}
-		// --- end hygiene ---
-
 		rep := types.SerialSessionOpened{
 			SessionID: d.sess.id,
 			RXHandle:  uint32(d.sess.rxHandle),

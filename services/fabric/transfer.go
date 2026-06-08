@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"devicecode-go/bus"
 	"devicecode-go/services/otadiag"
 	"devicecode-go/services/updater"
 	"devicecode-go/x/strconvx"
@@ -75,6 +76,14 @@ type incomingTransfer struct {
 
 type completedTransfer struct {
 	meta transferMeta
+}
+
+type pendingTargetCall struct {
+	xferID   string
+	meta     transferMeta
+	info     transferInfo
+	sub      *bus.Subscription
+	deadline time.Time
 }
 
 func sameTransferTuple(a, b transferMeta) bool {
@@ -284,7 +293,6 @@ func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 }
 
 func (s *session) onTransferBegin(msg *protoXferBegin) {
-	s.extendTransferQuiet("xfer_begin_rx", transferPrepareQuiet)
 	otadiag.SetActiveXfer(msg.XferID)
 	otadiag.Event(
 		"[fabric-xfer]", "begin_rx", msg.XferID,
@@ -342,6 +350,18 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 			"[fabric-xfer]", "begin_reject", meta.ID,
 			otadiag.KV("reason", reason),
 			otadiag.KV("active_xfer", cur.meta.ID),
+			otadiag.KV("abort_tx", abortOK),
+		)
+		otadiag.StopUpdateWindow("begin_reject")
+		return
+	}
+	if s.pendingTargetCall != nil {
+		reason := "busy"
+		abortOK := s.sendTransferAbort(meta.ID, reason)
+		otadiag.Event(
+			"[fabric-xfer]", "begin_reject", meta.ID,
+			otadiag.KV("reason", reason),
+			otadiag.KV("pending_xfer", s.pendingTargetCall.xferID),
 			otadiag.KV("abort_tx", abortOK),
 		)
 		otadiag.StopUpdateWindow("begin_reject")
@@ -620,33 +640,25 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 	}
 	sink := cur.sink
 	meta := cur.meta
-	s.extendTransferQuiet("xfer_commit_target", transferCompleteQuiet)
 	s.clearTransfer()
 
-	bytesPayload := sink.Bytes()
-	ok, reason := s.invokeTransferTarget(meta, id, info, bytesPayload)
-	if !ok {
-		s.extendTransferQuiet("xfer_target_rejected", transferCompleteQuiet)
+	if reason := s.startTransferTargetCall(meta, id, info, sink.Bytes()); reason != "" {
 		abortOK := s.sendTransferAbort(id, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
-	s.extendTransferQuiet("xfer_done", transferCompleteQuiet)
-	s.recordCompletedTransfer(meta)
-	doneOK := s.sendTransferDone(id)
-	otadiag.Event("[fabric-xfer]", "done_tx", id, otadiag.KV("ok", doneOK))
-	otadiag.StopUpdateWindow("transfer_done")
 }
 
-var targetCallTimeout = 5 * time.Second
-
-// invokeTransferTarget calls the local updater staging RPC named by
-// xfer_begin.target. The wire no longer carries raw/member receiver topics;
-// target="updater/main" maps to an internal bus RPC owned by the updater
-// service. The reply gates whether fabric sends xfer_done or xfer_abort.
-func (s *session) invokeTransferTarget(meta transferMeta, xferID string, info transferInfo, artefact []byte) (bool, string) {
+// startTransferTargetCall invokes the local updater/main staging RPC without
+// blocking the Fabric session reactor. The reply is observed by drainTargetCall
+// on the normal session tick path; until then the session continues to process
+// pings, exports, replies and link events.
+func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info transferInfo, artefact []byte) string {
 	if meta.Target != transferTargetUpdaterMain {
-		return false, "unsupported_target"
+		return "unsupported_target"
+	}
+	if s.pendingTargetCall != nil {
+		return "busy"
 	}
 	payload := updater.StagePayload{
 		LinkID:     s.linkID,
@@ -660,25 +672,79 @@ func (s *session) invokeTransferTarget(meta transferMeta, xferID string, info tr
 		Artefact:   artefact,
 	}
 	msg := s.conn.NewMessage(updater.TopicStageRPC, payload, false)
-	replySub := s.conn.Request(msg)
-	defer s.conn.Unsubscribe(replySub)
-
-	select {
-	case rep, ok := <-replySub.Channel():
-		if !ok || rep == nil {
-			updater.CancelStreamedStage(xferID, info.Generation, "stage_no_reply")
-			return false, "stage_no_reply"
-		}
-		ok, reason := decodeStageReply(rep.Payload)
-		if !ok {
-			updater.CancelStreamedStage(xferID, info.Generation, reason)
-			return false, reason
-		}
-		return true, ""
-	case <-time.After(targetCallTimeout):
-		updater.CancelStreamedStage(xferID, info.Generation, "stage_timeout")
-		return false, "stage_timeout"
+	s.pendingTargetCall = &pendingTargetCall{
+		xferID:   xferID,
+		meta:     meta,
+		info:     info,
+		sub:      s.conn.Request(msg),
+		deadline: time.Now().Add(s.cfg.TargetCallTimeout),
 	}
+	otadiag.Event("[fabric-xfer]", "target_call_start", xferID,
+		otadiag.KV("timeout_ms", int(s.cfg.TargetCallTimeout/time.Millisecond)),
+	)
+	return ""
+}
+
+func (s *session) finishTargetCall(call *pendingTargetCall, ok bool, reason string) {
+	if call == nil {
+		return
+	}
+	if call.sub != nil {
+		s.conn.Unsubscribe(call.sub)
+		call.sub = nil
+	}
+	s.pendingTargetCall = nil
+	if ok {
+		s.recordCompletedTransfer(call.meta)
+		doneOK := s.sendTransferDone(call.xferID)
+		otadiag.Event("[fabric-xfer]", "done_tx", call.xferID, otadiag.KV("ok", doneOK))
+		otadiag.StopUpdateWindow("transfer_done")
+		return
+	}
+	if reason == "" {
+		reason = "stage_rejected"
+	}
+	updater.CancelStreamedStage(call.xferID, call.info.Generation, reason)
+	abortOK := s.sendTransferAbort(call.xferID, reason)
+	otadiag.Event("[fabric-xfer]", "abort_tx", call.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
+}
+
+func (s *session) drainTargetCall(now time.Time) {
+	call := s.pendingTargetCall
+	if call == nil {
+		return
+	}
+	select {
+	case rep, ok := <-call.sub.Channel():
+		if !ok || rep == nil {
+			s.finishTargetCall(call, false, "stage_no_reply")
+			return
+		}
+		okReply, reason := decodeStageReply(rep.Payload)
+		s.finishTargetCall(call, okReply, reason)
+		return
+	default:
+	}
+	if !now.Before(call.deadline) {
+		s.finishTargetCall(call, false, "stage_timeout")
+	}
+}
+
+func (s *session) cancelTargetCall(reason string) {
+	call := s.pendingTargetCall
+	if call == nil {
+		return
+	}
+	if reason == "" {
+		reason = reasonLinkDown
+	}
+	if call.sub != nil {
+		s.conn.Unsubscribe(call.sub)
+		call.sub = nil
+	}
+	s.pendingTargetCall = nil
+	updater.CancelStreamedStage(call.xferID, call.info.Generation, reason)
+	otadiag.Event("[fabric-xfer]", "target_call_cancel", call.xferID, otadiag.KV("reason", reason))
 }
 
 func decodeStageReply(payload any) (bool, string) {

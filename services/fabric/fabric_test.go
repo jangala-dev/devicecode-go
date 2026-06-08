@@ -1286,7 +1286,7 @@ func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
 	}
 }
 
-func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
+func TestDrainExportsContinuesAfterPrepareCall(t *testing.T) {
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1332,32 +1332,22 @@ func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
 	))
 	s.drainExports()
 
-	if len(tr.writes) != 0 {
-		t.Fatalf("writes during prepare quiet = %d, want 0", len(tr.writes))
-	}
-
-	s.transferQuietUntil = time.Time{}
-	s.transferQuietReason = ""
-	s.drainExports()
-
 	if len(tr.writes) != 1 {
-		t.Fatalf("writes after prepare quiet = %d, want 1", len(tr.writes))
+		t.Fatalf("writes after prepare call = %d, want 1", len(tr.writes))
 	}
 }
 
-func TestDrainExportsAllowsOnlyCriticalFactsDuringPostTransferQuiet(t *testing.T) {
+func TestDrainExportsDoesNotUsePostTransferQuietWindow(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
 	tr := &captureTransport{}
 	s := session{
-		conn:                fabricConn,
-		tr:                  tr,
-		link:                linkUp,
-		exportsEnabled:      true,
-		exportReadyAt:       time.Now().Add(-time.Second),
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "xfer_done",
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
 	}
 
 	s.setupExports()
@@ -1387,8 +1377,8 @@ func TestDrainExportsAllowsOnlyCriticalFactsDuringPostTransferQuiet(t *testing.T
 	for i := 0; i < len(criticalExportTopics)+4; i++ {
 		s.drainExports()
 	}
-	if len(tr.writes) != len(criticalExportTopics) {
-		t.Fatalf("writes during post-transfer quiet = %d, want %d critical facts",
+	if len(tr.writes) < len(criticalExportTopics) {
+		t.Fatalf("writes after transfer = %d, want at least %d critical facts",
 			len(tr.writes), len(criticalExportTopics))
 	}
 	want := [][]string{
@@ -1837,21 +1827,19 @@ func TestPongAllowedDuringIncomingTransfer(t *testing.T) {
 	}
 }
 
-func TestPongAllowedDuringPrepareQuietForEstablishedPeer(t *testing.T) {
+func TestPongAllowedForEstablishedPeerWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "cm5-sid",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "cm5-sid"})
 
 	if len(tr.writes) != 1 {
-		t.Fatalf("pong writes during prepare quiet = %d, want 1", len(tr.writes))
+		t.Fatalf("pong writes = %d, want 1", len(tr.writes))
 	}
 	var pong protoPong
 	if err := json.Unmarshal(tr.writes[0], &pong); err != nil {
@@ -1862,15 +1850,13 @@ func TestPongAllowedDuringPrepareQuietForEstablishedPeer(t *testing.T) {
 	}
 }
 
-func TestPongRejectsWrongSIDDuringPrepareQuiet(t *testing.T) {
+func TestPongRejectsWrongSIDWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "cm5-sid",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "other-sid"})
@@ -1910,15 +1896,13 @@ func TestWrongSIDPingPongDoNotRefreshLiveness(t *testing.T) {
 	}
 }
 
-func TestPongRejectsSelfSIDDuringPrepareQuiet(t *testing.T) {
+func TestPongRejectsSelfSIDWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "mcu-sid-test",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "mcu-sid-test",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "mcu-sid-test"})

@@ -43,6 +43,11 @@ type LinkConfig struct {
 	// this window once established. Mirrors session_ctl.lua's
 	// liveness_timeout_s. Release: 30s.
 	LivenessTimeout time.Duration
+	// TargetCallTimeout is the local updater/main stage RPC deadline after
+	// xfer_commit has verified the wire transfer. The Fabric session owns this
+	// as pending operation state; it must not block the reactor loop.
+	// Release: 5s.
+	TargetCallTimeout time.Duration
 	// MaxInboundHelpers caps the number of in-flight inbound RPC calls.
 	// Excess inbound calls reply `{ok=false, err="busy"}` per
 	// rpc_bridge.lua's `spawn_local_call_helper`. Lua default is 64
@@ -61,6 +66,7 @@ func DefaultLinkConfig() LinkConfig {
 		PhaseTimeout:      15 * time.Second,
 		PingInterval:      10 * time.Second,
 		LivenessTimeout:   30 * time.Second,
+		TargetCallTimeout: 5 * time.Second,
 		MaxInboundHelpers: 64,
 		RPCQuantum:        4,
 		BulkQuantum:       1,
@@ -80,6 +86,9 @@ func (c *LinkConfig) applyDefaults() {
 	}
 	if c.LivenessTimeout == 0 {
 		c.LivenessTimeout = d.LivenessTimeout
+	}
+	if c.TargetCallTimeout == 0 {
+		c.TargetCallTimeout = d.TargetCallTimeout
 	}
 	if c.MaxInboundHelpers == 0 {
 		c.MaxInboundHelpers = d.MaxInboundHelpers

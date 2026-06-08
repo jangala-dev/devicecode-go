@@ -52,20 +52,6 @@ const (
 	exportMaxPerTick   = 1
 	exportTickInterval = 50 * time.Millisecond
 	errPayloadMarshal  = "payload_marshal_failed"
-
-	// Temporary transport recovery policy: the USB/UART path used during OTA
-	// can echo MCU-originated JSONL back into the MCU receiver. If exported
-	// retained state is in flight while CM5 starts an OTA transfer, the echoed
-	// line can contain CM5's xfer_begin spliced into the middle of the state pub.
-	// Hold exports quiet from prepare until either xfer_begin arrives or this
-	// window expires. Revisit after CM5 update-admission hardening so this does
-	// not become OTA semantics.
-	transferPrepareQuiet = 10 * time.Second
-	// Temporary transport recovery policy: keep telemetry/state exports quiet
-	// long enough for the host to send the follow-up updater commit call after
-	// xfer_done. On echo-prone UART links, retained export backlog can otherwise
-	// splice into the commit JSONL frame.
-	transferCompleteQuiet = 10 * time.Second
 )
 
 // ---- link reasons and error strings ----
@@ -86,13 +72,12 @@ const (
 // ---- types ----
 
 type inboundCall struct {
-	id              string
-	topic           []string
-	localTopic      bus.Topic
-	payload         json.RawMessage
-	sub             *bus.Subscription
-	deadline        time.Time
-	transferPrepare bool
+	id         string
+	topic      []string
+	localTopic bus.Topic
+	payload    json.RawMessage
+	sub        *bus.Subscription
+	deadline   time.Time
 }
 
 type outboundCall struct {
@@ -164,8 +149,7 @@ type session struct {
 	rpcReady                    bool        // bridge replay complete; gates linkStatePayload.Ready
 	incomingTransfer            *incomingTransfer
 	completedTransfers          []completedTransfer
-	transferQuietUntil          time.Time
-	transferQuietReason         string
+	pendingTargetCall           *pendingTargetCall
 	beginTransfer               func(transferMeta) (transferSink, error)
 }
 
@@ -245,6 +229,7 @@ func (s *session) run(ctx context.Context) {
 	defer s.teardownExports()
 	defer s.teardownInbound()
 	defer s.teardownOutbound(reasonLinkDown)
+	defer s.cancelTargetCall(reasonLinkDown)
 	defer s.abortTransfer(reasonLinkDown)
 	defer s.log("run stop")
 
@@ -288,6 +273,7 @@ func (s *session) run(ctx context.Context) {
 			s.drainInbound(now)
 			s.drainOutbound(now)
 			s.checkTransferTimeout(now)
+			s.drainTargetCall(now)
 			s.tickPing(now)
 			s.tickReady(now)
 
@@ -388,12 +374,11 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.exportReadyAt = time.Time{}
 	s.exportsEnabled = false
 	s.rpcReady = false
-	s.transferQuietUntil = time.Time{}
-	s.transferQuietReason = ""
 	s.teardownExports()
 	s.teardownInbound()
 	s.teardownOutbound(pendingReason)
 	s.teardownImportedRetained()
+	s.cancelTargetCall(pendingReason)
 	s.abortTransfer(pendingReason)
 	s.clearCompletedTransfers()
 	s.publishLinkState(reason, err)
@@ -420,6 +405,7 @@ func (s *session) promoteLink(reason string) {
 		if reason == "" {
 			reason = reasonPeerReset
 		}
+		s.cancelTargetCall(reason)
 		s.abortTransfer(reason)
 		s.teardownExports()
 		s.teardownInbound()
@@ -805,38 +791,6 @@ func validWireTopic(topic []string) bool {
 	return true
 }
 
-func (s *session) extendTransferQuiet(reason string, d time.Duration) {
-	now := time.Now()
-	until := now.Add(d)
-	if until.After(s.transferQuietUntil) {
-		s.transferQuietUntil = until
-		s.transferQuietReason = reason
-	}
-}
-
-func (s *session) transferQuiet(now time.Time) (bool, string) {
-	if cur := s.incomingTransfer; cur != nil {
-		return true, "incoming_transfer:" + cur.meta.ID
-	}
-	if !s.transferQuietUntil.IsZero() && now.Before(s.transferQuietUntil) {
-		reason := s.transferQuietReason
-		if reason == "" {
-			reason = "quiet_window"
-		}
-		return true, reason
-	}
-	return false, ""
-}
-
-func quietAllowsCriticalExports(reason string) bool {
-	switch reason {
-	case "xfer_commit_target", "xfer_target_rejected", "xfer_done":
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *session) onHello(msg *protoHello) {
 	if msg.Proto != protocolName {
 		s.log("hello dropped: unsupported proto")
@@ -914,13 +868,6 @@ func (s *session) onPing(msg *protoPing) {
 // unconditionally every ping_interval after each send (NOT TX-activity-based).
 func (s *session) tickPing(now time.Time) {
 	if s.link != linkUp {
-		return
-	}
-	if quiet, _ := s.transferQuiet(now); quiet {
-		// Keep the UART quiet while CM5 is preparing or streaming a firmware
-		// image; chunk recovery depends on xfer_need being the only periodic
-		// MCU-originated frame on the fabric link.
-		s.nextPingAt = now.Add(s.cfg.PingInterval)
 		return
 	}
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
@@ -1026,11 +973,6 @@ func (s *session) onCall(msg *protoCall) {
 	s.rpcDiag("call_route_ok", msg, localTopic, "")
 
 	s.markRx()
-	isTransferPrepare := wireTopicEquals(msg.Topic, wireUpdaterPrepare)
-	if isTransferPrepare {
-		s.extendTransferQuiet("prepare_call_rx", transferPrepareQuiet)
-	}
-
 	timeout := callTimeoutDef
 	if msg.TimeoutMs > 0 {
 		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
@@ -1042,13 +984,12 @@ func (s *session) onCall(msg *protoCall) {
 	sub := s.conn.Request(busMsg)
 	topicCopy := append([]string(nil), msg.Topic...)
 	s.inboundCalls = append(s.inboundCalls, &inboundCall{
-		id:              msg.ID,
-		topic:           topicCopy,
-		localTopic:      localTopic,
-		payload:         append(json.RawMessage(nil), msg.Payload...),
-		sub:             sub,
-		deadline:        time.Now().Add(timeout),
-		transferPrepare: isTransferPrepare,
+		id:         msg.ID,
+		topic:      topicCopy,
+		localTopic: localTopic,
+		payload:    append(json.RawMessage(nil), msg.Payload...),
+		sub:        sub,
+		deadline:   time.Now().Add(timeout),
 	})
 }
 
@@ -1275,24 +1216,14 @@ func (s *session) drainExports() {
 		return
 	}
 	now := time.Now()
-	quiet, quietReason := s.transferQuiet(now)
 	if !s.exportsEnabled {
 		return
 	}
 	if !s.exportReadyAt.IsZero() && now.Before(s.exportReadyAt) {
 		return
 	}
-	if quiet && !quietAllowsCriticalExports(quietReason) {
-		// Avoid colliding telemetry/state exports with prepare/xfer traffic on
-		// echo-prone links. Post-transfer quiet allows critical facts below so
-		// state=rebooting can reach CM5 before the reboot arm.
-		return
-	}
 	total := 0
 	if !s.drainCriticalExports(&total) {
-		return
-	}
-	if quiet {
 		return
 	}
 	if !s.criticalExportReplayDrained() {
@@ -1338,9 +1269,6 @@ func (s *session) drainInbound(now time.Time) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil // prevent double-unsubscribe in teardownInbound
 			if !ok || reply == nil {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_timeout", transferPrepareQuiet)
-				}
 				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
 				s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
 				if !sent {
@@ -1349,9 +1277,6 @@ func (s *session) drainInbound(now time.Time) {
 				continue
 			}
 			if errStr := checkBusError(reply.Payload); errStr != "" {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_error", transferPrepareQuiet)
-				}
 				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr}))
 				s.rpcDiagInbound("call_reply_tx", call, false, errStr, otadiag.KV("sent", sent))
 				if !sent {
@@ -1361,18 +1286,12 @@ func (s *session) drainInbound(now time.Time) {
 			}
 			payload, err := marshalPayload(reply.Payload)
 			if err != nil {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_marshal_failed", transferPrepareQuiet)
-				}
 				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal}))
 				s.rpcDiagInbound("call_reply_tx", call, false, errPayloadMarshal, otadiag.KV("sent", sent))
 				if !sent {
 					return
 				}
 				continue
-			}
-			if call.transferPrepare {
-				s.extendTransferQuiet("prepare_reply_ok", transferPrepareQuiet)
 			}
 			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload}))
 			s.rpcDiagInbound("call_reply_tx", call, true, "", otadiag.KV("sent", sent))
@@ -1386,9 +1305,6 @@ func (s *session) drainInbound(now time.Time) {
 		if !now.Before(call.deadline) {
 			s.conn.Unsubscribe(call.sub)
 			call.sub = nil
-			if call.transferPrepare {
-				s.extendTransferQuiet("prepare_call_timeout", transferPrepareQuiet)
-			}
 			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
 			s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
 			if !sent {
