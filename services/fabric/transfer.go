@@ -169,6 +169,9 @@ func (s *session) nextPendingDeadline(now time.Time) (time.Time, bool) {
 	if s.link == linkUp && !s.rpcReady && !s.exportReadyAt.IsZero() {
 		out, ok = earlierDeadline(out, ok, s.exportReadyAt, true)
 	}
+	if s.link == linkUp && !s.exportDrainAt.IsZero() {
+		out, ok = earlierDeadline(out, ok, s.exportDrainAt, true)
+	}
 	return out, ok
 }
 
@@ -181,8 +184,7 @@ func (s *session) handlePendingDeadline(now time.Time) {
 	s.expireInbound(now)
 	s.expireOutbound(now)
 	s.tickPing(now)
-	s.tickReady(now)
-	s.drainQueuedExports()
+	s.drainBusEvents(now)
 }
 
 func sameTransferTuple(a, b transferMeta) bool {

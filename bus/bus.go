@@ -165,6 +165,7 @@ type Subscription struct {
 	ch    chan *Message
 	bus   *Bus
 	conn  *Connection
+	set   *SubscriptionSet
 }
 
 func (s *Subscription) Topic() Topic             { return s.topic }
@@ -174,6 +175,137 @@ func (s *Subscription) Unsubscribe()             { s.conn.Unsubscribe(s) }
 // Convenience wrapper that replies via the owning connection.
 func (s *Subscription) Reply(to *Message, payload any, retained bool) {
 	s.conn.Reply(to, payload, retained)
+}
+
+// -----------------------------------------------------------------------------
+// SubscriptionSet
+// -----------------------------------------------------------------------------
+
+// SubscriptionSet lets a reactor wait on one readiness channel for several
+// subscriptions without spawning a goroutine per subscription. Readiness is
+// coalesced: once Ready() is signalled, callers should drain the subscriptions
+// they own until no immediate work remains.
+type SubscriptionSet struct {
+	conn   *Connection
+	ready  chan struct{}
+	mu     sync.Mutex
+	subs   []*Subscription
+	closed bool
+}
+
+func (c *Connection) NewSubscriptionSet() *SubscriptionSet {
+	return &SubscriptionSet{
+		conn:  c,
+		ready: make(chan struct{}, 1),
+	}
+}
+
+func (ss *SubscriptionSet) Ready() <-chan struct{} {
+	if ss == nil {
+		return nil
+	}
+	return ss.ready
+}
+
+func (ss *SubscriptionSet) Subscribe(tp Topic) *Subscription {
+	if ss == nil || ss.conn == nil {
+		return nil
+	}
+	ss.mu.Lock()
+	if ss.closed {
+		ss.mu.Unlock()
+		return nil
+	}
+	ss.mu.Unlock()
+	ct := toConcrete(tp)
+	sub := &Subscription{topic: ct, ch: make(chan *Message, ss.conn.bus.qLen), bus: ss.conn.bus, conn: ss.conn, set: ss}
+	ss.conn.bus.addSubscription(ct, sub)
+	ss.conn.mu.Lock()
+	ss.conn.subs = append(ss.conn.subs, sub)
+	ss.conn.mu.Unlock()
+	ss.mu.Lock()
+	if !ss.closed {
+		ss.subs = append(ss.subs, sub)
+	} else {
+		sub.set = nil
+	}
+	ss.mu.Unlock()
+	if sub.set == nil {
+		ss.conn.Unsubscribe(sub)
+		return nil
+	}
+	return sub
+}
+
+func (ss *SubscriptionSet) Request(msg *Message) *Subscription {
+	if ss == nil || ss.conn == nil {
+		return nil
+	}
+	if topicLen(msg.ReplyTo) == 0 {
+		msg.ReplyTo = TNoIntern("_rr", ss.conn.rrCtr.Add(1))
+	}
+	sub := ss.Subscribe(msg.ReplyTo)
+	ss.conn.Publish(msg)
+	return sub
+}
+
+func (ss *SubscriptionSet) Unsubscribe(sub *Subscription) {
+	if ss == nil || sub == nil || ss.conn == nil {
+		return
+	}
+	ss.conn.Unsubscribe(sub)
+}
+
+func (ss *SubscriptionSet) Close() {
+	if ss == nil || ss.conn == nil {
+		return
+	}
+	ss.mu.Lock()
+	if ss.closed {
+		ss.mu.Unlock()
+		return
+	}
+	subs := append([]*Subscription(nil), ss.subs...)
+	ss.subs = nil
+	ss.closed = true
+	close(ss.ready)
+	ss.mu.Unlock()
+	for _, sub := range subs {
+		ss.conn.Unsubscribe(sub)
+	}
+}
+
+func (ss *SubscriptionSet) remove(sub *Subscription) {
+	if ss == nil || sub == nil {
+		return
+	}
+	ss.mu.Lock()
+	ss.subs = removeSub(ss.subs, sub)
+	ss.mu.Unlock()
+}
+
+func (ss *SubscriptionSet) signal() {
+	if ss == nil {
+		return
+	}
+	ss.mu.Lock()
+	ready := ss.ready
+	closed := ss.closed
+	ss.mu.Unlock()
+	if closed || ready == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	select {
+	case ready <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Subscription) signalReady() {
+	if s != nil && s.set != nil {
+		s.set.signal()
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -308,10 +440,12 @@ func drainOne(ch chan *Message) {
 func (b *Bus) tryDeliver(sub *Subscription, msg *Message) {
 	defer func() { _ = recover() }() // channel may be closed; best-effort
 	if trySend(sub.ch, msg) {
+		sub.signalReady()
 		return
 	}
 	drainOne(sub.ch)
 	_ = trySend(sub.ch, msg)
+	sub.signalReady()
 }
 
 // -----------------------------------------------------------------------------
@@ -489,10 +623,19 @@ func (c *Connection) Subscribe(tp Topic) *Subscription {
 }
 
 func (c *Connection) Unsubscribe(sub *Subscription) {
+	if sub == nil {
+		return
+	}
 	c.bus.unsubscribe(sub.topic, sub)
 	c.mu.Lock()
 	c.subs = removeSub(c.subs, sub)
 	c.mu.Unlock()
+	if sub.set != nil {
+		set := sub.set
+		sub.set = nil
+		set.remove(sub)
+	}
+	defer func() { _ = recover() }()
 	close(sub.ch)
 }
 
@@ -504,7 +647,15 @@ func (c *Connection) Disconnect() {
 
 	for _, sub := range subs {
 		c.bus.unsubscribe(sub.topic, sub)
-		close(sub.ch)
+		if sub.set != nil {
+			set := sub.set
+			sub.set = nil
+			set.remove(sub)
+		}
+		func(ch chan *Message) {
+			defer func() { _ = recover() }()
+			close(ch)
+		}(sub.ch)
 	}
 }
 

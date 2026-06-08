@@ -347,3 +347,55 @@ func TestTopic_InvalidTokenPanics(t *testing.T) {
 	// []byte is not comparable, so T should panic
 	_ = T([]byte{1, 2, 3})
 }
+
+func TestSubscriptionSetSignalsForAnyMember(t *testing.T) {
+	b := NewBus(4, "+", "#")
+	c := b.NewConnection("test")
+	ss := c.NewSubscriptionSet()
+	defer ss.Close()
+
+	a := ss.Subscribe(T("a"))
+	bb := ss.Subscribe(T("b"))
+
+	c.Publish(c.NewMessage(T("b"), "bee", false))
+	select {
+	case <-ss.Ready():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for subscription set readiness")
+	}
+
+	select {
+	case m := <-bb.Channel():
+		if m.Payload != "bee" {
+			t.Fatalf("unexpected b payload: %#v", m.Payload)
+		}
+	default:
+		t.Fatal("b subscription was not ready after set signal")
+	}
+
+	select {
+	case m := <-a.Channel():
+		t.Fatalf("unexpected a message: %#v", m)
+	default:
+	}
+}
+
+func TestSubscriptionSetCoalescesReadiness(t *testing.T) {
+	b := NewBus(4, "+", "#")
+	c := b.NewConnection("test")
+	ss := c.NewSubscriptionSet()
+	defer ss.Close()
+
+	sub := ss.Subscribe(T("a"))
+	c.Publish(c.NewMessage(T("a"), "one", false))
+	c.Publish(c.NewMessage(T("a"), "two", false))
+
+	select {
+	case <-ss.Ready():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for first readiness")
+	}
+
+	got := drainPayloads(t, sub, 2)
+	assertUnorderedEqual(t, got, []string{"one", "two"})
+}

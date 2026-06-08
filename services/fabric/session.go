@@ -90,24 +90,6 @@ type readResult struct {
 	err  error
 }
 
-type sessionEventKind uint8
-
-const (
-	sessionEventCriticalExport sessionEventKind = iota + 1
-	sessionEventExport
-	sessionEventOutboundCall
-	sessionEventInboundReply
-)
-
-type sessionEvent struct {
-	kind   sessionEventKind
-	msg    *bus.Message
-	sub    *bus.Subscription
-	idx    int
-	callID string
-	closed bool
-}
-
 type linkStatePayload struct {
 	LinkID            string `json:"link_id"`
 	Status            string `json:"status"`
@@ -149,6 +131,7 @@ type session struct {
 	lastTxAt       time.Time
 	lastPongAt     time.Time
 	exportReadyAt  time.Time
+	exportDrainAt  time.Time
 	exportsEnabled bool
 
 	criticalExportSubs          []*bus.Subscription
@@ -170,7 +153,7 @@ type session struct {
 	completedTransfers          []completedTransfer
 	pendingTargetCall           *pendingTargetCall
 	beginTransfer               func(transferMeta) (transferSink, error)
-	events                      chan sessionEvent
+	busSubs                     *bus.SubscriptionSet
 	ctx                         context.Context
 }
 
@@ -192,7 +175,7 @@ func (s *session) logKV(msg, key, value string) {
 func (s *session) run(ctx context.Context) {
 	s.cfg.applyDefaults()
 	s.ctx = ctx
-	s.events = make(chan sessionEvent, 64)
+	s.busSubs = s.conn.NewSubscriptionSet()
 	lines := make(chan readResult, lineQueueSize)
 
 	go func() {
@@ -249,6 +232,11 @@ func (s *session) run(ctx context.Context) {
 	}()
 
 	defer s.tr.Close()
+	defer func() {
+		if s.busSubs != nil {
+			s.busSubs.Close()
+		}
+	}()
 	defer s.teardownExports()
 	defer s.teardownInbound()
 	defer s.teardownOutbound(reasonLinkDown)
@@ -307,8 +295,11 @@ func (s *session) run(ctx context.Context) {
 		case <-pendingDeadlineCh:
 			s.handlePendingDeadline(time.Now())
 
-		case ev := <-s.events:
-			s.handleSessionEvent(time.Now(), ev)
+		case _, ok := <-s.busReady():
+			if !ok {
+				return
+			}
+			s.drainBusEvents(time.Now())
 
 		case <-waitTick.C:
 			s.logWaiting()
@@ -423,6 +414,7 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.peerSID = ""
 	s.peerProto = ""
 	s.exportReadyAt = time.Time{}
+	s.exportDrainAt = time.Time{}
 	s.exportsEnabled = false
 	s.rpcReady = false
 	s.teardownExports()
@@ -469,6 +461,7 @@ func (s *session) promoteLink(reason string) {
 	s.setupExports()
 	s.exportsEnabled = true
 	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
+	s.exportDrainAt = time.Time{}
 	s.nextPingAt = time.Now().Add(s.cfg.PingInterval)
 	s.log("exports enabled")
 	s.publishLinkState(reason, "")
@@ -512,6 +505,7 @@ func (s *session) tickReady(now time.Time) {
 		return
 	}
 	if !s.criticalExportReplayDrained() {
+		s.scheduleExportDrain(now)
 		return
 	}
 	s.rpcReady = true
@@ -1033,7 +1027,7 @@ func (s *session) onCall(msg *protoCall) {
 	s.rpcDiag("call_dispatch_start", msg, localTopic, "",
 		otadiag.KV("timeout_ms", strconvx.Itoa(int(timeout/time.Millisecond))),
 	)
-	sub := s.conn.Request(busMsg)
+	sub := s.requestBus(busMsg)
 	topicCopy := append([]string(nil), msg.Topic...)
 	call := &inboundCall{
 		id:         msg.ID,
@@ -1044,7 +1038,6 @@ func (s *session) onCall(msg *protoCall) {
 		deadline:   time.Now().Add(timeout),
 	}
 	s.inboundCalls = append(s.inboundCalls, call)
-	s.watchSubscription(sub, sessionEventInboundReply, -1, msg.ID)
 }
 
 func (s *session) onReply(msg *protoReply) {
@@ -1118,73 +1111,55 @@ func marshalPayload(payload any) (json.RawMessage, error) {
 // Exports are drained inline in the main loop (no extra goroutines)
 // to avoid TinyGo cooperative scheduler mutex panics.
 
-func (s *session) watchSubscription(sub *bus.Subscription, kind sessionEventKind, idx int, callID string) {
-	if sub == nil || s.ctx == nil || s.events == nil {
-		return
+func (s *session) busReady() <-chan struct{} {
+	if s.busSubs == nil {
+		return nil
 	}
-	ctx := s.ctx
-	go func() {
-		for {
-			select {
-			case m, ok := <-sub.Channel():
-				ev := sessionEvent{kind: kind, sub: sub, idx: idx, callID: callID, msg: m, closed: !ok}
-				select {
-				case s.events <- ev:
-				case <-ctx.Done():
-				}
-				if !ok {
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	return s.busSubs.Ready()
 }
 
-func (s *session) handleSessionEvent(now time.Time, ev sessionEvent) {
-	switch ev.kind {
-	case sessionEventCriticalExport:
-		if ev.closed || ev.msg == nil {
-			return
-		}
-		s.handleCriticalExportEvent(ev.idx, ev.msg)
-		s.tickReady(now)
-	case sessionEventExport:
-		if ev.closed || ev.msg == nil {
-			return
-		}
-		s.handleExportEvent(ev.msg)
-	case sessionEventOutboundCall:
-		if ev.closed || ev.msg == nil {
-			return
-		}
-		s.handleOutboundCallEvent(now, ev.msg)
-	case sessionEventInboundReply:
-		s.handleInboundReplyEvent(ev.callID, ev.msg, ev.closed)
+func (s *session) subscribeBus(tp bus.Topic) *bus.Subscription {
+	if s.busSubs == nil {
+		return s.conn.Subscribe(tp)
 	}
+	return s.busSubs.Subscribe(tp)
+}
+
+func (s *session) requestBus(msg *bus.Message) *bus.Subscription {
+	if s.busSubs == nil {
+		return s.conn.Request(msg)
+	}
+	return s.busSubs.Request(msg)
+}
+
+func (s *session) drainBusEvents(now time.Time) {
+	// A single bus readiness edge may cover several subscriptions.  Drain each
+	// class without blocking; export drains retain their quota and will be
+	// resumed by the export-ready timer when work remains.
+	s.drainExports()
+	s.drainOutboundMessages(now)
+	s.drainInbound(now)
+	s.tickReady(now)
+	s.drainQueuedExports()
 }
 
 func (s *session) setupExports() {
 	if s.conn == nil {
 		return
 	}
-	for i, p := range criticalExportTopics {
-		sub := s.conn.Subscribe(p)
+	for _, p := range criticalExportTopics {
+		sub := s.subscribeBus(p)
 		s.criticalExportSubs = append(s.criticalExportSubs, sub)
 		s.criticalExportReplayPending = append(s.criticalExportReplayPending, true)
 		s.criticalExportPendingMsgs = append(s.criticalExportPendingMsgs, nil)
-		s.watchSubscription(sub, sessionEventCriticalExport, i, "")
 	}
 	for _, p := range exportPatterns() {
-		sub := s.conn.Subscribe(p)
+		sub := s.subscribeBus(p)
 		s.exportSubs = append(s.exportSubs, sub)
-		s.watchSubscription(sub, sessionEventExport, -1, "")
 	}
 	for _, p := range exportCallPatterns() {
-		sub := s.conn.Subscribe(p)
+		sub := s.subscribeBus(p)
 		s.exportCallSubs = append(s.exportCallSubs, sub)
-		s.watchSubscription(sub, sessionEventOutboundCall, -1, "")
 	}
 }
 
@@ -1381,7 +1356,8 @@ func (s *session) handleExportEvent(m *bus.Message) {
 }
 
 func (s *session) drainQueuedExports() {
-	if !s.exportCanSend(time.Now()) {
+	now := time.Now()
+	if !s.exportCanSend(now) {
 		return
 	}
 	for i, m := range s.criticalExportPendingMsgs {
@@ -1398,6 +1374,7 @@ func (s *session) drainQueuedExports() {
 		}
 	}
 	if !s.criticalExportReplayDrained() {
+		s.scheduleExportDrain(now)
 		return
 	}
 	for len(s.exportPendingMsgs) > 0 {
@@ -1414,13 +1391,21 @@ func (s *session) drainQueuedExports() {
 	}
 }
 
+func (s *session) scheduleExportDrain(now time.Time) {
+	when := now.Add(time.Millisecond)
+	if s.exportDrainAt.IsZero() || when.Before(s.exportDrainAt) {
+		s.exportDrainAt = when
+	}
+}
+
 // drainExports does a non-blocking read of each export subscription
 // and writes any messages to the wire. Called from the main loop.
 func (s *session) drainExports() {
+	now := time.Now()
+	s.exportDrainAt = time.Time{}
 	if s.link != linkUp {
 		return
 	}
-	now := time.Now()
 	if !s.exportsEnabled {
 		return
 	}
@@ -1432,11 +1417,13 @@ func (s *session) drainExports() {
 		return
 	}
 	if !s.criticalExportReplayDrained() {
+		s.scheduleExportDrain(now)
 		return
 	}
 	for _, sub := range s.exportSubs {
 		for {
 			if total >= exportMaxPerTick {
+				s.scheduleExportDrain(now)
 				return
 			}
 			select {
@@ -1529,9 +1516,9 @@ func (s *session) expireInbound(now time.Time) {
 }
 
 func (s *session) drainInbound(now time.Time) {
-	// Test/support path: the reactor receives inbound replies through
-	// sessionEventInboundReply.  Direct calls still drain ready replies so
-	// unit tests can exercise the reducer without running the event loop.
+	// Reactor path: bus readiness is coalesced by SubscriptionSet, then this
+	// reducer drains all ready inbound replies without blocking. Direct calls
+	// still let unit tests exercise the reducer without running the event loop.
 	calls := append([]*inboundCall(nil), s.inboundCalls...)
 	for _, call := range calls {
 		if call == nil || call.sub == nil {
@@ -1598,7 +1585,25 @@ func (s *session) expireOutbound(now time.Time) {
 	s.outboundCalls = keep
 }
 
-func (s *session) drainOutbound(now time.Time) { s.expireOutbound(now) }
+func (s *session) drainOutboundMessages(now time.Time) {
+	for _, sub := range s.exportCallSubs {
+		for {
+			select {
+			case msg, ok := <-sub.Channel():
+				if !ok || msg == nil {
+					goto nextSub
+				}
+				s.handleOutboundCallEvent(now, msg)
+			default:
+				goto nextSub
+			}
+		}
+	nextSub:
+	}
+	s.expireOutbound(now)
+}
+
+func (s *session) drainOutbound(now time.Time) { s.drainOutboundMessages(now) }
 
 // ---- transport write ----
 
