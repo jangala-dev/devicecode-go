@@ -283,8 +283,8 @@ func (s *session) run(ctx context.Context) {
 				resetTimer(stale, s.cfg.LivenessTimeout)
 			}
 
-		case err := <-s.pendingChunkReady():
-			s.finishChunkWrite(time.Now(), err)
+		case res := <-s.pendingChunkReady():
+			s.finishChunkWrite(time.Now(), res)
 
 		case res := <-s.pendingCommitReady():
 			s.finishTransferCommit(time.Now(), res)

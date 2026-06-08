@@ -3,6 +3,7 @@ package fabric
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"runtime"
 	"strings"
 	"time"
@@ -58,7 +59,7 @@ type transferSink interface {
 
 type incomingTransfer struct {
 	meta                   transferMeta
-	sink                   transferSink
+	worker                 *transferSinkWorker
 	bytesWritten           uint32
 	chunksSeen             uint32
 	hasher                 *xxhash.Hasher
@@ -81,7 +82,11 @@ type pendingChunkWrite struct {
 	offset   uint32
 	data     []byte
 	started  time.Time
-	resultCh chan error
+	resultCh chan transferChunkResult
+}
+
+type transferChunkResult struct {
+	err error
 }
 
 type pendingTransferCommit struct {
@@ -93,6 +98,189 @@ type pendingTransferCommit struct {
 type transferCommitResult struct {
 	info transferInfo
 	err  error
+}
+
+type transferSinkCommandKind uint8
+
+const (
+	transferSinkCommandWrite transferSinkCommandKind = iota + 1
+	transferSinkCommandCommit
+	transferSinkCommandAbort
+)
+
+type transferSinkCommand struct {
+	kind         transferSinkCommandKind
+	xferID       string
+	offset       uint32
+	data         []byte
+	reason       string
+	timeout      time.Duration
+	chunkResult  chan<- transferChunkResult
+	commitResult chan<- transferCommitResult
+}
+
+type transferSinkWorker struct {
+	xferID string
+	cmdCh  chan transferSinkCommand
+}
+
+func newTransferSinkWorker(xferID string, sink transferSink) *transferSinkWorker {
+	w := &transferSinkWorker{
+		xferID: xferID,
+		cmdCh:  make(chan transferSinkCommand, 1),
+	}
+	go w.run(sink)
+	return w
+}
+
+func (w *transferSinkWorker) write(xferID string, offset uint32, data []byte, timeout time.Duration, result chan<- transferChunkResult) bool {
+	return w.send(transferSinkCommand{
+		kind:        transferSinkCommandWrite,
+		xferID:      xferID,
+		offset:      offset,
+		data:        data,
+		timeout:     timeout,
+		chunkResult: result,
+	})
+}
+
+func (w *transferSinkWorker) commit(xferID string, timeout time.Duration, result chan<- transferCommitResult) bool {
+	return w.send(transferSinkCommand{
+		kind:         transferSinkCommandCommit,
+		xferID:       xferID,
+		timeout:      timeout,
+		commitResult: result,
+	})
+}
+
+func (w *transferSinkWorker) abort(reason string) bool {
+	if reason == "" {
+		reason = "abort"
+	}
+	return w.send(transferSinkCommand{
+		kind:   transferSinkCommandAbort,
+		xferID: w.xferID,
+		reason: reason,
+	})
+}
+
+func (w *transferSinkWorker) send(cmd transferSinkCommand) bool {
+	select {
+	case w.cmdCh <- cmd:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *transferSinkWorker) run(sink transferSink) {
+	for cmd := range w.cmdCh {
+		switch cmd.kind {
+		case transferSinkCommandWrite:
+			if !w.runWrite(sink, cmd) {
+				return
+			}
+		case transferSinkCommandCommit:
+			w.runCommit(sink, cmd)
+			return
+		case transferSinkCommandAbort:
+			_ = sink.Abort(cmd.reason)
+			return
+		}
+	}
+}
+
+func (w *transferSinkWorker) runWrite(sink transferSink, cmd transferSinkCommand) bool {
+	opDone := make(chan error, 1)
+	go func() {
+		opDone <- sink.WriteChunk(cmd.offset, cmd.data)
+	}()
+	timer, timerCh := newOptionalWorkerTimer(cmd.timeout)
+	defer stopOptionalWorkerTimer(timer)
+
+	select {
+	case err := <-opDone:
+		if err != nil {
+			_ = sink.Abort(err.Error())
+			cmd.chunkResult <- transferChunkResult{err: err}
+			return false
+		}
+		gcStart := time.Now()
+		next := cmd.offset + uint32(len(cmd.data))
+		otadiag.Event("[fabric-xfer]", "gc_start", cmd.xferID, otadiag.KV("next", u32s(next)))
+		runtime.GC()
+		otadiag.Event(
+			"[fabric-xfer]", "gc_done", cmd.xferID,
+			otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
+			otadiag.KV("next", next),
+		)
+		cmd.chunkResult <- transferChunkResult{}
+		return true
+	case <-timerCh:
+		reason := "chunk_write_timeout"
+		cmd.chunkResult <- transferChunkResult{err: errors.New(reason)}
+		<-opDone
+		_ = sink.Abort(reason)
+		return false
+	case abort := <-w.cmdCh:
+		if abort.kind != transferSinkCommandAbort {
+			cmd.chunkResult <- transferChunkResult{err: errors.New("transfer_worker_protocol_error")}
+			return false
+		}
+		<-opDone
+		_ = sink.Abort(abort.reason)
+		return false
+	}
+}
+
+func (w *transferSinkWorker) runCommit(sink transferSink, cmd transferSinkCommand) {
+	opDone := make(chan transferCommitResult, 1)
+	go func() {
+		info, err := sink.Commit()
+		opDone <- transferCommitResult{info: info, err: err}
+	}()
+	timer, timerCh := newOptionalWorkerTimer(cmd.timeout)
+	defer stopOptionalWorkerTimer(timer)
+
+	select {
+	case res := <-opDone:
+		if res.err != nil {
+			_ = sink.Abort(res.err.Error())
+		}
+		cmd.commitResult <- res
+	case <-timerCh:
+		reason := "transfer_commit_timeout"
+		cmd.commitResult <- transferCommitResult{err: errors.New(reason)}
+		<-opDone
+		_ = sink.Abort(reason)
+	case abort := <-w.cmdCh:
+		if abort.kind != transferSinkCommandAbort {
+			cmd.commitResult <- transferCommitResult{err: errors.New("transfer_worker_protocol_error")}
+			return
+		}
+		<-opDone
+		_ = sink.Abort(abort.reason)
+	}
+}
+
+func newOptionalWorkerTimer(d time.Duration) (*time.Timer, <-chan time.Time) {
+	if d <= 0 {
+		return nil, nil
+	}
+	t := time.NewTimer(d)
+	return t, t.C
+}
+
+func stopOptionalWorkerTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }
 
 type completedTransfer struct {
@@ -107,7 +295,7 @@ type pendingTargetCall struct {
 	deadline time.Time
 }
 
-func (s *session) pendingChunkReady() <-chan error {
+func (s *session) pendingChunkReady() <-chan transferChunkResult {
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingChunk == nil {
 		return nil
@@ -147,7 +335,7 @@ func earlierDeadline(a time.Time, aOK bool, b time.Time, bOK bool) (time.Time, b
 func (s *session) nextPendingDeadline(now time.Time) (time.Time, bool) {
 	var out time.Time
 	var ok bool
-	if cur := s.incomingTransfer; cur != nil && !cur.deadline.IsZero() {
+	if cur := s.incomingTransfer; cur != nil && cur.pendingChunk == nil && cur.pendingCommit == nil && !cur.deadline.IsZero() {
 		out, ok = earlierDeadline(out, ok, cur.deadline, true)
 	}
 	if call := s.pendingTargetCall; call != nil && !call.deadline.IsZero() {
@@ -282,9 +470,18 @@ func (s *session) abortTransfer(reason string) {
 	}
 	otadiag.Event("[fabric-xfer]", "abort_local", cur.meta.ID, otadiag.KV("reason", reason))
 	otadiag.StopUpdateWindow(reason)
-	if err := cur.sink.Abort(reason); err != nil {
-		s.logKV("transfer abort failed", "err", err.Error())
+	if cur.worker != nil && !cur.worker.abort(reason) {
+		s.logKV("transfer abort enqueue failed", "reason", reason)
 	}
+}
+
+func (s *session) clearTransferAfterWorkerFailure(reason string) {
+	cur := s.clearTransfer()
+	if cur == nil {
+		return
+	}
+	otadiag.Event("[fabric-xfer]", "abort_local", cur.meta.ID, otadiag.KV("reason", reason), otadiag.KV("worker_owned", true))
+	otadiag.StopUpdateWindow(reason)
 }
 
 // checkTransferTimeout enforces the idle-chunk watchdog. Fires once per
@@ -300,18 +497,11 @@ func (s *session) checkTransferTimeout(now time.Time) {
 	if !now.After(cur.deadline) {
 		return
 	}
-	if cur.pendingChunk != nil {
-		id := cur.meta.ID
-		s.abortTransfer("chunk_write_timeout")
-		abortOK := s.sendTransferAbort(id, "chunk_write_timeout")
-		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "chunk_write_timeout"), otadiag.KV("ok", abortOK))
-		return
-	}
-	if cur.pendingCommit != nil {
-		id := cur.meta.ID
-		s.abortTransfer("transfer_commit_timeout")
-		abortOK := s.sendTransferAbort(id, "transfer_commit_timeout")
-		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "transfer_commit_timeout"), otadiag.KV("ok", abortOK))
+	if cur.pendingChunk != nil || cur.pendingCommit != nil {
+		// Pending sink operations own their own deadlines.  The worker reports a
+		// timeout event to the reactor, then aborts the sink after the in-flight
+		// sink method reaches a safe point.  The reactor must not call Abort while
+		// WriteChunk or Commit may still be executing.
 		return
 	}
 	if cur.idleRetries < transferIdleRetryLimit {
@@ -529,7 +719,7 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 	)
 	s.incomingTransfer = &incomingTransfer{
 		meta:     meta,
-		sink:     sink,
+		worker:   newTransferSinkWorker(meta.ID, sink),
 		hasher:   xxhash.New(0),
 		deadline: now.Add(s.cfg.PhaseTimeout),
 	}
@@ -544,8 +734,7 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 }
 
 func (s *session) startPendingChunkWrite(cur *incomingTransfer, offset uint32, raw []byte) {
-	ch := make(chan error, 1)
-	sink := cur.sink
+	ch := make(chan transferChunkResult, 1)
 	data := raw
 	started := time.Now()
 	cur.pendingChunk = &pendingChunkWrite{
@@ -555,28 +744,27 @@ func (s *session) startPendingChunkWrite(cur *incomingTransfer, offset uint32, r
 		started:  started,
 		resultCh: ch,
 	}
-	cur.deadline = started.Add(s.cfg.PhaseTimeout)
-	go func() {
-		ch <- sink.WriteChunk(offset, data)
-	}()
+	if cur.worker == nil || !cur.worker.write(cur.meta.ID, offset, data, s.cfg.PhaseTimeout, ch) {
+		ch <- transferChunkResult{err: errors.New("transfer_worker_busy")}
+	}
 }
 
-func (s *session) finishChunkWrite(now time.Time, err error) {
+func (s *session) finishChunkWrite(now time.Time, res transferChunkResult) {
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingChunk == nil {
 		return
 	}
 	pending := cur.pendingChunk
 	cur.pendingChunk = nil
-	if err != nil {
-		reason := err.Error()
+	if res.err != nil {
+		reason := res.err.Error()
 		otadiag.Event(
 			"[fabric-xfer]", "sink_write_error", pending.xferID,
 			otadiag.KV("reason", reason),
 			otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
 		)
 		s.logKV("transfer write failed", "err", reason)
-		s.abortTransfer(reason)
+		s.clearTransferAfterWorkerFailure(reason)
 		abortOK := s.sendTransferAbort(pending.xferID, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
@@ -594,17 +782,6 @@ func (s *session) finishChunkWrite(now time.Time, err error) {
 		otadiag.KV("next", u32s(cur.bytesWritten)),
 	)
 	pending.data = nil
-	// Keep transfer memory bounded on TinyGo. The receiver allocates while
-	// unmarshalling JSON and decoding base64 chunks; without regular collection
-	// long updates can run out of heap before commit.
-	gcStart := time.Now()
-	otadiag.Event("[fabric-xfer]", "gc_start", pending.xferID, otadiag.KV("next", u32s(cur.bytesWritten)))
-	runtime.GC()
-	otadiag.Event(
-		"[fabric-xfer]", "gc_done", pending.xferID,
-		otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
-		otadiag.KV("next", cur.bytesWritten),
-	)
 	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 	otadiag.Event(
 		"[fabric-xfer]", "need_tx", cur.meta.ID,
@@ -626,18 +803,15 @@ func (s *session) finishChunkWrite(now time.Time, err error) {
 
 func (s *session) startPendingTransferCommit(cur *incomingTransfer) {
 	ch := make(chan transferCommitResult, 1)
-	sink := cur.sink
 	started := time.Now()
 	cur.pendingCommit = &pendingTransferCommit{
 		xferID:   cur.meta.ID,
 		started:  started,
 		resultCh: ch,
 	}
-	cur.deadline = started.Add(s.cfg.TargetCallTimeout)
-	go func() {
-		info, err := sink.Commit()
-		ch <- transferCommitResult{info: info, err: err}
-	}()
+	if cur.worker == nil || !cur.worker.commit(cur.meta.ID, s.cfg.TargetCallTimeout, ch) {
+		ch <- transferCommitResult{err: errors.New("transfer_worker_busy")}
+	}
 }
 
 func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) {
@@ -650,7 +824,7 @@ func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) 
 	if res.err != nil {
 		reason := res.err.Error()
 		s.logKV("transfer commit failed", "err", reason)
-		s.abortTransfer(reason)
+		s.clearTransferAfterWorkerFailure(reason)
 		abortOK := s.sendTransferAbort(pending.xferID, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return

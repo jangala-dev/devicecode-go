@@ -65,6 +65,23 @@ func (s *fakeTransferSink) Abort(reason string) error {
 	return nil
 }
 
+func waitAbortReason(t *testing.T, sink *fakeTransferSink, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if len(sink.abortReasons) > 0 {
+			if want != "" && sink.abortReasons[0] != want {
+				t.Fatalf("sink.Abort reasons = %v, want %q", sink.abortReasons, want)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for sink.Abort(%q); reasons=%v", want, sink.abortReasons)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 type diagCapture struct {
 	mu    sync.Mutex
 	lines []string
@@ -731,9 +748,9 @@ func TestTransferAcceptedChunkEmitsProcessingDiagnostics(t *testing.T) {
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_decode_done", "ok true", "raw_len 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_digest_done", "ok true"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_start", "offset 0", "raw_len 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_done", "next 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_start", "next 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_done", "next 4"},
+		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_done", "next 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev need_tx", "next 4", "ok true", "accepted true"},
 	)
 	assertDiagNotContains(t, diag.snapshot(), "[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev transfer_mem_sample")
@@ -918,7 +935,7 @@ func TestTransferStaleLowerOffsetDoesNotRefreshPhaseDeadline(t *testing.T) {
 		cfg: LinkConfig{PhaseTimeout: time.Second},
 		incomingTransfer: &incomingTransfer{
 			meta:         transferMeta{ID: "xfer-stale-deadline", Size: 6},
-			sink:         sink,
+			worker:       newTransferSinkWorker("xfer-stale-deadline", sink),
 			bytesWritten: 3,
 			deadline:     oldDeadline,
 		},
@@ -953,7 +970,7 @@ func TestTransferCurrentCorruptChunkRefreshesLinkLiveness(t *testing.T) {
 		cfg:      LinkConfig{PhaseTimeout: time.Second},
 		incomingTransfer: &incomingTransfer{
 			meta:     transferMeta{ID: "xfer-corrupt-liveness", Size: 4},
-			sink:     &fakeTransferSink{},
+			worker:   newTransferSinkWorker("xfer-corrupt-liveness", &fakeTransferSink{}),
 			deadline: time.Now().Add(time.Second),
 		},
 	}
@@ -1048,9 +1065,7 @@ func TestTransferChunkMissingDigestRetriesThenAborts(t *testing.T) {
 		Data:   rawURL(payload),
 	})
 	readTransferAbort(t, cm5, "xfer-missing-digest", "bad_message")
-	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink.Abort on missing chunk digest")
-	}
+	waitAbortReason(t, sink, "bad_message")
 }
 
 func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
@@ -1085,9 +1100,7 @@ func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
 		ChunkDigest: xxhashStr(payload),
 	})
 	readTransferAbort(t, cm5, "xfer-bad-b64", "invalid_chunk_encoding")
-	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "invalid_chunk_encoding" {
-		t.Fatalf("sink.Abort reasons = %v, want invalid_chunk_encoding", sink.abortReasons)
-	}
+	waitAbortReason(t, sink, "invalid_chunk_encoding")
 }
 
 func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
@@ -1241,7 +1254,7 @@ func TestTransferMalformedWrongXferIDDoesNotChargeActiveTransfer(t *testing.T) {
 				tr:   tr,
 				incomingTransfer: &incomingTransfer{
 					meta:     transferMeta{ID: activeID},
-					sink:     sink,
+					worker:   newTransferSinkWorker(activeID, sink),
 					deadline: time.Now().Add(time.Second),
 				},
 			}
@@ -1461,9 +1474,7 @@ func TestTransferCommitDigestMismatchAborts(t *testing.T) {
 	if abort.Type != msgXferAbort || abort.Err != "digest_mismatch" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
-	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink abort on digest mismatch")
-	}
+	waitAbortReason(t, sink, "digest_mismatch")
 }
 
 func TestTransferTargetInvokedAfterCommit(t *testing.T) {
@@ -1776,9 +1787,7 @@ func TestTransferIdleChunkWatchdog(t *testing.T) {
 	if abort.Type != msgXferAbort || abort.XferID != "xfer-wd" || abort.Err != "timeout" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
-	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "timeout" {
-		t.Fatalf("sink.Abort reasons = %v, want [\"timeout\"]", sink.abortReasons)
-	}
+	waitAbortReason(t, sink, "timeout")
 }
 
 func TestTransferCommitDigestMismatchOnCommitFrameAborts(t *testing.T) {

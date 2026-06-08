@@ -426,8 +426,8 @@ func TestDuplicateSameSIDHelloRefreshesWithoutReset(t *testing.T) {
 		peerSID:  "s1",
 		peerNode: "bigbox-cm5",
 		incomingTransfer: &incomingTransfer{
-			meta: transferMeta{ID: "xfer-1"},
-			sink: sink,
+			meta:   transferMeta{ID: "xfer-1"},
+			worker: newTransferSinkWorker("xfer-1", sink),
 		},
 	}
 
@@ -463,8 +463,8 @@ func TestDuplicateSameSIDHelloAckRefreshesWithoutReset(t *testing.T) {
 		peerSID:  "s1",
 		peerNode: "bigbox-cm5",
 		incomingTransfer: &incomingTransfer{
-			meta: transferMeta{ID: "xfer-1"},
-			sink: sink,
+			meta:   transferMeta{ID: "xfer-1"},
+			worker: newTransferSinkWorker("xfer-1", sink),
 		},
 	}
 
