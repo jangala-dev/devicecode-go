@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"runtime"
 	"strings"
 	"time"
 
@@ -19,7 +18,6 @@ const transferTargetUpdaterMain = "updater/main"
 const transferIdleRetryLimit = 3
 const transferCorruptRetryLimit = 3
 const completedTransferCacheLimit = 4
-const transferMemSampleStride = 64 * 1024
 
 // transferMeta captures xfer_begin contents. The transfer target is explicit
 // on the wire; firmware update uses target="updater/main". meta remains opaque
@@ -40,6 +38,13 @@ type transferInfo struct {
 	BytesWritten uint32
 	SlotXIPAddr  uint32
 	Generation   uint64
+	cancel       func(reason string)
+}
+
+func (i transferInfo) cancelStage(reason string) {
+	if i.cancel != nil {
+		i.cancel(reason)
+	}
 }
 
 // transferSink is the firmware-side write target for an incoming transfer.
@@ -191,96 +196,39 @@ func (w *transferSinkWorker) run(sink transferSink) {
 }
 
 func (w *transferSinkWorker) runWrite(sink transferSink, cmd transferSinkCommand) bool {
-	opDone := make(chan error, 1)
-	go func() {
-		opDone <- sink.WriteChunk(cmd.offset, cmd.data)
-	}()
-	timer, timerCh := newOptionalWorkerTimer(cmd.timeout)
-	defer stopOptionalWorkerTimer(timer)
-
-	select {
-	case err := <-opDone:
-		if err != nil {
-			_ = sink.Abort(err.Error())
-			cmd.chunkResult <- transferChunkResult{err: err}
-			return false
-		}
-		gcStart := time.Now()
-		next := cmd.offset + uint32(len(cmd.data))
-		otadiag.Event("[fabric-xfer]", "gc_start", cmd.xferID, otadiag.KV("next", u32s(next)))
-		runtime.GC()
-		otadiag.Event(
-			"[fabric-xfer]", "gc_done", cmd.xferID,
-			otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
-			otadiag.KV("next", next),
-		)
-		cmd.chunkResult <- transferChunkResult{}
-		return true
-	case <-timerCh:
-		reason := "chunk_write_timeout"
-		cmd.chunkResult <- transferChunkResult{err: errors.New(reason)}
-		<-opDone
-		_ = sink.Abort(reason)
-		return false
-	case abort := <-w.cmdCh:
-		if abort.kind != transferSinkCommandAbort {
-			cmd.chunkResult <- transferChunkResult{err: errors.New("transfer_worker_protocol_error")}
-			return false
-		}
-		<-opDone
-		_ = sink.Abort(abort.reason)
+	start := time.Now()
+	err := sink.WriteChunk(cmd.offset, cmd.data)
+	if err != nil {
+		_ = sink.Abort(err.Error())
+		cmd.chunkResult <- transferChunkResult{err: err}
 		return false
 	}
+	if cmd.timeout > 0 && time.Since(start) > cmd.timeout {
+		reason := "chunk_write_timeout"
+		_ = sink.Abort(reason)
+		cmd.chunkResult <- transferChunkResult{err: errors.New(reason)}
+		return false
+	}
+	cmd.chunkResult <- transferChunkResult{}
+	return true
 }
 
 func (w *transferSinkWorker) runCommit(sink transferSink, cmd transferSinkCommand) {
-	opDone := make(chan transferCommitResult, 1)
-	go func() {
-		info, err := sink.Commit()
-		opDone <- transferCommitResult{info: info, err: err}
-	}()
-	timer, timerCh := newOptionalWorkerTimer(cmd.timeout)
-	defer stopOptionalWorkerTimer(timer)
-
-	select {
-	case res := <-opDone:
-		if res.err != nil {
-			_ = sink.Abort(res.err.Error())
-		}
+	start := time.Now()
+	info, err := sink.Commit()
+	res := transferCommitResult{info: info, err: err}
+	if err != nil {
+		_ = sink.Abort(err.Error())
 		cmd.commitResult <- res
-	case <-timerCh:
-		reason := "transfer_commit_timeout"
-		cmd.commitResult <- transferCommitResult{err: errors.New(reason)}
-		<-opDone
-		_ = sink.Abort(reason)
-	case abort := <-w.cmdCh:
-		if abort.kind != transferSinkCommandAbort {
-			cmd.commitResult <- transferCommitResult{err: errors.New("transfer_worker_protocol_error")}
-			return
-		}
-		<-opDone
-		_ = sink.Abort(abort.reason)
-	}
-}
-
-func newOptionalWorkerTimer(d time.Duration) (*time.Timer, <-chan time.Time) {
-	if d <= 0 {
-		return nil, nil
-	}
-	t := time.NewTimer(d)
-	return t, t.C
-}
-
-func stopOptionalWorkerTimer(t *time.Timer) {
-	if t == nil {
 		return
 	}
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
+	if cmd.timeout > 0 && time.Since(start) > cmd.timeout {
+		reason := "transfer_commit_timeout"
+		info.cancelStage(reason)
+		cmd.commitResult <- transferCommitResult{err: errors.New(reason)}
+		return
 	}
+	cmd.commitResult <- res
 }
 
 type completedTransfer struct {
@@ -409,45 +357,52 @@ func u32s(v uint32) string {
 	return strconvx.Itoa(int(v))
 }
 
-func decodeChunkData(encoded string) ([]byte, string) {
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+func (s *session) decodeChunkData(encoded string) ([]byte, string) {
+	s.buffers = ensureFabricBuffers(s.buffers)
+	maxAccepted := int(s.cfg.MaxAcceptedChunkSize)
+	if maxAccepted <= 0 || maxAccepted > len(s.buffers.ChunkRaw) {
+		maxAccepted = len(s.buffers.ChunkRaw)
+	}
+	if len(encoded) > len(s.buffers.ChunkB64) {
+		return nil, "chunk_too_large"
+	}
+	decodedLen := base64.RawURLEncoding.DecodedLen(len(encoded))
+	if decodedLen > maxAccepted {
+		return nil, "chunk_too_large"
+	}
+	copy(s.buffers.ChunkB64[:], encoded)
+	raw := s.buffers.ChunkRaw[:maxAccepted]
+	n, err := base64.RawURLEncoding.Decode(raw, s.buffers.ChunkB64[:len(encoded)])
 	if err != nil {
 		return nil, "invalid_chunk_encoding"
 	}
-	if base64.RawURLEncoding.EncodeToString(raw) != encoded {
+	encLen := base64.RawURLEncoding.EncodedLen(n)
+	if encLen != len(encoded) || encLen > len(s.buffers.ChunkB64) {
 		return nil, "invalid_chunk_encoding"
 	}
-	return raw, ""
+	base64.RawURLEncoding.Encode(s.buffers.ChunkB64[:encLen], raw[:n])
+	for i := 0; i < encLen; i++ {
+		if s.buffers.ChunkB64[i] != encoded[i] {
+			return nil, "invalid_chunk_encoding"
+		}
+	}
+	return raw[:n], ""
 }
 
 func (s *session) sendTransferReady(id string) bool {
-	return s.sendControl(marshal(protoXferReady{
-		Type:   msgXferReady,
-		XferID: id,
-	}))
+	return s.sendControl(marshalXferReady(id))
 }
 
 func (s *session) sendTransferNeed(id string, next uint32) bool {
-	return s.sendControl(marshal(protoXferNeed{
-		Type:   msgXferNeed,
-		XferID: id,
-		Next:   next,
-	}))
+	return s.sendControl(marshalXferNeed(id, next))
 }
 
 func (s *session) sendTransferDone(id string) bool {
-	return s.sendControl(marshal(protoXferDone{
-		Type:   msgXferDone,
-		XferID: id,
-	}))
+	return s.sendControl(marshalXferDone(id))
 }
 
 func (s *session) sendTransferAbort(id, reason string) bool {
-	return s.sendControl(marshal(protoXferAbort{
-		Type:   msgXferAbort,
-		XferID: id,
-		Err:    reason,
-	}))
+	return s.sendControl(marshalXferAbort(id, reason))
 }
 
 func (s *session) clearTransfer() *incomingTransfer {
@@ -464,6 +419,7 @@ func (s *session) clearTransfer() *incomingTransfer {
 }
 
 func (s *session) abortTransfer(reason string) {
+	s.counters.TransferAborts++
 	cur := s.clearTransfer()
 	if cur == nil {
 		return
@@ -505,6 +461,7 @@ func (s *session) checkTransferTimeout(now time.Time) {
 		return
 	}
 	if cur.idleRetries < transferIdleRetryLimit {
+		s.counters.TransferOffsetRetries++
 		cur.idleRetries++
 		cur.deadline = now.Add(s.cfg.PhaseTimeout)
 		s.logKV("transfer idle retry", "offset", u32s(cur.bytesWritten))
@@ -534,6 +491,7 @@ func (s *session) retryCorruptTransferFrame(reason string) bool {
 		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return false
 	}
+	s.counters.TransferOffsetRetries++
 	cur.corruptRetriesAtOffset++
 	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 	otadiag.Event(
@@ -692,7 +650,9 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 	}
 	beginFn := s.beginTransfer
 	if beginFn == nil {
-		beginFn = beginTransfer
+		beginFn = func(meta transferMeta) (transferSink, error) {
+			return beginUpdaterTransfer(s.stageController, meta)
+		}
 	}
 	beginStart := time.Now()
 	otadiag.Event(
@@ -717,6 +677,7 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		"[fabric-xfer]", "begin_transfer_done", meta.ID,
 		otadiag.KV("dur_ms", int(time.Since(beginStart)/time.Millisecond)),
 	)
+	s.counters.TransferBegins++
 	s.incomingTransfer = &incomingTransfer{
 		meta:     meta,
 		worker:   newTransferSinkWorker(meta.ID, sink),
@@ -772,6 +733,8 @@ func (s *session) finishChunkWrite(now time.Time, res transferChunkResult) {
 	_, _ = cur.hasher.Write(pending.data)
 	cur.bytesWritten += uint32(len(pending.data))
 	cur.chunksSeen++
+	s.counters.TransferChunks++
+	s.counters.TransferBytes += uint64(len(pending.data))
 	cur.idleRetries = 0
 	cur.corruptRetryOffset = cur.bytesWritten
 	cur.corruptRetriesAtOffset = 0
@@ -789,16 +752,6 @@ func (s *session) finishChunkWrite(now time.Time, res transferChunkResult) {
 		otadiag.KV("ok", needOK),
 		otadiag.KV("accepted", true),
 	)
-	if cur.bytesWritten != 0 && cur.bytesWritten%transferMemSampleStride == 0 {
-		var ms runtime.MemStats
-		runtime.ReadMemStats(&ms)
-		otadiag.Event(
-			"[fabric-xfer]", "transfer_mem_sample", cur.meta.ID,
-			otadiag.KV("next", cur.bytesWritten),
-			otadiag.KV("alloc", ms.Alloc),
-			otadiag.KV("heap", ms.HeapSys),
-		)
-	}
 }
 
 func (s *session) startPendingTransferCommit(cur *incomingTransfer) {
@@ -836,7 +789,7 @@ func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) 
 		otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
 	)
 	if reason := s.startTransferTargetCall(meta, pending.xferID, res.info); reason != "" {
-		updater.CancelStreamedStage(pending.xferID, res.info.Generation, reason)
+		res.info.cancelStage(reason)
 		abortOK := s.sendTransferAbort(pending.xferID, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", pending.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 	}
@@ -898,8 +851,9 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 		return
 	}
 	decodeStart := time.Now()
-	raw, errStr := decodeChunkData(msg.Data)
+	raw, errStr := s.decodeChunkData(msg.Data)
 	if errStr != "" {
+		s.counters.TransferDecodeErrors++
 		otadiag.Event(
 			"[fabric-xfer]", "chunk_decode_done", id,
 			otadiag.KV("ok", false),
@@ -943,6 +897,7 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	digestStart := time.Now()
 	want, ok := canonicalXXHash32Hex(msg.ChunkDigest)
 	if !ok {
+		s.counters.TransferDigestErrors++
 		otadiag.Event(
 			"[fabric-xfer]", "chunk_digest_done", id,
 			otadiag.KV("ok", false),
@@ -957,6 +912,7 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	}
 	got := xxhashHex(xxhash.Sum32(raw, 0))
 	if got != want {
+		s.counters.TransferDigestErrors++
 		otadiag.Event(
 			"[fabric-xfer]", "chunk_digest_done", id,
 			otadiag.KV("ok", false),
@@ -1080,6 +1036,7 @@ func (s *session) finishTargetCall(call *pendingTargetCall, ok bool, reason stri
 	}
 	s.pendingTargetCall = nil
 	if ok {
+		s.counters.TransferCompletions++
 		s.recordCompletedTransfer(call.meta)
 		doneOK := s.sendTransferDone(call.xferID)
 		otadiag.Event("[fabric-xfer]", "done_tx", call.xferID, otadiag.KV("ok", doneOK))
@@ -1089,7 +1046,7 @@ func (s *session) finishTargetCall(call *pendingTargetCall, ok bool, reason stri
 	if reason == "" {
 		reason = "stage_rejected"
 	}
-	updater.CancelStreamedStage(call.xferID, call.info.Generation, reason)
+	call.info.cancelStage(reason)
 	abortOK := s.sendTransferAbort(call.xferID, reason)
 	otadiag.Event("[fabric-xfer]", "abort_tx", call.xferID, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 }
@@ -1120,7 +1077,7 @@ func (s *session) cancelTargetCall(reason string) {
 		call.sub = nil
 	}
 	s.pendingTargetCall = nil
-	updater.CancelStreamedStage(call.xferID, call.info.Generation, reason)
+	call.info.cancelStage(reason)
 	otadiag.Event("[fabric-xfer]", "target_call_cancel", call.xferID, otadiag.KV("reason", reason))
 }
 

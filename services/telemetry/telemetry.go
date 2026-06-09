@@ -241,6 +241,14 @@ type linkObservation struct {
 	LocalSID string
 }
 
+// fabricLinkObserver is implemented by services/fabric's retained link-state
+// payload. Keeping this as a tiny structural interface avoids JSON reflection
+// in the common in-process TinyGo path while still tolerating map/JSON payloads
+// in host-side tests.
+type fabricLinkObserver interface {
+	FabricLinkObservation() (ready bool, peerSID string, localSID string)
+}
+
 func linkReadyEdgeReason(prev, cur linkObservation, hadPrev bool) string {
 	if !cur.Ready {
 		return ""
@@ -277,6 +285,9 @@ func decodeLinkReady(msg *bus.Message) (string, linkObservation) {
 		obs.Ready, _ = p["ready"].(bool)
 		obs.PeerSID, _ = p["peer_sid"].(string)
 		obs.LocalSID, _ = p["local_sid"].(string)
+		return id, obs
+	case fabricLinkObserver:
+		obs.Ready, obs.PeerSID, obs.LocalSID = p.FabricLinkObservation()
 		return id, obs
 	}
 	// Probe via JSON for the typed-struct payload fabric publishes.

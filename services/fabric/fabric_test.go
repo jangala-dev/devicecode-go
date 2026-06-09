@@ -229,7 +229,7 @@ func TestOversizeLineRecovery(t *testing.T) {
 }
 
 func TestReleaseTransferChunkFitsLineLimit(t *testing.T) {
-	raw := bytes.Repeat([]byte{'x'}, int(DefaultLinkConfig().ChunkSize))
+	raw := bytes.Repeat([]byte{'x'}, int(DefaultLinkConfig().MaxAcceptedChunkSize))
 	line := marshal(protoXferChunk{
 		Type:        msgXferChunk,
 		XferID:      "xfer-line-limit",
@@ -943,11 +943,10 @@ func TestInboundCallBusyAtCapacity(t *testing.T) {
 	// First call holds the only helper slot. The bus has no handler, so
 	// the call sits as a pending request until timeout.
 	sendMsg(t, cm5, protoCall{
-		Type:      msgCall,
-		ID:        "c1",
-		Topic:     []string{"rpc", "test", "noop"},
-		Payload:   json.RawMessage(`{}`),
-		TimeoutMs: 5000,
+		Type:    msgCall,
+		ID:      "c1",
+		Topic:   []string{"rpc", "test", "noop"},
+		Payload: json.RawMessage(`{}`),
 	})
 
 	// Second call arrives while the helper is full → busy reply.
@@ -1976,7 +1975,7 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 
 	sendMsg(t, cm5, protoCall{
 		Type: "call", ID: "pre-hello-1", Topic: []string{"rpc", "hal", "dump"},
-		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
+		Payload: json.RawMessage(`{}`),
 	})
 
 	select {
@@ -2008,7 +2007,7 @@ func TestCallImport(t *testing.T) {
 
 	sendMsg(t, cm5, protoCall{
 		Type: "call", ID: "test-corr-1", Topic: []string{"cap", "self", "updater", "main", "rpc", "prepare-update"},
-		Payload: json.RawMessage(`{"job_id":"job-prepare","expected_image_id":"mcu-dev-15.3"}`), TimeoutMs: 5000,
+		Payload: json.RawMessage(`{"job_id":"job-prepare","expected_image_id":"mcu-dev-15.3"}`),
 	})
 
 	reply := readMsg[protoReply](t, cm5)
@@ -2021,7 +2020,7 @@ func TestCallImport(t *testing.T) {
 	lines := diag.snapshot()
 	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_rx", "call_id test-corr-1", "job_id job-prepare", "expected_image_id mcu-dev-15.3")
 	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_route_ok", "local_topic rpc/updater/prepare")
-	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_dispatch_start", "timeout_ms 5000")
+	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_dispatch_start")
 	waitDiagContains(t, diag, "[fabric-rpc]", "ev call_reply_tx", "ok true", "sent true")
 }
 
@@ -2035,7 +2034,7 @@ func TestCallNoRoute(t *testing.T) {
 
 	sendMsg(t, cm5, protoCall{
 		Type: "call", ID: "no-route-1", Topic: []string{"unknown", "endpoint"},
-		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
+		Payload: json.RawMessage(`{}`),
 	})
 
 	reply := readMsg[protoReply](t, cm5)

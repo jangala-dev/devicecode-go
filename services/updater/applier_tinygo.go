@@ -24,7 +24,7 @@ const postCommitReplyFlushDelay = 750 * time.Millisecond
 func (abupdateApplier) CanApply(d StagedDescriptor) error {
 	_ = d
 	if !sharedUpdaterInit {
-		return errFromRC("apply_unavailable_uninited", 0)
+		return errors.New(ErrApplyUnavailable)
 	}
 	return nil
 }

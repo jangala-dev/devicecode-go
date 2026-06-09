@@ -79,7 +79,7 @@ type Applier interface {
 
 // refusingApplier is the production default. CanApply always returns
 // ErrApplyUnavailable so commit refuses with
-// `error: "apply_unavailable"` and never reaches ArmReboot.
+// `error: "commit_failed"` and never reaches ArmReboot.
 type refusingApplier struct{}
 
 // RefusingApplier returns the safe-default Applier for this branch.

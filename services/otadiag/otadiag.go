@@ -16,9 +16,10 @@ type Field struct {
 }
 
 var (
-	startedAt = time.Now()
-	nextSeq   atomic.Uint64
-	verbose   atomic.Bool
+	startedAt           = time.Now()
+	nextSeq             atomic.Uint64
+	verbose             atomic.Bool
+	heartbeatDeadlineMS atomic.Int64
 
 	sinkMu sync.Mutex
 	sink   func(string)
@@ -104,6 +105,21 @@ func SetUpdaterSnapshot(s StageSnapshot) {
 	windowMu.Unlock()
 }
 
+func SetHeartbeatDeadline(d time.Duration) {
+	if d <= 0 {
+		d = 45 * time.Second
+	}
+	heartbeatDeadlineMS.Store(d.Milliseconds())
+}
+
+func currentHeartbeatDeadline() time.Duration {
+	ms := heartbeatDeadlineMS.Load()
+	if ms <= 0 {
+		return 45 * time.Second
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func StartUpdateWindow(reason, xferID string) {
 	if xferID == "" {
 		xferID = XferNone
@@ -166,7 +182,7 @@ func WindowActive() bool {
 func heartbeatLoop(stop <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	deadline := time.NewTimer(45 * time.Second)
+	deadline := time.NewTimer(currentHeartbeatDeadline())
 	defer deadline.Stop()
 
 	for {
@@ -217,17 +233,18 @@ func allowEvent(prefix, event string, fields []Field) bool {
 	if verbose.Load() {
 		return true
 	}
+	// Normal firmware builds keep Fabric/OTA observability as retained counters
+	// and state, not as per-frame/per-chunk log lines. The sink used by tests can
+	// still opt into the detailed stream through SetSinkForTest/verbose.
 	switch prefix {
-	case "[serial-raw]", "[fabric-rx]", "[fabric-rpc]", "[fabric-handshake]":
-		return true
 	case "[mcu-ota]":
 		return event == "heartbeat_start" || event == "heartbeat_stop"
-	case "[fabric-xfer]":
-		return allowFabricXferEvent(event, fields)
-	case "[updater-stream]":
-		return allowUpdaterStreamEvent(event)
+	case "[serial-raw]", "[fabric-rx]", "[fabric-rpc]", "[fabric-handshake]", "[fabric-xfer]", "[updater-stream]":
+		return strings.HasSuffix(event, "_error") ||
+			strings.Contains(event, "reject") ||
+			strings.Contains(event, "abort")
 	default:
-		return true
+		return false
 	}
 }
 

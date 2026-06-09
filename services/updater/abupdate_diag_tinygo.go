@@ -41,6 +41,13 @@ func clearABUpdateDiagHook() {
 	abupdateDiagGeneration = 0
 }
 
+func clearABUpdateDiagHookFor(xferID string, generation uint64) {
+	if abupdateDiagXferID != xferID || abupdateDiagGeneration != generation {
+		return
+	}
+	clearABUpdateDiagHook()
+}
+
 func emitABUpdateDiag(event string, fields ...otadiag.Field) {
 	var out [10]otadiag.Field
 	n := 0

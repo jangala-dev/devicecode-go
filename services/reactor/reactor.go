@@ -8,86 +8,12 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/fabric"
-	"devicecode-go/services/telemetry"
 	"devicecode-go/services/updater"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
 	"devicecode-go/x/shmring"
 	"devicecode-go/x/strconvx"
 )
-
-// FirmwareVersion/FirmwareBuild/FirmwareImageID are the stamps the updater
-// publishes via state/self/software. main may override them before the reactor
-// starts; defaults are development sentinels.
-var (
-	FirmwareVersion = "0.0.0-dev"
-	FirmwareBuild   = "local"
-	FirmwareImageID = "img-dev"
-)
-
-func firmwareIdentity() updater.Identity {
-	return updater.Identity{
-		Version: FirmwareVersion,
-		Build:   FirmwareBuild,
-		ImageID: FirmwareImageID,
-	}
-}
-
-const (
-	fabricWaitLogInterval = 2 * time.Second
-	fabricStopWaitTimeout = 500 * time.Millisecond
-)
-
-func waitFabricDone(done <-chan struct{}, timeout time.Duration) bool {
-	if done == nil {
-		return true
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
-		return false
-	}
-}
-
-func waitForUpdaterCriticalFacts(ctx context.Context, conn *bus.Connection) bool {
-	if conn == nil {
-		return false
-	}
-	swSub := conn.Subscribe(updater.TopicSoftwareFact)
-	defer conn.Unsubscribe(swSub)
-	upSub := conn.Subscribe(updater.TopicUpdaterFact)
-	defer conn.Unsubscribe(upSub)
-	healthSub := conn.Subscribe(updater.TopicHealthFact)
-	defer conn.Unsubscribe(healthSub)
-
-	softwareReady := false
-	updaterReady := false
-	healthReady := false
-
-	for !(softwareReady && updaterReady && healthReady) {
-		select {
-		case <-ctx.Done():
-			return false
-		case msg, ok := <-swSub.Channel():
-			if ok && msg != nil && msg.Payload != nil {
-				softwareReady = true
-			}
-		case msg, ok := <-upSub.Channel():
-			if ok && msg != nil && msg.Payload != nil {
-				updaterReady = true
-			}
-		case msg, ok := <-healthSub.Channel():
-			if ok && msg != nil && msg.Payload != nil {
-				healthReady = true
-			}
-		}
-	}
-	return true
-}
 
 // -----------------------------------------------------------------------------
 // Thresholds & timing
@@ -171,6 +97,13 @@ func tSessClosed(name string) bus.Topic {
 	return bus.T("hal", "cap", "io", "serial", name, "event", "session_closed")
 }
 
+func subscriptionChannel(sub *bus.Subscription) <-chan *bus.Message {
+	if sub == nil {
+		return nil
+	}
+	return sub.Channel()
+}
+
 // -----------------------------------------------------------------------------
 // Rail order (pre-gap semantics)
 // -----------------------------------------------------------------------------
@@ -203,8 +136,11 @@ const (
 )
 
 type Reactor struct {
-	bus    *bus.Bus
 	uiConn *bus.Connection
+
+	// UART
+	jsonOut *shmring.Ring // telemetry (JSON UART TX)
+	// Logger UART1 already handled by global logger (see SetUART1)
 
 	// inputs (latest)
 	vin_mV, vbat_mV int32
@@ -233,30 +169,31 @@ type Reactor struct {
 	ledTick   int // throttles breathe commands
 
 	// misc
-	now       time.Time
-	bootBuyRC int32
+	now time.Time
 
-	// updater service handle used by the post-hello_ack republish hook.
-	updater *updater.Service
+	// telemetry drop counters (bytes)
+	droppedUART0Bytes int
+
+	// supervised children. The Reactor owns only lifecycle; child
+	// services own their own event loops and models.
+	children   childSupervisor
+	updaterSvc *updater.Service
+
+	// Fabric link lifecycle. Fabric owns its protocol reactor; this top-level
+	// Reactor only opens/closes the HAL UART session and cancels the active
+	// Fabric session when the HAL session is replaced or closed.
+	fabricCancel      context.CancelFunc
+	fabricDone        chan struct{}
+	fabricSessionOpen bool
 }
 
-type Options struct {
-	BootBuyRC int32
-}
-
-func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
-	return NewReactorWithOptions(b, uiConn, Options{})
-}
-
-func NewReactorWithOptions(b *bus.Bus, uiConn *bus.Connection, opts Options) *Reactor {
+func NewReactor(uiConn *bus.Connection) *Reactor {
 	return &Reactor{
-		bus:       b,
-		uiConn:    uiConn,
-		levelUp:   true,
-		state:     stateOff,
-		now:       time.Now(),
-		bootBuyRC: opts.BootBuyRC,
-		ledTick:   0,
+		uiConn:  uiConn,
+		levelUp: true,
+		state:   stateOff,
+		now:     time.Now(),
+		ledTick: 0,
 	}
 }
 
@@ -456,23 +393,97 @@ func (r *Reactor) OnCharger(v types.ChargerValue) {
 	r.vin_mV = v.VIN_mV
 	r.iin_mA = v.IIn_mA
 	r.tsVIN = r.now
+
+	// JSON: {"power/charger/internal/vin":..,"vsys":..,"iin":..}
+	if r.jsonOut != nil {
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("power/charger/internal/vin", int(v.VIN_mV))
+		w.KvInt("power/charger/internal/vsys", int(v.VSYS_mV))
+		w.KvInt("power/charger/internal/iin", int(v.IIn_mA))
+		// Full bitfield maps (0/1) for LOCF pipelines
+		{
+			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.KvInt("power/charger/internal/system/"+bitName, 1)
+				} else {
+					w.KvInt("power/charger/internal/system/"+bitName, 0)
+				}
+			}
+		}
+		{
+			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.KvInt("power/charger/internal/status/"+bitName, 1)
+				} else {
+					w.KvInt("power/charger/internal/status/"+bitName, 0)
+				}
+			}
+		}
+		{
+			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
+			for {
+				bitName, set, ok := it.NextAny()
+				if !ok {
+					break
+				}
+				if set {
+					w.KvInt("power/charger/internal/state/"+bitName, 1)
+				} else {
+					w.KvInt("power/charger/internal/state/"+bitName, 0)
+				}
+			}
+		}
+		w.End()
+	}
 }
 
 func (r *Reactor) OnBattery(v types.BatteryValue) {
 	r.vbat_mV = v.PackMilliV
 	r.ibat_mA = v.IBatMilliA
 	r.tsVBAT = r.now
+
+	// JSON: {"power/battery/internal/vbat":..,"ibat":..}
+	if r.jsonOut != nil {
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("power/battery/internal/vbat", int(v.PackMilliV))
+		w.KvInt("power/battery/internal/ibat", int(v.IBatMilliA))
+		w.KvInt("power/battery/internal/bsr", int(v.BSR_uOhmPerCell))
+		w.End()
+	}
 }
 
-func (r *Reactor) OnTempDeciC(label string, deci int, _ string) {
+func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	log.Deci(label, deci)
+	if r.jsonOut != nil {
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt(jsonKey, deci)
+		w.End()
+	}
 }
 
-// ---- memory snapshot (every ~3 s in main loop) ----
+// ---- memory snapshot telemetry (every ~2 s in main loop) ----
 
 func (r *Reactor) emitMemSnapshot() {
 	var ms runtime.MemStats
+	runtime.GC()
 	runtime.ReadMemStats(&ms)
+	// log line
 	log.Println(
 		"[mem] ",
 		"alloc:", int(ms.Alloc), " ",
@@ -480,37 +491,20 @@ func (r *Reactor) emitMemSnapshot() {
 		"mallocs:", int(ms.Mallocs), " ",
 		"frees:", int(ms.Frees),
 	)
+	// JSON (minimal to keep overhead low)
+	if r.jsonOut != nil {
+		var w utilities.JSONWriter
+		w.Write = r.jsonWrite
+		w.Begin()
+		w.KvInt("sys/mem/alloc", int(ms.Alloc))
+		w.End()
+	}
 }
 
 func (r *Reactor) Run(ctx context.Context) {
-	// Updater service: state machine + updater prepare/commit RPC
-	// RPC handlers + updater/main staging + retained state/self/{software,
-	// updater, health} facts. Started early so the initial fact retains
-	// land before fabric establishes — that way the first hello_ack
-	// observer sees a populated retain store.
-	updaterConn := r.bus.NewConnection("updater")
-	identity := firmwareIdentity()
-	updaterSvc := updater.New(updater.Options{
-		Conn:      updaterConn,
-		Verifier:  updater.SignedImageVerifier(),
-		Applier:   updater.ProductionApplier(),
-		Identity:  identity,
-		BootBuyRC: r.bootBuyRC,
-	})
-	go updaterSvc.Run(ctx)
-	r.updater = updaterSvc
-	if !waitForUpdaterCriticalFacts(ctx, r.bus.NewConnection("updater-ready")) {
-		return
-	}
-
-	// Telemetry service: subscribes to HAL value topics and republishes
-	// at state/self/* with integer engineering units; runs the charger
-	// alert FSM and emits event/self/power/charger/alert on bit-set
-	// transitions. Started after the updater so the initial software/
-	// updater retains land first.
-	telemetryConn := r.bus.NewConnection("telemetry")
-	telemetrySvc := telemetry.New(telemetryConn)
-	go telemetrySvc.Run(ctx)
+	r.startCoreChildren(ctx)
+	defer r.stopCoreChildren()
+	defer r.stopFabricLink()
 
 	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
@@ -521,33 +515,27 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART session for the CM5 Fabric link on proto_1 hardware.
-	const uartFabric = "uart1"
-	subSessOpenFabric := r.uiConn.Subscribe(tSessOpened(uartFabric))
-	subSessClosedFabric := r.uiConn.Subscribe(tSessClosed(uartFabric))
-	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
-
-	// Retry back-off guards
-	var retryFabricAt time.Time
-
-	// Fabric session lifecycle state
-	var fabricCancel context.CancelFunc
-	var fabricDone chan struct{}
-	var fabricSessionOpen bool
-	nextFabricWaitLog := time.Now()
-
-	stopFabricSession := func() {
-		if fabricCancel == nil {
-			return
-		}
-		done := fabricDone
-		fabricCancel()
-		fabricCancel = nil
-		fabricDone = nil
-		if !waitFabricDone(done, fabricStopWaitTimeout) {
-			log.Println("[uart1] fabric session stop timed out")
-		}
+	// UART sessions. uart0 remains the original local JSON telemetry stream;
+	// uart1 is now reserved for the CM5 Fabric link. The logger still writes to
+	// the USB monitor, but no longer opens a competing uart1 log mirror.
+	const uartTele = "uart0"
+	subSessOpenTele := r.uiConn.Subscribe(tSessOpened(uartTele))
+	subSessClosedTele := r.uiConn.Subscribe(tSessClosed(uartTele))
+	var subSessOpenFabric *bus.Subscription
+	var subSessClosedFabric *bus.Subscription
+	if useHardwareFabricUART() {
+		subSessOpenFabric = r.uiConn.Subscribe(tSessOpened(fabricUART))
+		subSessClosedFabric = r.uiConn.Subscribe(tSessClosed(fabricUART))
 	}
+
+	// Kick open requests (fire-and-forget; events carry handles).
+	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+	if useHardwareFabricUART() {
+		r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(fabricUART), nil, false))
+	}
+
+	// Retry back-off guards.
+	var retryTeleAt, retryFabricAt time.Time
 
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
@@ -558,40 +546,32 @@ func (r *Reactor) Run(ctx context.Context) {
 	for {
 		select {
 		// ---- UART session opened/closed ----
-		case m := <-subSessOpenFabric.Channel():
+		case m := <-subSessOpenTele.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				// Tear down any previous fabric session before starting a new one.
-				stopFabricSession()
-				rx := shmring.Get(shmring.Handle(ev.RXHandle))
-				tx := shmring.Get(shmring.Handle(ev.TXHandle))
-				tr := fabric.NewShmringTransport(rx, tx)
-				fabricConn := r.bus.NewConnection("fabric")
-				fabricCtx, cancel := context.WithCancel(ctx)
-				done := make(chan struct{})
-				fabricCancel = cancel
-				fabricDone = done
-				fabricSessionOpen = true
-				log.Println("[uart1] fabric session opening node=mcu peer=bigbox-cm5 link=mcu-uart0")
-				go func() {
-					defer close(done)
-					fabric.Run(fabricCtx, tr, fabricConn, "mcu", "bigbox-cm5", fabric.DefaultLinkConfig())
-				}()
-				log.Println("[uart1] fabric session opened node=mcu peer=bigbox-cm5 link=mcu-uart0")
+				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
+				log.Println("[uart0] telemetry session opened")
 			}
-		case <-subSessClosedFabric.Channel():
-			// Ignore stale close events — the open handler already tears down
-			// the previous session before starting a new one.
-			if !fabricSessionOpen {
-				continue
+		case m := <-subscriptionChannel(subSessOpenFabric):
+			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
+				r.startPassiveFabric(ctx, ev)
 			}
-			stopFabricSession()
-			fabricSessionOpen = false
-			nextFabricWaitLog = time.Now()
+		case <-subSessClosedTele.Channel():
+			r.jsonOut = nil
+			log.Println("[uart0] telemetry session closed")
+			// Auto-reopen with back-off
+			if time.Now().After(retryTeleAt) {
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
+				retryTeleAt = time.Now().Add(2 * time.Second)
+			}
+		case <-subscriptionChannel(subSessClosedFabric):
+			r.stopFabricLink()
 			log.Println("[uart1] fabric session closed")
+			// Auto-reopen with back-off
 			if time.Now().After(retryFabricAt) {
-				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartFabric), nil, false))
+				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(fabricUART), nil, false))
 				retryFabricAt = time.Now().Add(2 * time.Second)
 			}
+
 		// ---- Env prints ----
 		case m := <-tempSub.Channel():
 			if v, ok := m.Payload.(types.TemperatureValue); ok {
@@ -607,6 +587,14 @@ func (r *Reactor) Run(ctx context.Context) {
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
 				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
+				// JSON
+				if r.jsonOut != nil {
+					var w utilities.JSONWriter
+					w.Write = r.jsonWrite
+					w.Begin()
+					w.KvInt("env/humidity/core", int(v.RHx100))
+					w.End()
+				}
 			}
 
 		// ---- Die Temp Backup ----
@@ -641,15 +629,28 @@ func (r *Reactor) Run(ctx context.Context) {
 
 		case m := <-evSub.Channel():
 			printCapEvent(m)
+			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
+			if r.jsonOut != nil {
+				dom, _ := m.Topic.At(2).(string)
+				kind, _ := m.Topic.At(3).(string)
+				name, _ := m.Topic.At(4).(string)
+				tag, _ := m.Topic.At(6).(string)
+				if dom != "" && kind != "" && name != "" && tag != "" {
+					var w utilities.JSONWriter
+					w.Write = r.jsonWrite
+					w.Begin()
+					w.KvStr(dom+"/"+kind+"/"+name+"/event", tag)
+					w.End()
+				}
+			}
+
+		// ---- Child service lifecycle ----
+		case ev := <-r.children.Done():
+			r.children.HandleExit(ev)
 
 		// ---- Supervisory tick ----
 		case <-ticker.C:
 			r.now = time.Now()
-
-			if !fabricSessionOpen && !r.now.Before(nextFabricWaitLog) {
-				log.Println("[main] waiting for fabric connection start")
-				nextFabricWaitLog = r.now.Add(fabricWaitLogInterval)
-			}
 
 			// 1) Run FSM (includes symmetric reversal)
 			r.stepFSM()
@@ -669,6 +670,26 @@ func (r *Reactor) Run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Centralised UART write helpers (handle partial writes)
+// -----------------------------------------------------------------------------
+
+// uart0 (telemetry JSON) — returns bytes written; tracks dropped bytes on partial writes.
+func (r *Reactor) jsonWrite(b []byte) int {
+	if r == nil || r.jsonOut == nil || len(b) == 0 {
+		return 0
+	}
+	n := r.jsonOut.TryWriteFrom(b)
+	if n < len(b) {
+		r.droppedUART0Bytes += (len(b) - n)
+		// Rate-limited note
+		if r.droppedUART0Bytes == (len(b)-n) || (r.droppedUART0Bytes%1024) == 0 {
+			log.Println("[uart0] dropped bytes =", r.droppedUART0Bytes)
+		}
+	}
+	return n
 }
 
 // -----------------------------------------------------------------------------

@@ -47,7 +47,7 @@ func writeStreamedStage(xferID string, generation uint64, data []byte) error {
 	return err
 }
 
-func commitStreamedStage(xferID string, generation uint64) (streamedStage, error) {
+func commitStreamedStage(svc *Service, xferID string, generation uint64) (streamedStage, error) {
 	_, _ = xferID, generation
 	f := hostStreamedStage.file
 	if f == nil {
@@ -57,7 +57,6 @@ func commitStreamedStage(xferID string, generation uint64) (streamedStage, error
 		abortStreamedStage()
 		return streamedStage{}, err
 	}
-	svc := currentService()
 	if svc == nil {
 		abortStreamedStage()
 		return streamedStage{}, errors.New("updater_not_running")

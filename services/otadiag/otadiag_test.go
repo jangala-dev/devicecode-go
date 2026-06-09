@@ -29,27 +29,22 @@ func TestDefaultFilterKeepsActionableEvents(t *testing.T) {
 	lines, restore := captureDefaultFilteredEvents()
 	defer restore()
 
-	Event("[serial-raw]", "rx_driver_pressure", XferNone, KV("uart", "uart0"))
-	Event("[fabric-rx]", "read_line", XferNone, KV("type", "ping"))
-	Event("[fabric-rpc]", "sent", XferNone, KV("call_id", "call-1"))
+	Event("[serial-raw]", "rx_ring_error", XferNone, KV("uart", "uart0"))
+	Event("[fabric-rx]", "read_line_error", XferNone, KV("reason", "line_too_long"))
+	Event("[fabric-rpc]", "call_reject", XferNone, KV("call_id", "call-1"))
 	Event("[mcu-ota]", "heartbeat_start", "xfer-1", KV("reason", "prepare"))
 	Event("[mcu-ota]", "heartbeat_stop", "xfer-1", KV("reason", "done"))
-	Event("[fabric-xfer]", "begin_rx", "xfer-1", KV("target", "updater/main"))
-	Event("[fabric-xfer]", "ready_tx", "xfer-1", KV("ok", true))
-	Event("[fabric-xfer]", "need_tx", "xfer-1", KV("next", 0), KV("ok", true))
-	Event("[fabric-xfer]", "chunk_digest_done", "xfer-1", KV("ok", false), KV("reason", "chunk_digest_mismatch"))
+	Event("[fabric-xfer]", "xfer_abort", "xfer-1", KV("reason", "cancelled"))
 	Event("[fabric-xfer]", "sink_write_error", "xfer-1", KV("reason", "write_boom"))
-	Event("[updater-stream]", "prepare_rx", XferNone, KV("job_id", "job-1"))
-	Event("[updater-stream]", "flash_erase_start", "xfer-1", KV("offset", 0))
+	Event("[updater-stream]", "prepare_reject", XferNone, KV("reason", "busy"))
 	Event("[updater-stream]", "image_signature_verify_error", "xfer-1", KV("reason", "bad_signature"))
 
 	got := strings.Join(*lines, "\n")
 	for _, want := range []string{
 		"[serial-raw]", "[fabric-rx]", "[fabric-rpc]",
 		"ev heartbeat_start", "ev heartbeat_stop",
-		"ev begin_rx", "ev ready_tx", "ev need_tx",
-		"ev chunk_digest_done", "ev sink_write_error",
-		"ev prepare_rx", "ev flash_erase_start", "ev image_signature_verify_error",
+		"ev xfer_abort", "ev sink_write_error",
+		"ev prepare_reject", "ev image_signature_verify_error",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("default filter output missing %q:\n%s", want, got)

@@ -1,6 +1,9 @@
 package fabric
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // ---- Wire message type identifiers ----
 //
@@ -73,11 +76,10 @@ type protoUnretain struct {
 }
 
 type protoCall struct {
-	Type      string          `json:"type"`
-	ID        string          `json:"id"`
-	Topic     []string        `json:"topic"`
-	Payload   json.RawMessage `json:"payload"`
-	TimeoutMs int             `json:"timeout_ms"`
+	Type    string          `json:"type"`
+	ID      string          `json:"id"`
+	Topic   []string        `json:"topic"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 // protoReply mirrors Lua's reply frame: {type, id, ok, payload, err}. The Go
@@ -161,6 +163,361 @@ func marshal(v any) []byte {
 		panic("fabric: marshal: " + err.Error())
 	}
 	return append(b, '\n')
+}
+
+// marshalHelloAck returns a compact hello_ack frame without using reflection.
+func marshalHelloAck(sid, node string) []byte {
+	b := make([]byte, 0, 96)
+	b = append(b, `{"type":"hello_ack","proto":"fabric-jsonl/1","sid":"`...)
+	b = appendJSONString(b, sid)
+	b = append(b, `","node":"`...)
+	b = appendJSONString(b, node)
+	b = append(b, `"}`...)
+	return append(b, '\n')
+}
+
+func marshalPing(sid string) []byte { return marshalSIDControl(msgPing, sid) }
+func marshalPong(sid string) []byte { return marshalSIDControl(msgPong, sid) }
+
+func marshalSIDControl(typ, sid string) []byte {
+	b := make([]byte, 0, 48+len(sid))
+	b = append(b, `{"type":"`...)
+	b = appendJSONString(b, typ)
+	b = append(b, `","sid":"`...)
+	b = appendJSONString(b, sid)
+	b = append(b, `"}`...)
+	return append(b, '\n')
+}
+
+func marshalReplyErr(id, errText string) []byte {
+	b := make([]byte, 0, 64+len(id)+len(errText))
+	b = append(b, `{"type":"reply","id":"`...)
+	b = appendJSONString(b, id)
+	b = append(b, `","ok":false,"err":"`...)
+	b = appendJSONString(b, errText)
+	b = append(b, `"}`...)
+	return append(b, '\n')
+}
+
+func marshalReplyOKRaw(id string, payload json.RawMessage) []byte {
+	b := make([]byte, 0, 48+len(id)+len(payload))
+	b = append(b, `{"type":"reply","id":"`...)
+	b = appendJSONString(b, id)
+	b = append(b, `","ok":true`...)
+	if len(payload) > 0 {
+		b = append(b, `,"payload":`...)
+		b = append(b, payload...)
+	}
+	b = append(b, `}`...)
+	return append(b, '\n')
+}
+
+func marshalXferReady(id string) []byte { return marshalXferControl(msgXferReady, id, 0, false, "") }
+func marshalXferNeed(id string, next uint32) []byte {
+	return marshalXferControl(msgXferNeed, id, next, true, "")
+}
+func marshalXferDone(id string) []byte { return marshalXferControl(msgXferDone, id, 0, false, "") }
+func marshalXferAbort(id, reason string) []byte {
+	return marshalXferControl(msgXferAbort, id, 0, false, reason)
+}
+
+func marshalXferControl(typ, id string, next uint32, hasNext bool, errText string) []byte {
+	b := make([]byte, 0, 80+len(id)+len(errText))
+	b = append(b, `{"type":"`...)
+	b = appendJSONString(b, typ)
+	b = append(b, `","xfer_id":"`...)
+	b = appendJSONString(b, id)
+	b = append(b, `"`...)
+	if hasNext {
+		b = append(b, `,"next":`...)
+		b = strconv.AppendUint(b, uint64(next), 10)
+	}
+	if errText != "" {
+		b = append(b, `,"err":"`...)
+		b = appendJSONString(b, errText)
+		b = append(b, `"`...)
+	}
+	b = append(b, `}`...)
+	return append(b, '\n')
+}
+
+func appendJSONString(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' {
+			dst = append(dst, '\\')
+		}
+		dst = append(dst, c)
+	}
+	return dst
+}
+
+// protoTopRaw returns the complete top-level JSON value for field.
+func protoTopRaw(line []byte, field string) (json.RawMessage, bool) {
+	i, ok := findTopJSONValue(line, field)
+	if !ok {
+		return nil, false
+	}
+	end, ok := skipJSONValue(line, i)
+	if !ok || end < i || end > len(line) {
+		return nil, false
+	}
+	out := make(json.RawMessage, end-i)
+	copy(out, line[i:end])
+	return out, true
+}
+
+func protoTopUint32(line []byte, field string) (uint32, bool) {
+	i, ok := findTopJSONValue(line, field)
+	if !ok || i >= len(line) || line[i] < '0' || line[i] > '9' {
+		return 0, false
+	}
+	var v uint32
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		d := uint32(line[i] - '0')
+		if v > (1<<32-1-d)/10 {
+			return 0, false
+		}
+		v = v*10 + d
+		i++
+	}
+	return v, true
+}
+
+func findTopJSONValue(line []byte, field string) (int, bool) {
+	n := len(line)
+	i := skipJSONSpace(line, 0)
+	if i >= n || line[i] != '{' {
+		return 0, false
+	}
+	i++
+	for {
+		i = skipJSONSpace(line, i)
+		if i >= n {
+			return 0, false
+		}
+		switch line[i] {
+		case '}':
+			return 0, false
+		case ',':
+			i++
+			continue
+		}
+		if line[i] != '"' {
+			return 0, false
+		}
+		keyStart := i + 1
+		keyEnd, ok := scanJSONString(line, i)
+		if !ok {
+			return 0, false
+		}
+		i = keyEnd
+		i = skipJSONSpace(line, i)
+		if i >= n || line[i] != ':' {
+			return 0, false
+		}
+		i++
+		i = skipJSONSpace(line, i)
+		if i >= n {
+			return 0, false
+		}
+		if jsonKeyEquals(line[keyStart:keyEnd-1], field) {
+			return i, true
+		}
+		i, ok = skipJSONValue(line, i)
+		if !ok {
+			return 0, false
+		}
+	}
+}
+
+func topFieldsAllowed(line []byte, allowed ...string) bool {
+	n := len(line)
+	i := skipJSONSpace(line, 0)
+	if i >= n || line[i] != '{' {
+		return false
+	}
+	i++
+	for {
+		i = skipJSONSpace(line, i)
+		if i >= n {
+			return false
+		}
+		if line[i] == '}' {
+			i++
+			i = skipJSONSpace(line, i)
+			return i == n
+		}
+		if line[i] == ',' {
+			i++
+			continue
+		}
+		if line[i] != '"' {
+			return false
+		}
+		keyStart := i + 1
+		keyEnd, ok := scanJSONString(line, i)
+		if !ok {
+			return false
+		}
+		if !jsonKeyInAllowed(line[keyStart:keyEnd-1], allowed) {
+			return false
+		}
+		i = skipJSONSpace(line, keyEnd)
+		if i >= n || line[i] != ':' {
+			return false
+		}
+		i++
+		i = skipJSONSpace(line, i)
+		if i >= n {
+			return false
+		}
+		i, ok = skipJSONValue(line, i)
+		if !ok {
+			return false
+		}
+	}
+}
+
+func jsonKeyInAllowed(key []byte, allowed []string) bool {
+	for _, field := range allowed {
+		if jsonKeyEquals(key, field) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeHelloFast(line []byte) (protoHello, bool) {
+	if !topFieldsAllowed(line, "type", "proto", "sid", "node", "identity", "auth") {
+		return protoHello{}, false
+	}
+	var msg protoHello
+	msg.Type = protoTopString(line, "type")
+	msg.Proto = protoTopString(line, "proto")
+	msg.SID = protoTopString(line, "sid")
+	msg.Node = protoTopString(line, "node")
+	return msg, msg.Type == msgHello && msg.Proto != "" && msg.SID != ""
+}
+
+func decodePingFast(line []byte, want string) (protoPing, bool) {
+	if !topFieldsAllowed(line, "type", "sid") {
+		return protoPing{}, false
+	}
+	var msg protoPing
+	msg.Type = protoTopString(line, "type")
+	msg.SID = protoTopString(line, "sid")
+	return msg, msg.Type == want
+}
+
+func decodePongFast(line []byte) (protoPong, bool) {
+	if !topFieldsAllowed(line, "type", "sid") {
+		return protoPong{}, false
+	}
+	var msg protoPong
+	msg.Type = protoTopString(line, "type")
+	msg.SID = protoTopString(line, "sid")
+	return msg, msg.Type == msgPong
+}
+
+func decodeCallFast(line []byte) (protoCall, bool) {
+	if !topFieldsAllowed(line, "type", "id", "topic", "payload") {
+		return protoCall{}, false
+	}
+	var msg protoCall
+	msg.Type = protoTopString(line, "type")
+	msg.ID = protoTopString(line, "id")
+	msg.Topic = protoTopStringArray(line, "topic")
+	if payload, ok := protoTopRaw(line, "payload"); ok {
+		msg.Payload = payload
+	}
+	return msg, msg.Type == msgCall && msg.ID != "" && len(msg.Topic) > 0
+}
+
+func decodeXferBeginFast(line []byte) (protoXferBegin, bool) {
+	if !topFieldsAllowed(line, "type", "xfer_id", "target", "size", "digest_alg", "digest", "meta") {
+		return protoXferBegin{}, false
+	}
+	var msg protoXferBegin
+	msg.Type = protoTopString(line, "type")
+	msg.XferID = protoTopString(line, "xfer_id")
+	msg.Target = protoTopString(line, "target")
+	msg.Size, _ = protoTopUint32(line, "size")
+	msg.DigestAlg = protoTopString(line, "digest_alg")
+	msg.Digest = protoTopString(line, "digest")
+	if meta, ok := protoTopRaw(line, "meta"); ok {
+		msg.Meta = meta
+	}
+	return msg, msg.Type == msgXferBegin && msg.XferID != ""
+}
+
+func decodeXferChunkFast(line []byte) (protoXferChunk, bool) {
+	if !topFieldsAllowed(line, "type", "xfer_id", "offset", "data", "chunk_digest") {
+		return protoXferChunk{}, false
+	}
+	var msg protoXferChunk
+	msg.Type = protoTopString(line, "type")
+	msg.XferID = protoTopString(line, "xfer_id")
+	msg.Offset, _ = protoTopUint32(line, "offset")
+	msg.Data = protoTopString(line, "data")
+	msg.ChunkDigest = protoTopString(line, "chunk_digest")
+	return msg, msg.Type == msgXferChunk && msg.XferID != ""
+}
+
+func decodeXferCommitFast(line []byte) (protoXferCommit, bool) {
+	if !topFieldsAllowed(line, "type", "xfer_id", "size", "digest_alg", "digest") {
+		return protoXferCommit{}, false
+	}
+	var msg protoXferCommit
+	msg.Type = protoTopString(line, "type")
+	msg.XferID = protoTopString(line, "xfer_id")
+	msg.Size, _ = protoTopUint32(line, "size")
+	msg.DigestAlg = protoTopString(line, "digest_alg")
+	msg.Digest = protoTopString(line, "digest")
+	return msg, msg.Type == msgXferCommit && msg.XferID != ""
+}
+
+func decodeXferAbortFast(line []byte) (protoXferAbort, bool) {
+	if !topFieldsAllowed(line, "type", "xfer_id", "err") {
+		return protoXferAbort{}, false
+	}
+	var msg protoXferAbort
+	msg.Type = protoTopString(line, "type")
+	msg.XferID = protoTopString(line, "xfer_id")
+	msg.Err = protoTopString(line, "err")
+	return msg, msg.Type == msgXferAbort && msg.XferID != ""
+}
+
+func protoTopStringArray(line []byte, field string) []string {
+	i, ok := findTopJSONValue(line, field)
+	if !ok || i >= len(line) || line[i] != '[' {
+		return nil
+	}
+	i++
+	out := make([]string, 0, 8)
+	for {
+		i = skipJSONSpace(line, i)
+		if i >= len(line) {
+			return nil
+		}
+		if line[i] == ']' {
+			return out
+		}
+		if line[i] == ',' {
+			i++
+			continue
+		}
+		if line[i] != '"' {
+			return nil
+		}
+		start := i + 1
+		end, ok := scanJSONString(line, i)
+		if !ok {
+			return nil
+		}
+		out = append(out, string(line[start:end-1]))
+		i = end
+	}
 }
 
 // protoType extracts the wire-discriminator "type" field from a JSON

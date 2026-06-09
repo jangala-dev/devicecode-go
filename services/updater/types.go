@@ -32,10 +32,10 @@ const (
 	PrepareTargetMCU  = "mcu"
 	TargetUpdaterMain = "updater/main"
 	DigestAlgXXHash32 = "xxhash32"
-	// DefaultMaxChunkSize is the safe RP2350 Fabric OTA limit currently
-	// advertised by prepare-update. It is a target pacing limit, not a
-	// Fabric protocol maximum.
-	DefaultMaxChunkSize uint32 = 512
+	// DefaultMaxChunkSize is the fabric-jsonl/1 v1 initial raw chunk size.
+	// The CM5 sender chooses the actual chunk size, but the MCU must accept
+	// at least 2048-byte chunks.
+	DefaultMaxChunkSize uint32 = 2048
 )
 
 // PrepareRequest mirrors the current prepare-update payload.
@@ -76,16 +76,19 @@ type Reply struct {
 
 // Refusal error strings — the Lua side compares against these.
 const (
-	ErrBusy              = "busy"
-	ErrNothingStaged     = "nothing_staged"
-	ErrTargetMismatch    = "target_mismatch"
-	ErrABUpdateBuyFailed = "abupdate_buy_failed"
+	ErrBusy               = "busy"
+	ErrInvalidRequest     = "invalid_request"
+	ErrUnsupportedTarget  = "unsupported_target"
+	ErrStorageUnavailable = "storage_unavailable"
+	ErrNoStagedImage      = "no_staged_image"
+	ErrImageIDMismatch    = "image_id_mismatch"
+	ErrABUpdateBuyFailed  = "abupdate_buy_failed"
 	// ErrApplyUnavailable is returned when the commit RPC sees a valid
 	// staged descriptor but no Applier is wired to actually trigger
 	// the slot-switch + reboot. Refusing by default means we never lie
 	// to the CM5 about apply success when the hardware apply path is not
 	// wired.
-	ErrApplyUnavailable = "apply_unavailable"
+	ErrApplyUnavailable = "commit_failed"
 )
 
 // SoftwareFact is the retained payload at state/self/software.

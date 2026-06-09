@@ -420,6 +420,49 @@ func readTransferNeed(t *testing.T, tr Transport, id string, next uint32) {
 	}
 }
 
+func readUntilTransferAbort(t *testing.T, tr Transport, id, reason string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for xfer_abort id=%s err=%s", id, reason)
+		}
+		lineCh := make(chan []byte, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			line, err := tr.ReadLine()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			lineCh <- append([]byte(nil), line...)
+		}()
+		var line []byte
+		select {
+		case line = <-lineCh:
+		case err := <-errCh:
+			t.Fatalf("ReadLine: %v", err)
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("timed out waiting for xfer_abort id=%s err=%s", id, reason)
+		}
+		var probe struct {
+			Type   string `json:"type"`
+			XferID string `json:"xfer_id"`
+			Err    string `json:"err"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			t.Fatalf("Unmarshal %q: %v", line, err)
+		}
+		if probe.Type != msgXferAbort {
+			continue
+		}
+		if probe.XferID != id || probe.Err != reason {
+			t.Fatalf("bad xfer_abort: %+v, want id=%s err=%s", probe, id, reason)
+		}
+		return
+	}
+}
+
 func readTransferAbort(t *testing.T, tr Transport, id, reason string) {
 	t.Helper()
 	abort := readMsg[protoXferAbort](t, tr)
@@ -435,16 +478,30 @@ func writeRawLine(t *testing.T, tr Transport, line string) {
 	}
 }
 
-func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
-	diag := captureOTADiag(t)
+func TestTransferBeginWithoutStageControllerAbortsNoReady(t *testing.T) {
 	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
-	defer cancelUpdater()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-no-controller", payload, nil))
+	readTransferAbort(t, cm5, "xfer-no-controller", "updater_stage_controller_missing")
+}
+
+func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
+	diag := captureOTADiag(t)
+	b := newBus()
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{})
+	defer cancelUpdater()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -460,7 +517,7 @@ func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
 func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
 	diag := captureOTADiag(t)
 	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{})
 	defer cancelUpdater()
 	caller := b.NewConnection("caller")
 	observer := b.NewConnection("observer")
@@ -471,7 +528,7 @@ func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -534,7 +591,7 @@ func TestInvalidTransferBeginEmitsRejectDiagnosticNoActiveTransfer(t *testing.T)
 
 func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{})
 	defer cancelUpdater()
 	caller := b.NewConnection("caller")
 	observer := b.NewConnection("observer")
@@ -545,7 +602,7 @@ func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -564,7 +621,7 @@ func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 	b := newBus()
 	memMD := updater.NewMemoryMetadata()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{
 		Verifier:      updater.StubVerifier(),
 		Metadata:      memMD,
 		MetadataWrite: memMD,
@@ -576,7 +633,7 @@ func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -596,8 +653,8 @@ func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 
 	replyPayload := requestUpdaterForFabricTest(t, caller, updater.TopicCommitRPC, updater.CommitRequest{})
 	reply, ok := replyPayload.(updater.Reply)
-	if !ok || reply.OK || reply.Error != updater.ErrNothingStaged {
-		t.Fatalf("commit after rejected transfer = %#v, want nothing_staged", replyPayload)
+	if !ok || reply.OK || reply.Error != updater.ErrNoStagedImage {
+		t.Fatalf("commit after rejected transfer = %#v, want no_staged_image", replyPayload)
 	}
 }
 
@@ -748,8 +805,6 @@ func TestTransferAcceptedChunkEmitsProcessingDiagnostics(t *testing.T) {
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_decode_done", "ok true", "raw_len 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_digest_done", "ok true"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_start", "offset 0", "raw_len 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_start", "next 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_done", "next 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_done", "next 4"},
 		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev need_tx", "next 4", "ok true", "accepted true"},
 	)
@@ -788,39 +843,6 @@ func TestTransferNeedIsSentOnlyAfterPendingChunkWriteCompletes(t *testing.T) {
 	if need.Next != uint32(len(payload)) {
 		t.Fatalf("xfer_need.next = %d, want %d", need.Next, len(payload))
 	}
-}
-
-func TestTransferAcceptedChunkEmitsSparseMemorySample(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{}
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
-	payload := make([]byte, transferMemSampleStride)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	sendMsg(t, cm5, xferBegin("xfer-mem-diag", payload, nil))
-	readTransferReady(t, cm5, "xfer-mem-diag", 0)
-
-	const chunkSize = 2048
-	for off := 0; off < len(payload); off += chunkSize {
-		end := off + chunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		sendMsg(t, cm5, xferChunk("xfer-mem-diag", uint32(off), payload[off:end]))
-		need := readMsg[protoXferNeed](t, cm5)
-		if need.Next != uint32(end) {
-			t.Fatalf("xfer_need.next = %d, want %d", need.Next, end)
-		}
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-mem-diag", "ev transfer_mem_sample", "next 65536", "alloc", "heap")
 }
 
 func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
@@ -1135,7 +1157,6 @@ func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
 	lines := diag.snapshot()
 	assertDiagContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev chunk_digest_done", "ok false", "reason chunk_digest_mismatch")
 	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev sink_write_start")
-	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev gc_start")
 
 	sendMsg(t, cm5, xferChunk("xfer-bad-chunk-digest", 0, payload))
 	need = readMsg[protoXferNeed](t, cm5)
@@ -1702,7 +1723,7 @@ func TestTransferCommitTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing
 			PayloadLength: 4,
 		},
 	}
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{
 		Verifier:      verif,
 		Metadata:      memMD,
 		MetadataWrite: memMD,
@@ -1717,7 +1738,7 @@ func TestTransferCommitTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", cfg)
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", cfg, RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	id := "xfer-stage-timeout"
@@ -1732,13 +1753,18 @@ func TestTransferCommitTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing
 	case <-time.After(2 * time.Second):
 		t.Fatal("verifier did not start before commit timeout")
 	}
-	readTransferAbort(t, cm5, id, "transfer_commit_timeout")
+	// Let the configured commit deadline pass while the verifier/flash operation
+	// remains blocked. The worker observes that deadline at the next safe point.
+	time.Sleep(50 * time.Millisecond)
 	if _, ok := memMD.StagedDescriptor(); ok {
-		t.Fatal("commit timeout persisted descriptor before verifier returned")
+		t.Fatal("descriptor persisted while verifier was still blocked")
 	}
 
+	// The stage worker now owns the verifier/flash call directly rather than
+	// spawning a nested goroutine.  The timeout is therefore observed at the
+	// next safe point: after the bounded verifier operation returns.
 	close(verif.release)
-	time.Sleep(50 * time.Millisecond)
+	readUntilTransferAbort(t, cm5, id, "transfer_commit_timeout")
 	if _, ok := memMD.StagedDescriptor(); ok {
 		t.Fatal("late verifier completion after commit timeout persisted descriptor")
 	}

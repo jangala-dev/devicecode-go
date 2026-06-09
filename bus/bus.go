@@ -606,6 +606,16 @@ func (b *Bus) NewConnection(id string) *Connection {
 	return &Connection{bus: b, id: id}
 }
 
+// NewChildConnection creates a separate connection on the same bus.
+// Services should use separate connections so subscriptions, request-reply
+// counters, and Disconnect lifetimes remain locally owned.
+func (c *Connection) NewChildConnection(id string) *Connection {
+	if c == nil || c.bus == nil {
+		return nil
+	}
+	return c.bus.NewConnection(id)
+}
+
 func (c *Connection) NewMessage(tp Topic, payload any, retained bool) *Message {
 	return c.bus.NewMessage(tp, payload, retained)
 }

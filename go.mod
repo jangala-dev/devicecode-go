@@ -1,6 +1,6 @@
 module devicecode-go
 
-go 1.25.1
+go 1.25.0
 
 require (
 	pico2-a-b v0.0.0
@@ -12,5 +12,3 @@ require (
 require github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 
 replace pico2-a-b => ../pico2-a-b
-
-replace github.com/jangala-dev/tinygo-uartx => ./third_party/tinygo-uartx

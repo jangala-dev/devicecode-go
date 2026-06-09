@@ -39,7 +39,7 @@ func (s *Service) handleStage(msg *bus.Message) {
 		return
 	}
 
-	staged, ok := consumeStreamedStageResult()
+	staged, ok := s.consumeStreamedStageResult()
 	if !ok {
 		s.failStage(payload, "artefact_missing")
 		s.reply(msg, StageReply{OK: false, Err: "artefact_missing"})

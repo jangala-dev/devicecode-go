@@ -15,8 +15,8 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 	prepareAt := time.Now()
 	req, ok := jsonDecode[PrepareRequest](msg.Payload)
 	if !ok {
-		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", "bad_request"))
-		s.reply(msg, Reply{OK: false, Error: "bad_request"})
+		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrInvalidRequest))
+		s.reply(msg, Reply{OK: false, Error: ErrInvalidRequest})
 		return
 	}
 	otadiag.Event(
@@ -26,8 +26,8 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 		otadiag.KV("expected_image_id", req.ExpectedImageID),
 	)
 	if req.Target != "" && req.Target != PrepareTargetMCU {
-		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrTargetMismatch))
-		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
+		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrUnsupportedTarget))
+		s.reply(msg, Reply{OK: false, Error: ErrUnsupportedTarget})
 		return
 	}
 
@@ -103,7 +103,7 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 func (s *Service) handleCommit(msg *bus.Message) {
 	req, ok := jsonDecode[CommitRequest](msg.Payload)
 	if !ok {
-		s.reply(msg, Reply{OK: false, Error: "bad_request"})
+		s.reply(msg, Reply{OK: false, Error: ErrInvalidRequest})
 		return
 	}
 
@@ -119,7 +119,7 @@ func (s *Service) handleCommit(msg *bus.Message) {
 		return
 	}
 	if !present || !stagedInState {
-		s.reply(msg, Reply{OK: false, Error: ErrNothingStaged})
+		s.reply(msg, Reply{OK: false, Error: ErrNoStagedImage})
 		return
 	}
 	expectedImageID := pendingImageID
@@ -127,14 +127,14 @@ func (s *Service) handleCommit(msg *bus.Message) {
 		expectedImageID = req.ExpectedImageID
 	}
 	if expectedImageID != "" && desc.ImageID != expectedImageID {
-		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
+		s.reply(msg, Reply{OK: false, Error: ErrImageIDMismatch})
 		return
 	}
 
 	// Validate the apply path before publishing committing/rebooting or
 	// replying accepted. The default Applier refuses in non-hardware tests.
 	if err := s.applier.CanApply(desc); err != nil {
-		s.reply(msg, Reply{OK: false, Error: err.Error()})
+		s.reply(msg, Reply{OK: false, Error: ErrApplyUnavailable})
 		return
 	}
 

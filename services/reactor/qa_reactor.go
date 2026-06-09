@@ -128,11 +128,11 @@ const (
 )
 
 type Reactor struct {
-	bus    *bus.Bus
 	uiConn *bus.Connection
 
 	// UART
 	jsonOut *shmring.Ring // telemetry (JSON UART TX)
+	// Logger UART1 already handled by global logger (see SetUART1)
 
 	// inputs (latest)
 	vin_mV, vbat_mV int32
@@ -165,26 +165,15 @@ type Reactor struct {
 
 	// telemetry drop counters (bytes)
 	droppedUART0Bytes int
-	bootBuyRC         int32
 }
 
-type Options struct {
-	BootBuyRC int32
-}
-
-func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
-	return NewReactorWithOptions(b, uiConn, Options{})
-}
-
-func NewReactorWithOptions(b *bus.Bus, uiConn *bus.Connection, opts Options) *Reactor {
+func NewReactor(uiConn *bus.Connection) *Reactor {
 	return &Reactor{
-		bus:       b,
-		uiConn:    uiConn,
-		levelUp:   true,
-		state:     stateOff,
-		now:       time.Now(),
-		bootBuyRC: opts.BootBuyRC,
-		ledTick:   0,
+		uiConn:  uiConn,
+		levelUp: true,
+		state:   stateOff,
+		now:     time.Now(),
+		ledTick: 0,
 	}
 }
 

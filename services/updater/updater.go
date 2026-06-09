@@ -160,11 +160,22 @@ type Service struct {
 	preparing      bool
 	bootBuyRC      int32
 
-	stageGeneration   uint64
-	streamLeaseActive bool
-	streamXferID      string
-	streamCancelled   bool
-	streamCommitted   bool
+	stageGeneration     uint64
+	streamLeaseActive   bool
+	streamXferID        string
+	streamCancelled     bool
+	streamCommitted     bool
+	streamStageResult   streamedStage
+	streamStageResultOK bool
+
+	stageCommands       chan streamedStageCommand
+	stageWorkerCommands chan streamedStageWorkerCommand
+	stageWorkerResults  chan streamedStageWorkerResult
+	pendingStageCommand *streamedStageCommand
+	stageReady          chan struct{}
+	stageStopped        chan struct{}
+	stageReadyOnce      sync.Once
+	stageStoppedOnce    sync.Once
 
 	applyResults chan applyRebootResult
 
@@ -245,15 +256,20 @@ func New(opts Options) *Service {
 		mw = noopMetadataWriter{}
 	}
 	s := &Service{
-		conn:          opts.Conn,
-		verifier:      v,
-		applier:       a,
-		identity:      opts.Identity,
-		metadata:      mr,
-		metadataWrite: mw,
-		state:         StateRunning,
-		bootBuyRC:     opts.BootBuyRC,
-		applyResults:  make(chan applyRebootResult, 1),
+		conn:                opts.Conn,
+		verifier:            v,
+		applier:             a,
+		identity:            opts.Identity,
+		metadata:            mr,
+		metadataWrite:       mw,
+		state:               StateRunning,
+		bootBuyRC:           opts.BootBuyRC,
+		stageCommands:       make(chan streamedStageCommand, 1),
+		stageWorkerCommands: make(chan streamedStageWorkerCommand, 1),
+		stageWorkerResults:  make(chan streamedStageWorkerResult, 1),
+		stageReady:          make(chan struct{}),
+		stageStopped:        make(chan struct{}),
+		applyResults:        make(chan applyRebootResult, 1),
 		criticalRepublish: normalizeCriticalRepublishConfig(
 			opts.CriticalRepublish,
 		),
@@ -280,8 +296,9 @@ func (noopMetadataWriter) ClearStagedDescriptor() error {
 // surface, and watches the fabric link-state retain for ready-true
 // edges. Blocks until ctx is cancelled.
 func (s *Service) Run(ctx context.Context) {
-	unregister := registerActiveService(s)
-	defer unregister()
+	s.stageReadyOnce.Do(func() { close(s.stageReady) })
+	go s.runStreamedStageWorker(ctx)
+	defer s.stageStoppedOnce.Do(func() { close(s.stageStopped) })
 	defer otadiag.StopUpdateWindow("updater_stop")
 
 	prepareSub := s.conn.Subscribe(TopicPrepareRPC)
@@ -383,6 +400,10 @@ func (s *Service) Run(ctx context.Context) {
 				continue
 			}
 			s.handleStage(msg)
+		case cmd := <-s.stageCommands:
+			s.handleStreamedStageCommand(cmd)
+		case result := <-s.stageWorkerResults:
+			s.handleStreamedStageWorkerResult(result)
 		case result := <-s.applyResults:
 			s.failRebootIfCurrent(result.desc, result.err)
 		case now := <-criticalTimerC:
@@ -549,6 +570,14 @@ type linkObservation struct {
 	LocalSID string
 }
 
+// fabricLinkObserver is implemented by services/fabric's retained link-state
+// payload. Keeping this as a tiny structural interface avoids JSON reflection
+// in the common in-process TinyGo path while still tolerating map/JSON payloads
+// in host-side tests.
+type fabricLinkObserver interface {
+	FabricLinkObservation() (ready bool, peerSID string, localSID string)
+}
+
 func republishReason(prev, cur linkObservation, hadPrev bool) string {
 	if !cur.Ready {
 		return ""
@@ -593,6 +622,9 @@ func decodeLinkState(msg *bus.Message) (string, linkObservation) {
 		obs.Ready, _ = p["ready"].(bool)
 		obs.PeerSID, _ = p["peer_sid"].(string)
 		obs.LocalSID, _ = p["local_sid"].(string)
+		return linkID, obs
+	case fabricLinkObserver:
+		obs.Ready, obs.PeerSID, obs.LocalSID = p.FabricLinkObservation()
 		return linkID, obs
 	}
 	// Fall back to JSON probe for the typed-struct payload that

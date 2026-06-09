@@ -58,8 +58,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 256,
-			TXSize: 2048,
+			RXSize: 32,
+			TXSize: 512,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{

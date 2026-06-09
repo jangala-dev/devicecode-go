@@ -10,27 +10,41 @@ import (
 // ShmringTransport implements Transport over two shmring rings (RX + TX).
 // Used for UART0 in production (main.go).
 type ShmringTransport struct {
-	rx     *shmring.Ring
-	tx     *shmring.Ring
-	cancel context.CancelFunc
-	ctx    context.Context
-	buf    []byte
-	over   bool // draining an oversize line
+	rx      *shmring.Ring
+	tx      *shmring.Ring
+	cancel  context.CancelFunc
+	ctx     context.Context
+	lineBuf *[maxLineLen]byte
+	n       int
+	over    bool // draining an oversize line
 }
 
 func NewShmringTransport(rx, tx *shmring.Ring) *ShmringTransport {
+	return NewShmringTransportWithBuffers(rx, tx, nil)
+}
+
+func NewShmringTransportWithBuffers(rx, tx *shmring.Ring, buffers *FabricBuffers) *ShmringTransport {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ShmringTransport{
-		rx:     rx,
-		tx:     tx,
-		cancel: cancel,
-		ctx:    ctx,
-		buf:    make([]byte, 0, 256),
-	}
+	buf := &ensureFabricBuffers(buffers).TransportLine
+	return &ShmringTransport{rx: rx, tx: tx, cancel: cancel, ctx: ctx, lineBuf: buf}
 }
 
 func (t *ShmringTransport) ReadLine() ([]byte, error) {
-	t.buf = t.buf[:0]
+	var tmp [maxLineLen]byte
+	n, err := t.ReadLineInto(tmp[:])
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, n)
+	copy(out, tmp[:n])
+	return out, nil
+}
+
+func (t *ShmringTransport) ReadLineInto(dst []byte) (int, error) {
+	if len(dst) < maxLineLen {
+		return 0, fmt.Errorf("fabric read buffer too small: %d", len(dst))
+	}
+	t.n = 0
 	t.over = false
 
 	for {
@@ -38,78 +52,80 @@ func (t *ShmringTransport) ReadLine() ([]byte, error) {
 		if len(p1)+len(p2) == 0 {
 			select {
 			case <-t.ctx.Done():
-				return nil, fmt.Errorf("transport closed")
+				return 0, fmt.Errorf("transport closed")
 			case <-t.rx.Readable():
 				continue
 			}
 		}
 
-		// Scan p1 for newline.
 		if idx := findByte(p1, '\n'); idx >= 0 {
-			if !t.over {
-				t.buf = append(t.buf, p1[:idx]...)
+			if !t.over && !t.appendLineChunk(p1[:idx]) {
+				t.over = true
 			}
 			t.rx.ReadRelease(idx + 1)
-			if t.over {
-				t.buf = t.buf[:0]
-				t.over = false
-				return nil, ErrLineTooLong
-			}
-			if len(t.buf) > maxLineLen {
-				return nil, ErrLineTooLong
-			}
-			out := make([]byte, len(t.buf))
-			copy(out, t.buf)
-			traceLine("rx", out)
-			return out, nil
+			return t.finishLineInto(dst)
 		}
 
-		// No newline in p1 — consume it, check p2.
-		if !t.over {
-			t.buf = append(t.buf, p1...)
+		if !t.over && !t.appendLineChunk(p1) {
+			t.over = true
 		}
 
 		if idx := findByte(p2, '\n'); idx >= 0 {
-			if !t.over {
-				t.buf = append(t.buf, p2[:idx]...)
+			if !t.over && !t.appendLineChunk(p2[:idx]) {
+				t.over = true
 			}
 			t.rx.ReadRelease(len(p1) + idx + 1)
-			if t.over {
-				t.buf = t.buf[:0]
-				t.over = false
-				return nil, ErrLineTooLong
-			}
-			if len(t.buf) > maxLineLen {
-				return nil, ErrLineTooLong
-			}
-			out := make([]byte, len(t.buf))
-			copy(out, t.buf)
-			traceLine("rx", out)
-			return out, nil
+			return t.finishLineInto(dst)
 		}
 
-		// No newline — consume everything, wait for more.
-		if !t.over {
-			t.buf = append(t.buf, p2...)
-		}
-		t.rx.ReadRelease(len(p1) + len(p2))
-
-		// Check for oversize.
-		if len(t.buf) > maxLineLen {
-			t.buf = t.buf[:0]
+		if !t.over && !t.appendLineChunk(p2) {
 			t.over = true
 		}
+		t.rx.ReadRelease(len(p1) + len(p2))
 	}
+}
+
+func (t *ShmringTransport) appendLineChunk(p []byte) bool {
+	if len(p) == 0 {
+		return true
+	}
+	if t.n+len(p) > maxLineLen {
+		t.n = 0
+		return false
+	}
+	copy(t.lineBuf[t.n:], p)
+	t.n += len(p)
+	return true
+}
+
+func (t *ShmringTransport) finishLineInto(dst []byte) (int, error) {
+	if t.over {
+		t.n = 0
+		t.over = false
+		return 0, ErrLineTooLong
+	}
+	copy(dst, t.lineBuf[:t.n])
+	traceLine("rx", dst[:t.n])
+	return t.n, nil
 }
 
 func (t *ShmringTransport) WriteLine(data []byte) error {
 	if len(data) > maxLineLen {
 		return ErrLineTooLong
 	}
-	line := append(data, '\n')
-	written := 0
+	if err := t.writeBytes(data); err != nil {
+		return err
+	}
+	if err := t.writeBytes([]byte{'\n'}); err != nil {
+		return err
+	}
+	traceLine("tx", data)
+	return nil
+}
 
-	for written < len(line) {
+func (t *ShmringTransport) writeBytes(data []byte) error {
+	written := 0
+	for written < len(data) {
 		p1, p2 := t.tx.WriteAcquire()
 		if len(p1)+len(p2) == 0 {
 			select {
@@ -119,8 +135,7 @@ func (t *ShmringTransport) WriteLine(data []byte) error {
 				continue
 			}
 		}
-
-		remaining := line[written:]
+		remaining := data[written:]
 		n := copy(p1, remaining)
 		remaining = remaining[n:]
 		if len(remaining) > 0 && len(p2) > 0 {
@@ -129,7 +144,6 @@ func (t *ShmringTransport) WriteLine(data []byte) error {
 		t.tx.WriteCommit(n)
 		written += n
 	}
-	traceLine("tx", data)
 	return nil
 }
 

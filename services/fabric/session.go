@@ -30,7 +30,12 @@ const (
 	statusReady   = "ready"
 	statusOpening = "opening"
 	statusDown    = "down"
-	lineQueueSize = 32
+	// lineQueueSize is deliberately tiny on MCU builds. The UART RX ring is
+	// already the byte-level shock absorber; keeping only two fully decoded
+	// JSONL frames avoids reserving 32 * maxLineLen bytes of static RAM. This
+	// preserves allocation discipline without starving the reactor behind a
+	// large preallocated line queue.
+	lineQueueSize = 2
 )
 
 // ---- timeouts (local policy) ----
@@ -87,26 +92,37 @@ type outboundCall struct {
 
 type readResult struct {
 	line []byte
+	slot int
 	err  error
 }
 
 type linkStatePayload struct {
-	LinkID            string `json:"link_id"`
-	Status            string `json:"status"`
-	Ready             bool   `json:"ready"`
-	Established       bool   `json:"established"`
-	PeerID            string `json:"peer_id"`
-	LocalSID          string `json:"local_sid"`
-	PeerSID           string `json:"peer_sid,omitempty"`
-	PeerNode          string `json:"peer_node,omitempty"`
-	PeerProto         string `json:"peer_proto,omitempty"`
-	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
-	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
-	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
-	InboundCalls      int    `json:"inbound_calls"`
-	OutboundCalls     int    `json:"outbound_calls"`
-	Reason            string `json:"reason,omitempty"`
-	Err               string `json:"err,omitempty"`
+	LinkID            string         `json:"link_id"`
+	Status            string         `json:"status"`
+	Ready             bool           `json:"ready"`
+	Established       bool           `json:"established"`
+	PeerID            string         `json:"peer_id"`
+	LocalSID          string         `json:"local_sid"`
+	PeerSID           string         `json:"peer_sid,omitempty"`
+	PeerNode          string         `json:"peer_node,omitempty"`
+	PeerProto         string         `json:"peer_proto,omitempty"`
+	LastRxUnixMilli   int64          `json:"last_rx_unix_ms,omitempty"`
+	LastTxUnixMilli   int64          `json:"last_tx_unix_ms,omitempty"`
+	LastPongUnixMilli int64          `json:"last_pong_unix_ms,omitempty"`
+	InboundCalls      int            `json:"inbound_calls"`
+	OutboundCalls     int            `json:"outbound_calls"`
+	Reason            string         `json:"reason,omitempty"`
+	Err               string         `json:"err,omitempty"`
+	Counters          FabricCounters `json:"counters"`
+}
+
+// FabricLinkObservation gives other in-process services a small, typed way to
+// observe Fabric readiness without JSON-probing this package's private retained
+// payload shape. The payload remains package-private so the wire/schema contract
+// is still centralised here, but Telemetry and Updater can avoid reflection on
+// TinyGo's hot path.
+func (p linkStatePayload) FabricLinkObservation() (ready bool, peerSID string, localSID string) {
+	return p.Ready, p.PeerSID, p.LocalSID
 }
 
 // session manages the fabric link state machine over a Transport.
@@ -153,6 +169,9 @@ type session struct {
 	completedTransfers          []completedTransfer
 	pendingTargetCall           *pendingTargetCall
 	beginTransfer               func(transferMeta) (transferSink, error)
+	stageController             StageController
+	buffers                     *FabricBuffers
+	counters                    FabricCounters
 	busSubs                     *bus.SubscriptionSet
 	ctx                         context.Context
 }
@@ -174,62 +193,16 @@ func (s *session) logKV(msg, key, value string) {
 // run is the main loop. Blocks until ctx is cancelled.
 func (s *session) run(ctx context.Context) {
 	s.cfg.applyDefaults()
+	s.buffers = ensureFabricBuffers(s.buffers)
 	s.ctx = ctx
 	s.busSubs = s.conn.NewSubscriptionSet()
 	lines := make(chan readResult, lineQueueSize)
+	freeSlots := make(chan int, lineQueueSize)
+	for i := 0; i < lineQueueSize; i++ {
+		freeSlots <- i
+	}
 
-	go func() {
-		defer close(lines)
-		lastLineAt := time.Now()
-		for {
-			started := time.Now()
-			line, err := s.tr.ReadLine()
-			now := time.Now()
-			readDur := now.Sub(started)
-			sinceLine := now.Sub(lastLineAt)
-			if err != nil {
-				if errors.Is(err, ErrLineTooLong) {
-					otadiag.Event(
-						"[fabric-rx]", "read_error", otadiag.XferNone,
-						otadiag.KV("reason", "line_too_long"),
-						otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-						otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-					)
-					s.log("oversized line dropped")
-					continue
-				}
-				otadiag.Event(
-					"[fabric-rx]", "read_error", otadiag.XferNone,
-					otadiag.KV("reason", err.Error()),
-					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-				)
-				select {
-				case lines <- readResult{err: err}:
-				case <-ctx.Done():
-				}
-				return
-			}
-			t := protoType(line)
-			if shouldLogFabricRead(t, readDur, sinceLine) {
-				otadiag.Event(
-					"[fabric-rx]", "read_line", protoXferID(line),
-					otadiag.KV("type", t),
-					otadiag.KV("line_len", len(line)),
-					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-				)
-			}
-			lastLineAt = now
-			cp := make([]byte, len(line))
-			copy(cp, line)
-			select {
-			case lines <- readResult{line: cp}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	go s.readLoop(ctx, lines, freeSlots)
 
 	defer s.tr.Close()
 	defer func() {
@@ -274,11 +247,18 @@ func (s *session) run(ctx context.Context) {
 				return
 			}
 			if res.err != nil {
+				s.releaseReadSlot(freeSlots, res.slot)
+				if errors.Is(res.err, ErrLineTooLong) {
+					s.counters.RXLineTooLong++
+					continue
+				}
 				s.handleLinkDown(reasonTransportDown, res.err.Error())
 				return
 			}
+			s.counters.RXLines++
 			beforeRx := s.lastRxAt
 			s.dispatch(res.line)
+			s.releaseReadSlot(freeSlots, res.slot)
 			if s.lastRxAt.After(beforeRx) {
 				resetTimer(stale, s.cfg.LivenessTimeout)
 			}
@@ -312,6 +292,65 @@ func (s *session) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *session) readLoop(ctx context.Context, lines chan<- readResult, freeSlots <-chan int) {
+	defer close(lines)
+	lastLineAt := time.Now()
+	_ = lastLineAt
+	for {
+		var slot int
+		select {
+		case slot = <-freeSlots:
+		case <-ctx.Done():
+			return
+		}
+		started := time.Now()
+		_ = started
+		buf := s.buffers.RXLines[slot][:]
+		n, err := s.readTransportLine(buf)
+		now := time.Now()
+		_ = now
+		if err != nil {
+			select {
+			case lines <- readResult{slot: slot, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if !errors.Is(err, ErrLineTooLong) {
+				return
+			}
+			continue
+		}
+		lastLineAt = now
+		select {
+		case lines <- readResult{line: buf[:n], slot: slot}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *session) readTransportLine(dst []byte) (int, error) {
+	if tr, ok := s.tr.(boundedLineTransport); ok {
+		return tr.ReadLineInto(dst)
+	}
+	line, err := s.tr.ReadLine()
+	if err != nil {
+		return 0, err
+	}
+	if len(line) > len(dst) {
+		return 0, ErrLineTooLong
+	}
+	copy(dst, line)
+	return len(line), nil
+}
+
+func (s *session) releaseReadSlot(freeSlots chan<- int, slot int) {
+	if slot < 0 {
+		return
+	}
+	freeSlots <- slot
 }
 
 func shouldLogFabricRead(msgType string, _, _ time.Duration) bool {
@@ -369,6 +408,7 @@ func (s *session) publishLinkState(reason, err string) {
 		return
 	}
 	status := s.currentStatus()
+	counters := s.counters
 	if s.link != linkUp && (reason != "" || err != "") {
 		status = statusDown
 	}
@@ -391,6 +431,7 @@ func (s *session) publishLinkState(reason, err string) {
 			OutboundCalls:     len(s.outboundCalls),
 			Reason:            reason,
 			Err:               err,
+			Counters:          counters,
 		},
 		true,
 	))
@@ -400,8 +441,13 @@ func (s *session) markRx() {
 	s.lastRxAt = time.Now()
 }
 
+func (s *session) markFrameRX() {
+	s.counters.RXFrames++
+}
+
 func (s *session) markTx() {
 	s.lastTxAt = time.Now()
+	s.counters.TXFrames++
 }
 
 func (s *session) handleLinkDown(reason, err string) {
@@ -524,7 +570,13 @@ func (s *session) dispatch(line []byte) {
 
 	switch t {
 	case msgHello:
-		typedDispatch(s, t, line, s.onHello)
+		msg, ok := decodeHelloFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_hello"))
+			return
+		}
+		s.markFrameRX()
+		s.onHello(&msg)
 		return
 	case msgHelloAck:
 		typedDispatch(s, t, line, s.onHelloAck)
@@ -537,15 +589,33 @@ func (s *session) dispatch(line []byte) {
 
 	switch t {
 	case msgPing:
-		typedDispatch(s, t, line, s.onPing)
+		msg, ok := decodePingFast(line, msgPing)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_ping"))
+			return
+		}
+		s.markFrameRX()
+		s.onPing(&msg)
 	case msgPong:
-		typedDispatch(s, t, line, s.onPong)
+		msg, ok := decodePongFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_pong"))
+			return
+		}
+		s.markFrameRX()
+		s.onPong(&msg)
 	case msgPub:
 		typedDispatch(s, t, line, s.onPub)
 	case msgUnretain:
 		typedDispatch(s, t, line, s.onUnretain)
 	case msgCall:
-		typedDispatch(s, t, line, s.onCall)
+		msg, ok := decodeCallFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_call"))
+			return
+		}
+		s.markFrameRX()
+		s.onCall(&msg)
 	case msgReply:
 		typedDispatch(s, t, line, s.onReply)
 	case msgXferBegin:
@@ -553,13 +623,39 @@ func (s *session) dispatch(line []byte) {
 			"[fabric-xfer]", "begin_route_start", protoXferID(line),
 			otadiag.KV("line_len", len(line)),
 		)
-		typedDispatch(s, t, line, s.onTransferBegin)
+		msg, ok := decodeXferBeginFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_begin"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferBegin(&msg)
+		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
 	case msgXferChunk:
-		typedDispatch(s, t, line, s.onTransferChunk)
+		msg, ok := decodeXferChunkFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_chunk"))
+			s.retryMalformedTransferFrame(t, line)
+			return
+		}
+		s.markFrameRX()
+		s.onTransferChunk(&msg)
 	case msgXferCommit:
-		typedDispatch(s, t, line, s.onTransferCommit)
+		msg, ok := decodeXferCommitFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_commit"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferCommit(&msg)
 	case msgXferAbort:
-		typedDispatch(s, t, line, s.onTransferAbort)
+		msg, ok := decodeXferAbortFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_abort"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferAbort(&msg)
 	case msgXferReady, msgXferNeed, msgXferDone:
 		s.logKV("echoed transfer control ignored", "type", t)
 	default:
@@ -601,6 +697,7 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
+	s.markFrameRX()
 	handler(&msg)
 	if msgType == msgXferBegin {
 		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
@@ -636,6 +733,7 @@ func (s *session) requireLinkUp(t string) bool {
 }
 
 func (s *session) logMalformed(line []byte, err error) {
+	s.counters.RXBadJSON++
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
@@ -854,12 +952,7 @@ func (s *session) onHello(msg *protoHello) {
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
-	if !s.sendControl(marshal(protoHelloAck{
-		Type:  msgHelloAck,
-		Proto: protocolName,
-		SID:   s.localSID,
-		Node:  s.nodeID,
-	})) {
+	if !s.sendControl(marshalHelloAck(s.localSID, s.nodeID)) {
 		return
 	}
 	s.log("hello_ack tx")
@@ -903,7 +996,7 @@ func (s *session) onPing(msg *protoPing) {
 	}
 	s.markRx()
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.sendControl(marshal(protoPong{Type: msgPong, SID: s.localSID})) {
+	if !s.sendControl(marshalPong(s.localSID)) {
 		return
 	}
 	s.log("pong tx")
@@ -919,7 +1012,7 @@ func (s *session) tickPing(now time.Time) {
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
 		return
 	}
-	if !s.sendControl(marshal(protoPing{Type: msgPing, SID: s.localSID})) {
+	if !s.sendControl(marshalPing(s.localSID)) {
 		return
 	}
 	s.nextPingAt = now.Add(s.cfg.PingInterval)
@@ -988,24 +1081,22 @@ func (s *session) onCall(msg *protoCall) {
 	if !validWireTopic(msg.Topic) {
 		s.rpcDiag("call_reject", msg, nil, "bad_topic")
 		s.log("incoming call dropped: bad_topic")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "bad_topic"}))
+		s.sendRPC(marshalReplyErr(msg.ID, "bad_topic"))
 		return
 	}
-	s.rpcDiag("call_rx", msg, nil, "",
-		otadiag.KV("timeout_ms", strconvx.Itoa(msg.TimeoutMs)),
-	)
+	s.rpcDiag("call_rx", msg, nil, "")
 	for _, call := range s.inboundCalls {
 		if call.id == msg.ID {
 			s.rpcDiag("call_reject", msg, nil, "duplicate_call_id")
 			s.logKV("incoming call dropped", "err", "duplicate_call_id")
-			s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "duplicate_call_id"}))
+			s.sendRPC(marshalReplyErr(msg.ID, "duplicate_call_id"))
 			return
 		}
 	}
 	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
 		s.rpcDiag("call_reject", msg, nil, reasonBusy)
 		s.log("incoming call dropped: busy")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
+		s.sendRPC(marshalReplyErr(msg.ID, reasonBusy))
 		return
 	}
 
@@ -1013,20 +1104,15 @@ func (s *session) onCall(msg *protoCall) {
 	if localTopic == nil {
 		s.rpcDiag("call_reject", msg, nil, reasonNoRoute)
 		s.log("incoming call dropped: no_route")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
+		s.sendRPC(marshalReplyErr(msg.ID, reasonNoRoute))
 		return
 	}
 	s.rpcDiag("call_route_ok", msg, localTopic, "")
 
 	s.markRx()
 	timeout := callTimeoutDef
-	if msg.TimeoutMs > 0 {
-		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
-	}
 	busMsg := s.conn.NewMessage(localTopic, msg.Payload, false)
-	s.rpcDiag("call_dispatch_start", msg, localTopic, "",
-		otadiag.KV("timeout_ms", strconvx.Itoa(int(timeout/time.Millisecond))),
-	)
+	s.rpcDiag("call_dispatch_start", msg, localTopic, "")
 	sub := s.requestBus(busMsg)
 	topicCopy := append([]string(nil), msg.Topic...)
 	call := &inboundCall{
@@ -1476,22 +1562,22 @@ func (s *session) handleInboundReplyEvent(id string, reply *bus.Message, closed 
 	}
 	s.removeInboundCall(idx)
 	if closed || reply == nil {
-		sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
+		sent := s.sendRPC(marshalReplyErr(call.id, reasonTimeout))
 		s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
 		return
 	}
 	if errStr := checkBusError(reply.Payload); errStr != "" {
-		sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr}))
+		sent := s.sendRPC(marshalReplyErr(call.id, errStr))
 		s.rpcDiagInbound("call_reply_tx", call, false, errStr, otadiag.KV("sent", sent))
 		return
 	}
 	payload, err := marshalPayload(reply.Payload)
 	if err != nil {
-		sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal}))
+		sent := s.sendRPC(marshalReplyErr(call.id, errPayloadMarshal))
 		s.rpcDiagInbound("call_reply_tx", call, false, errPayloadMarshal, otadiag.KV("sent", sent))
 		return
 	}
-	sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload}))
+	sent := s.sendRPC(marshalReplyOKRaw(call.id, payload))
 	s.rpcDiagInbound("call_reply_tx", call, true, "", otadiag.KV("sent", sent))
 }
 
@@ -1506,7 +1592,7 @@ func (s *session) expireInbound(now time.Time) {
 				s.conn.Unsubscribe(call.sub)
 				call.sub = nil
 			}
-			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
+			sent := s.sendRPC(marshalReplyErr(call.id, reasonTimeout))
 			s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
 			continue
 		}
@@ -1560,11 +1646,10 @@ func (s *session) handleOutboundCallEvent(now time.Time, msg *bus.Message) {
 		})
 	}
 	_ = s.sendRPC(marshal(protoCall{
-		Type:      msgCall,
-		ID:        corr,
-		Topic:     wireTopic,
-		Payload:   payload,
-		TimeoutMs: int(callTimeoutDef / time.Millisecond),
+		Type:    msgCall,
+		ID:      corr,
+		Topic:   wireTopic,
+		Payload: payload,
 	}))
 }
 

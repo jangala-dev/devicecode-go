@@ -1,4 +1,4 @@
-//go:build tinygo && rp2350
+//go:build tinygo && rp2350 && !fabric_uart_hwtest
 
 package updater
 
@@ -96,8 +96,8 @@ func writeStreamedStage(xferID string, generation uint64, data []byte) error {
 	return err
 }
 
-func commitStreamedStage(xferID string, generation uint64) (streamedStage, error) {
-	_, _ = xferID, generation
+func commitStreamedStage(svc *Service, xferID string, generation uint64) (streamedStage, error) {
+	_, _, _ = svc, xferID, generation
 	if streamedVerifier == nil {
 		return streamedStage{}, errors.New("streamed_stage_not_started")
 	}
