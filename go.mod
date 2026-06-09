@@ -1,11 +1,11 @@
 module devicecode-go
 
-go 1.25.0
+go 1.25.1
 
 require (
-	pico2-a-b v0.0.0
 	github.com/jangala-dev/tinygo-uartx v0.0.0-20251028085354-58b6258234b3
 	golang.org/x/exp v0.0.0-20251002181428-27f1f14c8bb9
+	pico2-a-b v0.0.0
 	tinygo.org/x/drivers v0.33.0
 )
 
