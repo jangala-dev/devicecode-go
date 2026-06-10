@@ -1509,6 +1509,51 @@ func TestDrainCriticalExportsCoalescesLatestRetainedFact(t *testing.T) {
 	}
 }
 
+func TestDrainExportsCoalescesQueuedRetainedTelemetry(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+	sub := fabricConn.Subscribe(bus.T("state", "self", "runtime", "#"))
+	defer fabricConn.Unsubscribe(sub)
+
+	s := session{
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+		exportSubs:     []*bus.Subscription{sub},
+	}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"seq": 1},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"seq": 2},
+		true,
+	))
+
+	s.drainExports()
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes = %d, want one coalesced retained export", len(tr.writes))
+	}
+	pub := decodePubWrite(t, tr.writes[0])
+	if !slicesEqual(pub.Topic, []string{"state", "self", "runtime", "memory"}) {
+		t.Fatalf("topic = %v, want state/self/runtime/memory", pub.Topic)
+	}
+	var payload map[string]int
+	if err := json.Unmarshal(pub.Payload, &payload); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if payload["seq"] != 2 {
+		t.Fatalf("payload seq = %d, want latest seq 2", payload["seq"])
+	}
+}
+
 func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")

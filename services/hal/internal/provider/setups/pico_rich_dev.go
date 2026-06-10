@@ -23,6 +23,11 @@ var SelectedPlan = ResourcePlan{
 	},
 }
 
+// Keep raw serial session rings deliberately modest. Fabric is a framed
+// stream protocol and should remain correct under bounded buffering; these
+// are not intended to hold full transfer frames.
+const rawSerialSessionSize = 512
+
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
 
@@ -42,8 +47,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart0",
 			Baud:   115_200,
-			RXSize: 32,
-			TXSize: 2048,
+			RXSize: rawSerialSessionSize,
+			TXSize: rawSerialSessionSize,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -52,8 +57,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 32,
-			TXSize: 512,
+			RXSize: rawSerialSessionSize,
+			TXSize: rawSerialSessionSize,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{

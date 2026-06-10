@@ -49,6 +49,7 @@ type session struct {
 	rxRing   *shmring.Ring
 	txHandle shmring.Handle
 	txRing   *shmring.Ring
+	probe    uartxProbe
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -317,14 +318,25 @@ func (d *Device) reactor(s *session) {
 	u := d.port
 	rxR := s.rxRing // UART -> app
 	txR := s.txRing // app  -> UART
+	s.probe.start(d.id, u, rxR, txR)
 
 	for {
 		made := false
+		rxMade := false
+		rxBackpressure := false
 
-		// UART RX -> rxRing (use spans; fill p1 completely before p2)
+		// UART RX -> rxRing.
+		//
+		// RX is the only lossy edge in this chain. Drain the UARTX software RX
+		// ring until it is empty, or until the session ring applies real
+		// back-pressure. Do not switch to TX merely because some RX bytes were
+		// published: during a peer chunk, the remote UART keeps sending and the
+		// interrupt-side ring only has short-latency elasticity.
 		for {
 			p1, p2 := rxR.WriteAcquire()
 			if len(p1) == 0 {
+				s.probe.rxRingFull(d.id, u, rxR, txR)
+				rxBackpressure = true
 				break
 			}
 			n1 := u.TryRead(p1)
@@ -333,7 +345,9 @@ func (d *Device) reactor(s *session) {
 			}
 			if n1 < len(p1) {
 				rxR.WriteCommit(n1)
+				s.probe.afterRX(d.id, u, rxR, txR, n1)
 				made = true
+				rxMade = true
 				continue
 			}
 			n2 := 0
@@ -341,35 +355,84 @@ func (d *Device) reactor(s *session) {
 				n2 = u.TryRead(p2)
 			}
 			rxR.WriteCommit(n1 + n2)
+			s.probe.afterRX(d.id, u, rxR, txR, n1+n2)
 			made = true
+			rxMade = true
 		}
 
-		// txRing -> UART TX (use spans; drain p1 completely before p2)
-		for {
+		if rxBackpressure {
+			// Downstream RX is full. Do not spin on UART readability, and do not rely
+			// on an explicit scheduler yield. If there is no outbound work, block on
+			// the only two edges that can make progress: the protocol consumer freeing
+			// RX space, or the application producing TX work. If outbound work exists,
+			// allow one small TX escape hatch; this lets a writer blocked in writeLine
+			// finish, after which the same application goroutine can read and free
+			// rxRing.
+			made = false
+			if txR.Available() == 0 {
+				select {
+				case <-s.ctx.Done():
+					return
+				case <-rxR.Writable():
+				case <-txR.Readable():
+				}
+				continue
+			}
+		} else if rxMade {
+			// RX made progress and the downstream ring still had room. Re-check RX
+			// immediately before considering TX. This preserves the serial worker
+			// as the short-latency drain for the UARTX ISR ring without involving a
+			// scheduler hint.
+			continue
+		}
+
+		// txRing -> UART TX.  Transmit under a small per-activation budget so
+		// retained publications or diagnostic chatter cannot monopolise this
+		// worker while the peer is sending a long chunk.  Under RX back-pressure,
+		// the same budget also acts as a deadlock escape hatch for a writer whose
+		// reader cannot run until writeLine completes.
+		const txBudgetPerPass = 64
+		txBudget := txBudgetPerPass
+		for txBudget > 0 {
 			p1, p2 := txR.ReadAcquire()
 			if len(p1) == 0 {
 				break
+			}
+			if len(p1) > txBudget {
+				p1 = p1[:txBudget]
 			}
 			n1 := u.TryWrite(p1)
 			if n1 == 0 {
 				break
 			}
-			if n1 < len(p1) {
+			txBudget -= n1
+			if n1 < len(p1) || txBudget == 0 {
 				txR.ReadRelease(n1)
+				s.probe.afterTX(d.id, u, rxR, txR, n1)
 				made = true
-				continue
+				break
 			}
 			n2 := 0
-			if len(p2) > 0 {
+			if len(p2) > 0 && txBudget > 0 {
+				if len(p2) > txBudget {
+					p2 = p2[:txBudget]
+				}
 				n2 = u.TryWrite(p2)
+				txBudget -= n2
 			}
 			txR.ReadRelease(n1 + n2)
+			s.probe.afterTX(d.id, u, rxR, txR, n1+n2)
 			made = true
+			if n2 == 0 || txBudget == 0 {
+				break
+			}
 		}
 
 		if made {
 			continue
 		}
+
+		s.probe.periodic(d.id, u, rxR, txR)
 
 		// Idle: wait for any edge, then re-check.
 		select {

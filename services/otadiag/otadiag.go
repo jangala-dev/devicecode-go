@@ -41,6 +41,13 @@ func KV(key string, value any) Field {
 	return Field{Key: key, Value: valueString(value)}
 }
 
+// Enabled reports whether Event would emit a line for prefix/event under the
+// current verbosity policy. It is used by TinyGo hot paths to avoid building
+// diagnostic Field values that would be filtered out.
+func Enabled(prefix, event string) bool {
+	return allowEvent(prefix, event, nil)
+}
+
 func Event(prefix, event, xferID string, fields ...Field) {
 	if !allowEvent(prefix, event, fields) {
 		return

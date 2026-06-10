@@ -19,6 +19,10 @@ const transferIdleRetryLimit = 3
 const transferCorruptRetryLimit = 3
 const completedTransferCacheLimit = 4
 
+func fabricXferDiagEnabled(event string) bool {
+	return otadiag.Enabled("[fabric-xfer]", event)
+}
+
 // transferMeta captures xfer_begin contents. The transfer target is explicit
 // on the wire; firmware update uses target="updater/main". meta remains opaque
 // and informational to Fabric.
@@ -390,19 +394,47 @@ func (s *session) decodeChunkData(encoded string) ([]byte, string) {
 }
 
 func (s *session) sendTransferReady(id string) bool {
-	return s.sendControl(marshalXferReady(id))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_ready_start", "xfer", id)
+	}
+	ok := s.sendControl(marshalXferReady(id))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_ready_done", "xfer", id, "ok", ok)
+	}
+	return ok
 }
 
 func (s *session) sendTransferNeed(id string, next uint32) bool {
-	return s.sendControl(marshalXferNeed(id, next))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_need_start", "xfer", id, "next", next)
+	}
+	ok := s.sendControl(marshalXferNeed(id, next))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_need_done", "xfer", id, "next", next, "ok", ok)
+	}
+	return ok
 }
 
 func (s *session) sendTransferDone(id string) bool {
-	return s.sendControl(marshalXferDone(id))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_done_start", "xfer", id)
+	}
+	ok := s.sendControl(marshalXferDone(id))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_done_done", "xfer", id, "ok", ok)
+	}
+	return ok
 }
 
 func (s *session) sendTransferAbort(id, reason string) bool {
-	return s.sendControl(marshalXferAbort(id, reason))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_abort_start", "xfer", id, "reason", reason)
+	}
+	ok := s.sendControl(marshalXferAbort(id, reason))
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "tx_abort_done", "xfer", id, "reason", reason, "ok", ok)
+	}
+	return ok
 }
 
 func (s *session) clearTransfer() *incomingTransfer {
@@ -465,6 +497,9 @@ func (s *session) checkTransferTimeout(now time.Time) {
 		cur.idleRetries++
 		cur.deadline = now.Add(s.cfg.PhaseTimeout)
 		s.logKV("transfer idle retry", "offset", u32s(cur.bytesWritten))
+		if xferProbeEnabled {
+			xferProbe("idle_retry", "id", cur.meta.ID, "next", cur.bytesWritten, "retry", int(cur.idleRetries))
+		}
 		s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 		return
 	}
@@ -493,6 +528,9 @@ func (s *session) retryCorruptTransferFrame(reason string) bool {
 	}
 	s.counters.TransferOffsetRetries++
 	cur.corruptRetriesAtOffset++
+	if xferProbeEnabled {
+		xferProbe("corrupt_retry", "id", cur.meta.ID, "next", cur.bytesWritten, "retry", int(cur.corruptRetriesAtOffset), "reason", reason)
+	}
 	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
 	otadiag.Event(
 		"[fabric-xfer]", "need_tx", cur.meta.ID,
@@ -564,14 +602,19 @@ func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 
 func (s *session) onTransferBegin(msg *protoXferBegin) {
 	otadiag.SetActiveXfer(msg.XferID)
-	otadiag.Event(
-		"[fabric-xfer]", "begin_rx", msg.XferID,
-		otadiag.KV("target", msg.Target),
-		otadiag.KV("size", msg.Size),
-		otadiag.KV("digest_alg", msg.DigestAlg),
-		otadiag.KV("digest", msg.Digest),
-		otadiag.KV("meta_len", len(msg.Meta)),
-	)
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "begin_enter", "xfer", msg.XferID, "target", msg.Target, "size", msg.Size, "digest", msg.Digest)
+	}
+	if fabricXferDiagEnabled("begin_rx") {
+		otadiag.Event(
+			"[fabric-xfer]", "begin_rx", msg.XferID,
+			otadiag.KV("target", msg.Target),
+			otadiag.KV("size", msg.Size),
+			otadiag.KV("digest_alg", msg.DigestAlg),
+			otadiag.KV("digest", msg.Digest),
+			otadiag.KV("meta_len", len(msg.Meta)),
+		)
+	}
 	meta, errStr := validateTransferBegin(msg)
 	if errStr != "" {
 		if msg.XferID != "" {
@@ -592,10 +635,15 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		s.logKV("xfer_begin dropped", "err", errStr)
 		return
 	}
-	otadiag.Event(
-		"[fabric-xfer]", "begin_validate_ok", meta.ID,
-		otadiag.KV("target", meta.Target),
-	)
+	if fabricXferDiagEnabled("begin_validate_ok") {
+		otadiag.Event(
+			"[fabric-xfer]", "begin_validate_ok", meta.ID,
+			otadiag.KV("target", meta.Target),
+		)
+	}
+	if xferProbeEnabled {
+		xferProbe("begin", "id", meta.ID, "size", meta.Size, "target", meta.Target, "digest", meta.Digest)
+	}
 	s.markRx()
 	now := time.Now()
 	if s.incomingTransfer != nil {
@@ -603,10 +651,14 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		if sameTransferTuple(cur.meta, meta) {
 			s.logKV("xfer_begin duplicate", "id", meta.ID)
 			readyOK := s.sendTransferReady(meta.ID)
-			otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK), otadiag.KV("duplicate", true))
+			if fabricXferDiagEnabled("ready_tx") {
+				otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK), otadiag.KV("duplicate", true))
+			}
 			if readyOK {
 				needOK := s.sendTransferNeed(meta.ID, cur.bytesWritten)
-				otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", cur.bytesWritten), otadiag.KV("ok", needOK), otadiag.KV("duplicate", true))
+				if fabricXferDiagEnabled("need_tx") {
+					otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", cur.bytesWritten), otadiag.KV("ok", needOK), otadiag.KV("duplicate", true))
+				}
 			}
 			cur.deadline = now.Add(s.cfg.PhaseTimeout)
 			return
@@ -640,7 +692,9 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 	if done, ok := s.completedTransferFor(meta.ID); ok {
 		if sameTransferTuple(done, meta) {
 			doneOK := s.sendTransferDone(meta.ID)
-			otadiag.Event("[fabric-xfer]", "begin_duplicate_done", meta.ID, otadiag.KV("done_tx", doneOK))
+			if fabricXferDiagEnabled("begin_duplicate_done") {
+				otadiag.Event("[fabric-xfer]", "begin_duplicate_done", meta.ID, otadiag.KV("done_tx", doneOK))
+			}
 			return
 		}
 		abortOK := s.sendTransferAbort(meta.ID, "conflicting_transfer")
@@ -654,14 +708,22 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 			return beginUpdaterTransfer(s.stageController, meta)
 		}
 	}
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "begin_sink_start", "xfer", meta.ID, "target", meta.Target, "size", meta.Size)
+	}
 	beginStart := time.Now()
-	otadiag.Event(
-		"[fabric-xfer]", "begin_transfer_start", meta.ID,
-		otadiag.KV("target", meta.Target),
-		otadiag.KV("size", meta.Size),
-	)
+	if fabricXferDiagEnabled("begin_transfer_start") {
+		otadiag.Event(
+			"[fabric-xfer]", "begin_transfer_start", meta.ID,
+			otadiag.KV("target", meta.Target),
+			otadiag.KV("size", meta.Size),
+		)
+	}
 	sink, err := beginFn(meta)
 	if err != nil {
+		if fabricTraceEnabled {
+			println("[fabric-xfer]", "sid", s.localSID, "begin_sink_error", "xfer", meta.ID, "err", err.Error())
+		}
 		durMS := int(time.Since(beginStart) / time.Millisecond)
 		abortOK := s.sendTransferAbort(meta.ID, err.Error())
 		otadiag.Event(
@@ -673,10 +735,15 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		otadiag.StopUpdateWindow("begin_transfer_error")
 		return
 	}
-	otadiag.Event(
-		"[fabric-xfer]", "begin_transfer_done", meta.ID,
-		otadiag.KV("dur_ms", int(time.Since(beginStart)/time.Millisecond)),
-	)
+	if fabricXferDiagEnabled("begin_transfer_done") {
+		otadiag.Event(
+			"[fabric-xfer]", "begin_transfer_done", meta.ID,
+			otadiag.KV("dur_ms", int(time.Since(beginStart)/time.Millisecond)),
+		)
+	}
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "begin_sink_ok", "xfer", meta.ID)
+	}
 	s.counters.TransferBegins++
 	s.incomingTransfer = &incomingTransfer{
 		meta:     meta,
@@ -684,17 +751,32 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		hasher:   xxhash.New(0),
 		deadline: now.Add(s.cfg.PhaseTimeout),
 	}
+	if xferProbeEnabled {
+		xferProbe("begin_ok", "id", meta.ID, "next", uint32(0))
+	}
 	readyOK := s.sendTransferReady(meta.ID)
-	otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK))
+	if fabricXferDiagEnabled("ready_tx") {
+		otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK))
+	}
 	if readyOK {
 		needOK := s.sendTransferNeed(meta.ID, 0)
-		otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", needOK))
+		if fabricXferDiagEnabled("need_tx") {
+			otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", needOK))
+		}
 	} else {
-		otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", false), otadiag.KV("skipped", "ready_failed"))
+		if fabricXferDiagEnabled("need_tx") {
+			otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", false), otadiag.KV("skipped", "ready_failed"))
+		}
 	}
 }
 
 func (s *session) startPendingChunkWrite(cur *incomingTransfer, offset uint32, raw []byte) {
+	if xferProbeEnabled {
+		xferProbe("write_start", "id", cur.meta.ID, "offset", offset, "len", len(raw))
+	}
+	if fabricTraceEnabled {
+		println("[fabric-xfer]", "sid", s.localSID, "chunk_worker_start", "xfer", cur.meta.ID, "offset", offset, "len", len(raw))
+	}
 	ch := make(chan transferChunkResult, 1)
 	data := raw
 	started := time.Now()
@@ -711,12 +793,26 @@ func (s *session) startPendingChunkWrite(cur *incomingTransfer, offset uint32, r
 }
 
 func (s *session) finishChunkWrite(now time.Time, res transferChunkResult) {
+	if fabricTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[fabric-xfer]", "sid", s.localSID, "chunk_worker_done", "err", errText)
+	}
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingChunk == nil {
 		return
 	}
 	pending := cur.pendingChunk
 	cur.pendingChunk = nil
+	if xferProbeEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		xferProbe("write_done", "id", pending.xferID, "offset", pending.offset, "dur_ms", int(time.Since(pending.started)/time.Millisecond), "err", errText)
+	}
 	if res.err != nil {
 		reason := res.err.Error()
 		otadiag.Event(
@@ -739,22 +835,32 @@ func (s *session) finishChunkWrite(now time.Time, res transferChunkResult) {
 	cur.corruptRetryOffset = cur.bytesWritten
 	cur.corruptRetriesAtOffset = 0
 	cur.deadline = now.Add(s.cfg.PhaseTimeout)
-	otadiag.Event(
-		"[fabric-xfer]", "sink_write_done", pending.xferID,
-		otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
-		otadiag.KV("next", u32s(cur.bytesWritten)),
-	)
+	if fabricXferDiagEnabled("sink_write_done") {
+		otadiag.Event(
+			"[fabric-xfer]", "sink_write_done", pending.xferID,
+			otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
+			otadiag.KV("next", u32s(cur.bytesWritten)),
+		)
+	}
 	pending.data = nil
+	if xferProbeEnabled {
+		xferProbe("need_after_write", "id", cur.meta.ID, "next", cur.bytesWritten)
+	}
 	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
-	otadiag.Event(
-		"[fabric-xfer]", "need_tx", cur.meta.ID,
-		otadiag.KV("next", cur.bytesWritten),
-		otadiag.KV("ok", needOK),
-		otadiag.KV("accepted", true),
-	)
+	if fabricXferDiagEnabled("need_tx") {
+		otadiag.Event(
+			"[fabric-xfer]", "need_tx", cur.meta.ID,
+			otadiag.KV("next", cur.bytesWritten),
+			otadiag.KV("ok", needOK),
+			otadiag.KV("accepted", true),
+		)
+	}
 }
 
 func (s *session) startPendingTransferCommit(cur *incomingTransfer) {
+	if xferProbeEnabled {
+		xferProbe("commit_start", "id", cur.meta.ID, "bytes", cur.bytesWritten, "chunks", cur.chunksSeen)
+	}
 	ch := make(chan transferCommitResult, 1)
 	started := time.Now()
 	cur.pendingCommit = &pendingTransferCommit{
@@ -768,12 +874,26 @@ func (s *session) startPendingTransferCommit(cur *incomingTransfer) {
 }
 
 func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) {
+	if fabricTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[fabric-xfer]", "sid", s.localSID, "commit_worker_done", "bytes", res.info.BytesWritten, "generation", res.info.Generation, "err", errText)
+	}
 	cur := s.incomingTransfer
 	if cur == nil || cur.pendingCommit == nil {
 		return
 	}
 	pending := cur.pendingCommit
 	cur.pendingCommit = nil
+	if xferProbeEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		xferProbe("commit_done", "id", pending.xferID, "dur_ms", int(time.Since(pending.started)/time.Millisecond), "bytes", res.info.BytesWritten, "generation", res.info.Generation, "err", errText)
+	}
 	if res.err != nil {
 		reason := res.err.Error()
 		s.logKV("transfer commit failed", "err", reason)
@@ -784,10 +904,12 @@ func (s *session) finishTransferCommit(now time.Time, res transferCommitResult) 
 	}
 	meta := cur.meta
 	s.clearTransfer()
-	otadiag.Event(
-		"[fabric-xfer]", "transfer_commit_done", pending.xferID,
-		otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
-	)
+	if fabricXferDiagEnabled("transfer_commit_done") {
+		otadiag.Event(
+			"[fabric-xfer]", "transfer_commit_done", pending.xferID,
+			otadiag.KV("dur_ms", int(time.Since(pending.started)/time.Millisecond)),
+		)
+	}
 	if reason := s.startTransferTargetCall(meta, pending.xferID, res.info); reason != "" {
 		res.info.cancelStage(reason)
 		abortOK := s.sendTransferAbort(pending.xferID, reason)
@@ -803,73 +925,105 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 		return
 	}
 	id := cur.meta.ID
+	if xferProbeEnabled {
+		xferProbe("chunk_rx", "id", id, "offset", msg.Offset, "expected", cur.bytesWritten, "encoded_len", len(msg.Data))
+	}
 	if cur.pendingChunk != nil {
+		if xferProbeEnabled {
+			xferProbe("chunk_drop_write_pending", "id", id, "offset", msg.Offset, "expected", cur.bytesWritten, "pending", cur.pendingChunk.offset)
+		}
 		s.markRx()
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_while_write_pending", id,
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("pending_offset", u32s(cur.pendingChunk.offset)),
-			otadiag.KV("expected", u32s(cur.bytesWritten)),
-		)
+		if fabricXferDiagEnabled("chunk_while_write_pending") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_while_write_pending", id,
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("pending_offset", u32s(cur.pendingChunk.offset)),
+				otadiag.KV("expected", u32s(cur.bytesWritten)),
+			)
+		}
 		return
 	}
 	if cur.pendingCommit != nil {
+		if xferProbeEnabled {
+			xferProbe("chunk_drop_commit_pending", "id", id, "offset", msg.Offset, "expected", cur.bytesWritten)
+		}
 		s.markRx()
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_while_commit_pending", id,
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("expected", u32s(cur.bytesWritten)),
-		)
+		if fabricXferDiagEnabled("chunk_while_commit_pending") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_while_commit_pending", id,
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("expected", u32s(cur.bytesWritten)),
+			)
+		}
 		return
 	}
-	otadiag.Event(
-		"[fabric-xfer]", "chunk_rx", id,
-		otadiag.KV("offset", u32s(msg.Offset)),
-		otadiag.KV("expected", u32s(cur.bytesWritten)),
-		otadiag.KV("encoded_len", strconvx.Itoa(len(msg.Data))),
-	)
-	if msg.Offset < cur.bytesWritten {
-		s.markRx()
-		needOK := s.sendTransferNeed(id, cur.bytesWritten)
+	if fabricXferDiagEnabled("chunk_rx") {
 		otadiag.Event(
-			"[fabric-xfer]", "chunk_stale_offset", id,
+			"[fabric-xfer]", "chunk_rx", id,
 			otadiag.KV("offset", u32s(msg.Offset)),
 			otadiag.KV("expected", u32s(cur.bytesWritten)),
-			otadiag.KV("need_tx", needOK),
+			otadiag.KV("encoded_len", strconvx.Itoa(len(msg.Data))),
 		)
+	}
+	if msg.Offset < cur.bytesWritten {
+		if xferProbeEnabled {
+			xferProbe("chunk_stale", "id", id, "offset", msg.Offset, "expected", cur.bytesWritten)
+		}
+		s.markRx()
+		needOK := s.sendTransferNeed(id, cur.bytesWritten)
+		if fabricXferDiagEnabled("chunk_stale_offset") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_stale_offset", id,
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("expected", u32s(cur.bytesWritten)),
+				otadiag.KV("need_tx", needOK),
+			)
+		}
 		return
 	}
 	if msg.Offset > cur.bytesWritten {
+		if xferProbeEnabled {
+			xferProbe("chunk_future", "id", id, "offset", msg.Offset, "expected", cur.bytesWritten)
+		}
 		s.markRx()
 		needOK := s.sendTransferNeed(id, cur.bytesWritten)
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_future_offset", id,
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("expected", u32s(cur.bytesWritten)),
-			otadiag.KV("need_tx", needOK),
-		)
+		if fabricXferDiagEnabled("chunk_future_offset") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_future_offset", id,
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("expected", u32s(cur.bytesWritten)),
+				otadiag.KV("need_tx", needOK),
+			)
+		}
 		return
 	}
 	decodeStart := time.Now()
 	raw, errStr := s.decodeChunkData(msg.Data)
 	if errStr != "" {
+		if xferProbeEnabled {
+			xferProbe("chunk_decode_error", "id", id, "offset", msg.Offset, "reason", errStr, "encoded_len", len(msg.Data))
+		}
 		s.counters.TransferDecodeErrors++
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_decode_done", id,
-			otadiag.KV("ok", false),
-			otadiag.KV("reason", errStr),
-			otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
-		)
+		if fabricXferDiagEnabled("chunk_decode_done") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_decode_done", id,
+				otadiag.KV("ok", false),
+				otadiag.KV("reason", errStr),
+				otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
+			)
+		}
 		s.logKV("xfer_chunk decode retry", "err", errStr)
 		s.retryCorruptTransferFrame(errStr)
 		return
 	}
-	otadiag.Event(
-		"[fabric-xfer]", "chunk_decode_done", id,
-		otadiag.KV("ok", true),
-		otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
-		otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
-	)
+	if fabricXferDiagEnabled("chunk_decode_done") {
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_decode_done", id,
+			otadiag.KV("ok", true),
+			otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+			otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
+		)
+	}
 	if len(raw) == 0 {
 		s.abortTransfer("empty_chunk")
 		abortOK := s.sendTransferAbort(id, "empty_chunk")
@@ -878,12 +1032,14 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	}
 	if cur.bytesWritten+uint32(len(raw)) > cur.meta.Size {
 		reason := "size_too_large"
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_size_overflow", id,
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
-			otadiag.KV("size", u32s(cur.meta.Size)),
-		)
+		if fabricXferDiagEnabled("chunk_size_overflow") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_size_overflow", id,
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+				otadiag.KV("size", u32s(cur.meta.Size)),
+			)
+		}
 		s.abortTransfer(reason)
 		abortOK := s.sendTransferAbort(id, reason)
 		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
@@ -897,50 +1053,66 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	digestStart := time.Now()
 	want, ok := canonicalXXHash32Hex(msg.ChunkDigest)
 	if !ok {
+		if xferProbeEnabled {
+			xferProbe("chunk_digest_error", "id", id, "offset", msg.Offset, "reason", "bad_message", "digest_len", len(msg.ChunkDigest), "data_len", len(msg.Data))
+		}
 		s.counters.TransferDigestErrors++
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_digest_done", id,
-			otadiag.KV("ok", false),
-			otadiag.KV("reason", "bad_message"),
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("digest_len", strconvx.Itoa(len(msg.ChunkDigest))),
-			otadiag.KV("data_len", strconvx.Itoa(len(msg.Data))),
-			otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
-		)
+		if fabricXferDiagEnabled("chunk_digest_done") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_digest_done", id,
+				otadiag.KV("ok", false),
+				otadiag.KV("reason", "bad_message"),
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("digest_len", strconvx.Itoa(len(msg.ChunkDigest))),
+				otadiag.KV("data_len", strconvx.Itoa(len(msg.Data))),
+				otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+			)
+		}
 		s.retryCorruptTransferFrame("bad_message")
 		return
 	}
 	got := xxhashHex(xxhash.Sum32(raw, 0))
 	if got != want {
+		if xferProbeEnabled {
+			xferProbe("chunk_digest_error", "id", id, "offset", msg.Offset, "reason", "mismatch", "got", got, "want", want)
+		}
 		s.counters.TransferDigestErrors++
-		otadiag.Event(
-			"[fabric-xfer]", "chunk_digest_done", id,
-			otadiag.KV("ok", false),
-			otadiag.KV("reason", "chunk_digest_mismatch"),
-			otadiag.KV("offset", u32s(msg.Offset)),
-			otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
-		)
+		if fabricXferDiagEnabled("chunk_digest_done") {
+			otadiag.Event(
+				"[fabric-xfer]", "chunk_digest_done", id,
+				otadiag.KV("ok", false),
+				otadiag.KV("reason", "chunk_digest_mismatch"),
+				otadiag.KV("offset", u32s(msg.Offset)),
+				otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+			)
+		}
 		s.retryCorruptTransferFrame("chunk_digest_mismatch")
 		return
 	}
-	otadiag.Event(
-		"[fabric-xfer]", "chunk_digest_done", id,
-		otadiag.KV("ok", true),
-		otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
-	)
+	if fabricXferDiagEnabled("chunk_digest_done") {
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_digest_done", id,
+			otadiag.KV("ok", true),
+			otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+		)
+	}
 	s.markRx()
 	writeStart := time.Now()
-	otadiag.Event(
-		"[fabric-xfer]", "sink_write_start", id,
-		otadiag.KV("offset", u32s(msg.Offset)),
-		otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
-	)
+	if fabricXferDiagEnabled("sink_write_start") {
+		otadiag.Event(
+			"[fabric-xfer]", "sink_write_start", id,
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+		)
+	}
 	s.startPendingChunkWrite(cur, msg.Offset, raw)
-	otadiag.Event(
-		"[fabric-xfer]", "sink_write_pending", id,
-		otadiag.KV("dur_ms", int(time.Since(writeStart)/time.Millisecond)),
-		otadiag.KV("offset", u32s(msg.Offset)),
-	)
+	if fabricXferDiagEnabled("sink_write_pending") {
+		otadiag.Event(
+			"[fabric-xfer]", "sink_write_pending", id,
+			otadiag.KV("dur_ms", int(time.Since(writeStart)/time.Millisecond)),
+			otadiag.KV("offset", u32s(msg.Offset)),
+		)
+	}
 }
 
 func (s *session) onTransferCommit(msg *protoXferCommit) {
@@ -950,13 +1122,18 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		return
 	}
 	id := cur.meta.ID
+	if xferProbeEnabled {
+		xferProbe("commit_rx", "id", id, "bytes", cur.bytesWritten, "size", msg.Size, "digest", msg.Digest)
+	}
 	if cur.pendingChunk != nil {
 		s.markRx()
-		otadiag.Event(
-			"[fabric-xfer]", "commit_while_write_pending", id,
-			otadiag.KV("expected", u32s(cur.bytesWritten)),
-			otadiag.KV("pending_offset", u32s(cur.pendingChunk.offset)),
-		)
+		if fabricXferDiagEnabled("commit_while_write_pending") {
+			otadiag.Event(
+				"[fabric-xfer]", "commit_while_write_pending", id,
+				otadiag.KV("expected", u32s(cur.bytesWritten)),
+				otadiag.KV("pending_offset", u32s(cur.pendingChunk.offset)),
+			)
+		}
 		return
 	}
 	if msg.Size != cur.meta.Size || cur.bytesWritten != cur.meta.Size {
@@ -987,7 +1164,9 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		return
 	}
 	s.markRx()
-	otadiag.Event("[fabric-xfer]", "transfer_commit_start", id)
+	if fabricXferDiagEnabled("transfer_commit_start") {
+		otadiag.Event("[fabric-xfer]", "transfer_commit_start", id)
+	}
 	s.startPendingTransferCommit(cur)
 }
 
@@ -1020,9 +1199,11 @@ func (s *session) startTransferTargetCall(meta transferMeta, xferID string, info
 		sub:      s.conn.Request(msg),
 		deadline: time.Now().Add(s.cfg.TargetCallTimeout),
 	}
-	otadiag.Event("[fabric-xfer]", "target_call_start", xferID,
-		otadiag.KV("timeout_ms", int(s.cfg.TargetCallTimeout/time.Millisecond)),
-	)
+	if fabricXferDiagEnabled("target_call_start") {
+		otadiag.Event("[fabric-xfer]", "target_call_start", xferID,
+			otadiag.KV("timeout_ms", int(s.cfg.TargetCallTimeout/time.Millisecond)),
+		)
+	}
 	return ""
 }
 
@@ -1039,7 +1220,9 @@ func (s *session) finishTargetCall(call *pendingTargetCall, ok bool, reason stri
 		s.counters.TransferCompletions++
 		s.recordCompletedTransfer(call.meta)
 		doneOK := s.sendTransferDone(call.xferID)
-		otadiag.Event("[fabric-xfer]", "done_tx", call.xferID, otadiag.KV("ok", doneOK))
+		if fabricXferDiagEnabled("done_tx") {
+			otadiag.Event("[fabric-xfer]", "done_tx", call.xferID, otadiag.KV("ok", doneOK))
+		}
 		otadiag.StopUpdateWindow("transfer_done")
 		return
 	}
@@ -1078,7 +1261,9 @@ func (s *session) cancelTargetCall(reason string) {
 	}
 	s.pendingTargetCall = nil
 	call.info.cancelStage(reason)
-	otadiag.Event("[fabric-xfer]", "target_call_cancel", call.xferID, otadiag.KV("reason", reason))
+	if fabricXferDiagEnabled("target_call_cancel") {
+		otadiag.Event("[fabric-xfer]", "target_call_cancel", call.xferID, otadiag.KV("reason", reason))
+	}
 }
 
 func decodeStageReply(payload any) (bool, string) {

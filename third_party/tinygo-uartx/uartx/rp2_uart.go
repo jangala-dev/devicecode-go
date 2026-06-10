@@ -40,11 +40,106 @@ type UART struct {
 
 	baud uint32 // last configured baud (for diagnostics, not used by HW)
 
-	rxDrops    volatile.Register32
-	rxOverruns volatile.Register32
-	rxBreaks   volatile.Register32
-	rxParity   volatile.Register32
-	rxFraming  volatile.Register32
+	stats uartStatsRegs
+}
+
+// UARTStats is a non-atomic diagnostic snapshot. It is intended for coarse
+// attribution while testing embedded UART paths, not for accounting-critical
+// decisions. Counters may be sampled while the ISR is updating them.
+type UARTStats struct {
+	RXIRQ        uint32
+	RXHWBytes    uint32
+	RXEnqueued   uint32
+	RXRingDrops  uint32
+	RXOverrun    uint32
+	RXBreak      uint32
+	RXParity     uint32
+	RXFraming    uint32
+	RXRingMax    uint32
+	RXReadBytes  uint32
+	RXReadEmpty  uint32
+	RXNotifyDrop uint32
+
+	TXIRQ        uint32
+	TXAccepted   uint32
+	TXHWBytes    uint32
+	TXRingFull   uint32
+	TXRingMax    uint32
+	TXTryCalls   uint32
+	TXNotifyDrop uint32
+}
+
+type uartStatsRegs struct {
+	rxIRQ        volatile.Register32
+	rxHWBytes    volatile.Register32
+	rxEnqueued   volatile.Register32
+	rxRingDrops  volatile.Register32
+	rxOverrun    volatile.Register32
+	rxBreak      volatile.Register32
+	rxParity     volatile.Register32
+	rxFraming    volatile.Register32
+	rxRingMax    volatile.Register32
+	rxReadBytes  volatile.Register32
+	rxReadEmpty  volatile.Register32
+	rxNotifyDrop volatile.Register32
+
+	txIRQ        volatile.Register32
+	txAccepted   volatile.Register32
+	txHWBytes    volatile.Register32
+	txRingFull   volatile.Register32
+	txRingMax    volatile.Register32
+	txTryCalls   volatile.Register32
+	txNotifyDrop volatile.Register32
+}
+
+func (uart *UART) inc(reg *volatile.Register32, n uint32) { reg.Set(reg.Get() + n) }
+
+func (uart *UART) observeRXRingUsed() {
+	u := uint32(uart.Buffer.Used())
+	for {
+		old := uart.stats.rxRingMax.Get()
+		if u <= old {
+			return
+		}
+		uart.stats.rxRingMax.Set(u)
+		return
+	}
+}
+
+func (uart *UART) observeTXRingUsed() {
+	u := uint32(uart.TxBuffer.Used())
+	for {
+		old := uart.stats.txRingMax.Get()
+		if u <= old {
+			return
+		}
+		uart.stats.txRingMax.Set(u)
+		return
+	}
+}
+
+// Stats returns a diagnostic snapshot of UART ISR and foreground counters.
+func (uart *UART) Stats() UARTStats {
+	return UARTStats{
+		RXIRQ: uart.stats.rxIRQ.Get(), RXHWBytes: uart.stats.rxHWBytes.Get(), RXEnqueued: uart.stats.rxEnqueued.Get(), RXRingDrops: uart.stats.rxRingDrops.Get(), RXOverrun: uart.stats.rxOverrun.Get(), RXBreak: uart.stats.rxBreak.Get(), RXParity: uart.stats.rxParity.Get(), RXFraming: uart.stats.rxFraming.Get(), RXRingMax: uart.stats.rxRingMax.Get(), RXReadBytes: uart.stats.rxReadBytes.Get(), RXReadEmpty: uart.stats.rxReadEmpty.Get(), RXNotifyDrop: uart.stats.rxNotifyDrop.Get(),
+		TXIRQ: uart.stats.txIRQ.Get(), TXAccepted: uart.stats.txAccepted.Get(), TXHWBytes: uart.stats.txHWBytes.Get(), TXRingFull: uart.stats.txRingFull.Get(), TXRingMax: uart.stats.txRingMax.Get(), TXTryCalls: uart.stats.txTryCalls.Get(), TXNotifyDrop: uart.stats.txNotifyDrop.Get(),
+	}
+}
+
+// NoteRXRead records bytes drained from the UARTX software RX ring by a
+// foreground consumer. It is diagnostic only; it deliberately does not alter
+// UART data state.
+func (uart *UART) NoteRXRead(n int) {
+	if n > 0 {
+		uart.inc(&uart.stats.rxReadBytes, uint32(n))
+		return
+	}
+	uart.inc(&uart.stats.rxReadEmpty, 1)
+}
+
+// ClearStats resets diagnostic counters. It does not alter UART data state.
+func (uart *UART) ClearStats() {
+	uart.stats = uartStatsRegs{}
 }
 
 // Configure sets up the PL011, its pins and interrupts. It leaves RXIM/RTIM
@@ -168,21 +263,6 @@ func (uart *UART) SetFormat(databits, stopbits uint8, parity UARTParity) error {
 	return nil
 }
 
-// RXDropCount reports bytes dropped because the software RX ring was full.
-func (uart *UART) RXDropCount() uint32 { return uart.rxDrops.Get() }
-
-// RXOverrunCount reports PL011 RX overrun error bytes seen by the ISR.
-func (uart *UART) RXOverrunCount() uint32 { return uart.rxOverruns.Get() }
-
-// RXBreakCount reports PL011 RX break error bytes seen by the ISR.
-func (uart *UART) RXBreakCount() uint32 { return uart.rxBreaks.Get() }
-
-// RXParityCount reports PL011 RX parity error bytes seen by the ISR.
-func (uart *UART) RXParityCount() uint32 { return uart.rxParity.Get() }
-
-// RXFramingCount reports PL011 RX framing error bytes seen by the ISR.
-func (uart *UART) RXFramingCount() uint32 { return uart.rxFraming.Get() }
-
 // initUART asserts and releases the peripheral reset for the selected PL011.
 func initUART(uart *UART) {
 	var resetVal uint32
@@ -230,6 +310,7 @@ func (uart *UART) attemptSend(p []byte) int {
 				break
 			}
 			uart.Bus.UARTDR.Set(uint32(b))
+			uart.inc(&uart.stats.txHWBytes, 1)
 		}
 		// Arm TX interrupts; ISR takes over steady-state.
 		uart.Bus.UARTIMSC.SetBits(rp.UART0_UARTIMSC_TXIM)
@@ -252,6 +333,7 @@ func (uart *UART) attemptSend(p []byte) int {
 				break
 			}
 			uart.Bus.UARTDR.Set(uint32(b))
+			uart.inc(&uart.stats.txHWBytes, 1)
 		}
 
 		// Re-enable TX level interrupts. Next drop to/under IFLS will raise TX IRQ.
@@ -286,6 +368,7 @@ func (uart *UART) tryWriteHW(p []byte) int {
 	i := 0
 	for i < len(p) && !uart.Bus.UARTFR.HasBits(rp.UART0_UARTFR_TXFF) {
 		uart.Bus.UARTDR.Set(uint32(p[i]))
+		uart.inc(&uart.stats.txHWBytes, 1)
 		i++
 	}
 	return i
@@ -296,9 +379,11 @@ func (uart *UART) enqueueTX(p []byte) int {
 	i := 0
 	for i < len(p) {
 		if ok := uart.TxBuffer.Put(p[i]); !ok {
+			uart.inc(&uart.stats.txRingFull, 1)
 			break
 		}
 		i++
+		uart.observeTXRingUsed()
 	}
 	return i
 }
@@ -318,22 +403,36 @@ func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 
 	// RX path (RX level or RX timeout).
 	if (mis & (rp.UART0_UARTMIS_RXMIS | rp.UART0_UARTMIS_RTMIS)) != 0 {
+		uart.inc(&uart.stats.rxIRQ, 1)
 
 		// In the ISR, only notify if at least one byte was enqueued.
 		enq := 0
 		for !uart.Bus.UARTFR.HasBits(rp.UART0_UARTFR_RXFE) {
 			r := uart.Bus.UARTDR.Get()
-			errs := r & (rp.UART0_UARTDR_OE | rp.UART0_UARTDR_BE |
-				rp.UART0_UARTDR_PE | rp.UART0_UARTDR_FE)
-			if errs != 0 {
-				uart.noteRXErrors(errs)
+			uart.inc(&uart.stats.rxHWBytes, 1)
+			if (r & (rp.UART0_UARTDR_OE | rp.UART0_UARTDR_BE |
+				rp.UART0_UARTDR_PE | rp.UART0_UARTDR_FE)) != 0 {
+				if (r & rp.UART0_UARTDR_OE) != 0 {
+					uart.inc(&uart.stats.rxOverrun, 1)
+				}
+				if (r & rp.UART0_UARTDR_BE) != 0 {
+					uart.inc(&uart.stats.rxBreak, 1)
+				}
+				if (r & rp.UART0_UARTDR_PE) != 0 {
+					uart.inc(&uart.stats.rxParity, 1)
+				}
+				if (r & rp.UART0_UARTDR_FE) != 0 {
+					uart.inc(&uart.stats.rxFraming, 1)
+				}
 				// Drop errored byte; reading DR clears the per-byte error flags.
 				continue
 			}
 			if uart.Buffer.Put(byte(r & 0xFF)) {
 				enq++
+				uart.inc(&uart.stats.rxEnqueued, 1)
+				uart.observeRXRingUsed()
 			} else {
-				incrementRegister32(&uart.rxDrops)
+				uart.inc(&uart.stats.rxRingDrops, 1)
 			}
 		}
 
@@ -346,12 +445,14 @@ func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 			select {
 			case uart.notify <- struct{}{}:
 			default:
+				uart.inc(&uart.stats.rxNotifyDrop, 1)
 			}
 		}
 	}
 
 	// TX path (TX level).
 	if mis&rp.UART0_UARTMIS_TXMIS != 0 {
+		uart.inc(&uart.stats.txIRQ, 1)
 
 		// Move bytes from SW buffer to HW FIFO.
 		for !uart.Bus.UARTFR.HasBits(rp.UART0_UARTFR_TXFF) {
@@ -360,12 +461,14 @@ func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 				break
 			}
 			uart.Bus.UARTDR.Set(uint32(b))
+			uart.inc(&uart.stats.txHWBytes, 1)
 		}
 
 		// Coalesce a Writable notification (space/progress).
 		select {
 		case uart.txNotify <- struct{}{}:
 		default:
+			uart.inc(&uart.stats.txNotifyDrop, 1)
 		}
 
 		// If SW buffer empty, manage the tail.
@@ -383,23 +486,4 @@ func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 		// Clear TX interrupt.
 		uart.Bus.UARTICR.Set(rp.UART0_UARTICR_TXIC)
 	}
-}
-
-func (uart *UART) noteRXErrors(errs uint32) {
-	if errs&rp.UART0_UARTDR_OE != 0 {
-		incrementRegister32(&uart.rxOverruns)
-	}
-	if errs&rp.UART0_UARTDR_BE != 0 {
-		incrementRegister32(&uart.rxBreaks)
-	}
-	if errs&rp.UART0_UARTDR_PE != 0 {
-		incrementRegister32(&uart.rxParity)
-	}
-	if errs&rp.UART0_UARTDR_FE != 0 {
-		incrementRegister32(&uart.rxFraming)
-	}
-}
-
-func incrementRegister32(r *volatile.Register32) {
-	r.Set(r.Get() + 1)
 }

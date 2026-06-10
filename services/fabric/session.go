@@ -256,6 +256,16 @@ func (s *session) run(ctx context.Context) {
 				return
 			}
 			s.counters.RXLines++
+			if fabricTraceEnabled {
+				println(
+					"[fabric]", "sid", s.localSID,
+					"rx_frame",
+					"type", protoType(res.line),
+					"xfer", protoXferID(res.line),
+					"len", len(res.line),
+					"line", tracePreview(res.line),
+				)
+			}
 			beforeRx := s.lastRxAt
 			s.dispatch(res.line)
 			s.releaseReadSlot(freeSlots, res.slot)
@@ -568,6 +578,10 @@ func (s *session) dispatch(line []byte) {
 		return
 	}
 
+	if fabricTraceEnabled {
+		println("[fabric]", "sid", s.localSID, "dispatch", "type", t, "xfer", protoXferID(line), "link", int(s.link), "ready", s.rpcReady)
+	}
+
 	switch t {
 	case msgHello:
 		msg, ok := decodeHelloFast(line)
@@ -619,10 +633,12 @@ func (s *session) dispatch(line []byte) {
 	case msgReply:
 		typedDispatch(s, t, line, s.onReply)
 	case msgXferBegin:
-		otadiag.Event(
-			"[fabric-xfer]", "begin_route_start", protoXferID(line),
-			otadiag.KV("line_len", len(line)),
-		)
+		if fabricXferDiagEnabled("begin_route_start") {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_route_start", protoXferID(line),
+				otadiag.KV("line_len", len(line)),
+			)
+		}
 		msg, ok := decodeXferBeginFast(line)
 		if !ok {
 			s.logMalformed(line, errors.New("bad_xfer_begin"))
@@ -630,7 +646,9 @@ func (s *session) dispatch(line []byte) {
 		}
 		s.markFrameRX()
 		s.onTransferBegin(&msg)
-		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+		if fabricXferDiagEnabled("begin_route_done") {
+			otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+		}
 	case msgXferChunk:
 		msg, ok := decodeXferChunkFast(line)
 		if !ok {
@@ -700,7 +718,9 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 	s.markFrameRX()
 	handler(&msg)
 	if msgType == msgXferBegin {
-		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+		if fabricXferDiagEnabled("begin_route_done") {
+			otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+		}
 	}
 }
 
@@ -1219,14 +1239,15 @@ func (s *session) requestBus(msg *bus.Message) *bus.Subscription {
 }
 
 func (s *session) drainBusEvents(now time.Time) {
-	// A single bus readiness edge may cover several subscriptions.  Drain each
-	// class without blocking; export drains retain their quota and will be
-	// resumed by the export-ready timer when work remains.
+	// A single bus readiness edge may cover several subscriptions. Drain each
+	// class without blocking. Export drains collect/coalesce retained facts and
+	// admit only a small number of frames per tick. This keeps the UART writer
+	// event-driven without adding a second writer actor or a transfer-specific
+	// quiet window.
 	s.drainExports()
 	s.drainOutboundMessages(now)
 	s.drainInbound(now)
 	s.tickReady(now)
-	s.drainQueuedExports()
 }
 
 func (s *session) setupExports() {
@@ -1356,25 +1377,30 @@ func (s *session) criticalExportReplayDrained() bool {
 
 func (s *session) drainCriticalExports(total *int) bool {
 	for i, sub := range s.criticalExportSubs {
-		if *total >= exportMaxPerTick {
-			return true
+		if m := latestSubscriptionMessage(sub); m != nil {
+			s.queueCriticalExport(i, m)
 		}
-		m := latestSubscriptionMessage(sub)
+	}
+	for i, m := range s.criticalExportPendingMsgs {
 		if m == nil {
 			if i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
 				return true
 			}
 			continue
 		}
+		if *total >= exportMaxPerTick {
+			return true
+		}
 		sent, ok := s.sendExportMessage(m)
 		if !ok {
 			return false
 		}
-		if sent && i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
-			s.criticalExportReplayPending[i] = false
-		}
 		if sent {
 			(*total)++
+			if i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
+				s.criticalExportReplayPending[i] = false
+			}
+			s.criticalExportPendingMsgs[i] = nil
 		}
 	}
 	return true
@@ -1395,9 +1421,21 @@ func (s *session) queueExport(m *bus.Message) {
 	if m == nil {
 		return
 	}
-	// Keep the queue bounded. The bus subscription itself coalesces retained
-	// changes, but once a watcher has handed the event to the session we still
-	// avoid unbounded growth during handshake holdoff.
+	// Retained exports are a cache: when several retained facts for the same
+	// topic arrive before the UART writer has capacity, only the newest value is
+	// useful on the wire. Coalescing here keeps the output path event-driven and
+	// avoids a semantic "pause exports during transfer" policy.
+	if m.Retained {
+		for i, pending := range s.exportPendingMsgs {
+			if pending != nil && pending.Retained && topicEquals(pending.Topic, m.Topic) {
+				s.exportPendingMsgs[i] = m
+				return
+			}
+		}
+	}
+	// Non-retained events are sparse, but keep the FIFO bounded. If the link is
+	// congested, old non-critical observations are less valuable than keeping the
+	// reactor and control frames moving.
 	const maxPendingExports = 32
 	if len(s.exportPendingMsgs) >= maxPendingExports {
 		copy(s.exportPendingMsgs, s.exportPendingMsgs[1:])
@@ -1407,38 +1445,36 @@ func (s *session) queueExport(m *bus.Message) {
 	s.exportPendingMsgs = append(s.exportPendingMsgs, m)
 }
 
+func (s *session) hasCriticalExportBacklog() bool {
+	for i, m := range s.criticalExportPendingMsgs {
+		if m != nil {
+			return true
+		}
+		if i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) hasExportBacklog() bool {
+	return s.hasCriticalExportBacklog() || len(s.exportPendingMsgs) > 0
+}
+
 func (s *session) handleCriticalExportEvent(idx int, m *bus.Message) {
 	if idx < 0 || idx >= len(s.criticalExportReplayPending) {
 		return
 	}
-	if !s.exportCanSend(time.Now()) {
-		s.queueCriticalExport(idx, m)
-		return
-	}
-	sent, ok := s.sendExportMessage(m)
-	if !ok {
-		s.queueCriticalExport(idx, m)
-		return
-	}
-	if sent && s.criticalExportReplayPending[idx] {
-		s.criticalExportReplayPending[idx] = false
-	}
-	s.criticalExportPendingMsgs[idx] = nil
-	s.drainQueuedExports()
+	s.queueCriticalExport(idx, m)
+	s.scheduleExportDrain(time.Now())
 }
 
 func (s *session) handleExportEvent(m *bus.Message) {
-	if !s.exportCanSend(time.Now()) || !s.criticalExportReplayDrained() {
-		s.queueExport(m)
+	if m == nil || (len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic)) {
 		return
 	}
-	if len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic) {
-		return
-	}
-	_, ok := s.sendExportMessage(m)
-	if !ok {
-		s.queueExport(m)
-	}
+	s.queueExport(m)
+	s.scheduleExportDrain(time.Now())
 }
 
 func (s *session) drainQueuedExports() {
@@ -1446,34 +1482,31 @@ func (s *session) drainQueuedExports() {
 	if !s.exportCanSend(now) {
 		return
 	}
-	for i, m := range s.criticalExportPendingMsgs {
-		if m == nil || (i < len(s.criticalExportReplayPending) && !s.criticalExportReplayPending[i]) {
-			continue
-		}
-		sent, ok := s.sendExportMessage(m)
-		if !ok {
-			return
-		}
-		if sent && i < len(s.criticalExportReplayPending) {
-			s.criticalExportReplayPending[i] = false
-			s.criticalExportPendingMsgs[i] = nil
-		}
+	total := 0
+	if !s.drainCriticalExports(&total) {
+		return
 	}
 	if !s.criticalExportReplayDrained() {
 		s.scheduleExportDrain(now)
 		return
 	}
-	for len(s.exportPendingMsgs) > 0 {
+	for total < exportMaxPerTick && len(s.exportPendingMsgs) > 0 {
 		m := s.exportPendingMsgs[0]
 		s.exportPendingMsgs = s.exportPendingMsgs[1:]
 		if m == nil || (len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic)) {
 			continue
 		}
-		_, ok := s.sendExportMessage(m)
+		sent, ok := s.sendExportMessage(m)
 		if !ok {
 			s.exportPendingMsgs = append([]*bus.Message{m}, s.exportPendingMsgs...)
 			return
 		}
+		if sent {
+			total++
+		}
+	}
+	if s.hasExportBacklog() {
+		s.scheduleExportDrain(now)
 	}
 }
 
@@ -1489,29 +1522,15 @@ func (s *session) scheduleExportDrain(now time.Time) {
 func (s *session) drainExports() {
 	now := time.Now()
 	s.exportDrainAt = time.Time{}
-	if s.link != linkUp {
+	if !s.exportCanSend(now) {
 		return
 	}
-	if !s.exportsEnabled {
-		return
-	}
-	if !s.exportReadyAt.IsZero() && now.Before(s.exportReadyAt) {
-		return
-	}
-	total := 0
-	if !s.drainCriticalExports(&total) {
-		return
-	}
-	if !s.criticalExportReplayDrained() {
-		s.scheduleExportDrain(now)
-		return
-	}
+	// Collect all immediately-available export notifications into the session's
+	// coalesced retained queue. Sending is handled by drainQueuedExports below,
+	// with a small per-tick budget. This keeps retained replay fair without
+	// making transfer state a special case.
 	for _, sub := range s.exportSubs {
 		for {
-			if total >= exportMaxPerTick {
-				s.scheduleExportDrain(now)
-				return
-			}
 			select {
 			case m, ok := <-sub.Channel():
 				if !ok || m == nil {
@@ -1520,19 +1539,14 @@ func (s *session) drainExports() {
 				if len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic) {
 					continue
 				}
-				sent, ok := s.sendExportMessage(m)
-				if !ok {
-					return
-				}
-				if sent {
-					total++
-				}
+				s.queueExport(m)
 			default:
 				goto nextSub
 			}
 		}
 	nextSub:
 	}
+	s.drainQueuedExports()
 }
 
 func (s *session) findInboundCall(id string) (*inboundCall, int) {

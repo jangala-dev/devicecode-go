@@ -101,6 +101,9 @@ func (s *Service) CancelStreamedStage(xferID string, generation uint64, reason s
 }
 
 func (s *Service) submitStreamedStageCommand(cmd streamedStageCommand) streamedStageCommandResult {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "submit", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", cmd.generation, "size", cmd.size, "data_len", len(cmd.data))
+	}
 	if s == nil {
 		return streamedStageCommandResult{err: errors.New("updater_not_running")}
 	}
@@ -122,6 +125,13 @@ func (s *Service) submitStreamedStageCommand(cmd streamedStageCommand) streamedS
 	}
 	select {
 	case res := <-cmd.reply:
+		if updaterTraceEnabled {
+			errText := ""
+			if res.err != nil {
+				errText = res.err.Error()
+			}
+			println("[updater-trace]", "reply", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", res.generation, "written", res.written, "err", errText)
+		}
 		return res
 	case <-s.stageStopped:
 		return streamedStageCommandResult{err: errors.New("updater_not_running")}
@@ -141,6 +151,9 @@ func (s *Service) runStreamedStageWorker(ctx context.Context) {
 				s.clearActiveABUpdateDiagHook()
 				return
 			}
+			if updaterTraceEnabled {
+				println("[updater-trace]", "worker_start", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", cmd.generation, "size", cmd.size, "data_len", len(cmd.data))
+			}
 			res := streamedStageWorkerResult{kind: cmd.kind, xferID: cmd.xferID, generation: cmd.generation}
 			switch cmd.kind {
 			case streamedStageCommandBegin:
@@ -155,6 +168,13 @@ func (s *Service) runStreamedStageWorker(ctx context.Context) {
 			default:
 				res.err = errors.New("bad_stage_command")
 			}
+			if updaterTraceEnabled {
+				errText := ""
+				if res.err != nil {
+					errText = res.err.Error()
+				}
+				println("[updater-trace]", "worker_done", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", cmd.generation, "err", errText)
+			}
 			select {
 			case s.stageWorkerResults <- res:
 			case <-ctx.Done():
@@ -167,6 +187,9 @@ func (s *Service) runStreamedStageWorker(ctx context.Context) {
 }
 
 func (s *Service) handleStreamedStageCommand(cmd streamedStageCommand) {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "handle_cmd", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", cmd.generation, "pending", s.pendingStageCommand != nil)
+	}
 	if cmd.reply == nil {
 		return
 	}
@@ -208,6 +231,9 @@ func (s *Service) cancelPendingStreamedStage(cmd streamedStageCommand) {
 }
 
 func (s *Service) startStreamedStageBegin(cmd streamedStageCommand) {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "begin_cmd", "xfer", cmd.xferID, "size", cmd.size)
+	}
 	beginAt := time.Now()
 	otadiag.SetActiveXfer(cmd.xferID)
 	otadiag.Event("[updater-stream]", "begin_entry", cmd.xferID, otadiag.KV("size", cmd.size))
@@ -234,6 +260,9 @@ func (s *Service) startStreamedStageBegin(cmd streamedStageCommand) {
 }
 
 func (s *Service) startStreamedStageWrite(cmd streamedStageCommand) {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "write_cmd", "xfer", cmd.xferID, "generation", cmd.generation, "data_len", len(cmd.data))
+	}
 	if err := s.checkStreamedStageLease(cmd.xferID, cmd.generation, false); err != nil {
 		cmd.reply <- streamedStageCommandResult{err: err}
 		return
@@ -248,6 +277,9 @@ func (s *Service) startStreamedStageWrite(cmd streamedStageCommand) {
 }
 
 func (s *Service) startStreamedStageCommit(cmd streamedStageCommand) {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "commit_cmd", "xfer", cmd.xferID, "generation", cmd.generation)
+	}
 	if err := s.checkStreamedStageLease(cmd.xferID, cmd.generation, false); err != nil {
 		cmd.reply <- streamedStageCommandResult{err: err}
 		return
@@ -282,6 +314,9 @@ func (s *Service) startStreamedStageAbort(cmd streamedStageCommand) {
 }
 
 func (s *Service) sendStageWorkerCommand(cmd streamedStageWorkerCommand) {
+	if updaterTraceEnabled {
+		println("[updater-trace]", "worker_queue", "kind", int(cmd.kind), "xfer", cmd.xferID, "generation", cmd.generation, "size", cmd.size, "data_len", len(cmd.data))
+	}
 	select {
 	case s.stageWorkerCommands <- cmd:
 	default:
@@ -301,6 +336,13 @@ func (s *Service) sendStageWorkerCommand(cmd streamedStageWorkerCommand) {
 }
 
 func (s *Service) handleStreamedStageWorkerResult(res streamedStageWorkerResult) {
+	if updaterTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[updater-trace]", "worker_result", "kind", int(res.kind), "xfer", res.xferID, "generation", res.generation, "err", errText)
+	}
 	cmd := s.pendingStageCommand
 	if cmd == nil || cmd.xferID != res.xferID || cmd.generation != res.generation || cmd.kind != res.kind {
 		// Stale worker result from an already-cancelled generation. The updater
@@ -324,6 +366,13 @@ func (s *Service) handleStreamedStageWorkerResult(res streamedStageWorkerResult)
 }
 
 func (s *Service) finishStreamedStageBegin(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	if updaterTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[updater-trace]", "finish_begin", "xfer", cmd.xferID, "generation", cmd.generation, "err", errText)
+	}
 	beginAt := time.Now()
 	if res.err != nil {
 		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
@@ -361,6 +410,13 @@ func (s *Service) finishStreamedStageBegin(cmd streamedStageCommand, res streame
 }
 
 func (s *Service) finishStreamedStageWrite(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	if updaterTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[updater-trace]", "finish_write", "xfer", cmd.xferID, "generation", cmd.generation, "err", errText)
+	}
 	if res.err != nil {
 		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, res.err.Error())
 		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
@@ -378,6 +434,13 @@ func (s *Service) finishStreamedStageWrite(cmd streamedStageCommand, res streame
 }
 
 func (s *Service) finishStreamedStageCommit(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	if updaterTraceEnabled {
+		errText := ""
+		if res.err != nil {
+			errText = res.err.Error()
+		}
+		println("[updater-trace]", "finish_commit", "xfer", cmd.xferID, "generation", cmd.generation, "err", errText, "staged_len", res.staged.Length)
+	}
 	clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
 	if res.err != nil {
 		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, res.err.Error())

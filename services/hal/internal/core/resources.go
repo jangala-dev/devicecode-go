@@ -127,6 +127,36 @@ type SerialFormatConfigurator interface {
 	SetFormat(databits, stopbits uint8, parity string) error
 }
 
+// SerialDebugStats is an optional provider-specific diagnostic snapshot for
+// UART-like serial resources. Values are coarse counters used to attribute data
+// loss during hardware tests; they are not part of the stable HAL contract.
+type SerialDebugStats struct {
+	RXIRQ        uint32
+	RXHWBytes    uint32
+	RXEnqueued   uint32
+	RXRingDrops  uint32
+	RXOverrun    uint32
+	RXBreak      uint32
+	RXParity     uint32
+	RXFraming    uint32
+	RXRingMax    uint32
+	RXReadBytes  uint32
+	RXReadEmpty  uint32
+	RXNotifyDrop uint32
+
+	TXIRQ        uint32
+	TXAccepted   uint32
+	TXHWBytes    uint32
+	TXRingFull   uint32
+	TXRingMax    uint32
+	TXTryCalls   uint32
+	TXNotifyDrop uint32
+}
+
+type SerialDiagnostics interface {
+	DebugStats() SerialDebugStats
+}
+
 // ---- Unified registry interface ----
 
 type ResourceRegistry interface {

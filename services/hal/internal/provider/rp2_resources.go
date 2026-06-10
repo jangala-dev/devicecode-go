@@ -707,9 +707,23 @@ type rp2SerialPort struct{ u *uartx.UART }
 
 func (p *rp2SerialPort) Readable() <-chan struct{} { return p.u.Readable() }
 func (p *rp2SerialPort) Writable() <-chan struct{} { return p.u.Writable() }
-func (p *rp2SerialPort) TryRead(b []byte) int      { return p.u.TryRead(b) }
-func (p *rp2SerialPort) TryWrite(b []byte) int     { return p.u.TryWrite(b) }
-func (p *rp2SerialPort) Flush() error              { return p.u.Flush() }
+func (p *rp2SerialPort) TryRead(b []byte) int {
+	n := p.u.TryRead(b)
+	p.u.NoteRXRead(n)
+	return n
+}
+func (p *rp2SerialPort) TryWrite(b []byte) int { return p.u.TryWrite(b) }
+func (p *rp2SerialPort) Flush() error          { return p.u.Flush() }
+func (p *rp2SerialPort) DebugStats() core.SerialDebugStats {
+	s := p.u.Stats()
+	return core.SerialDebugStats{
+		RXIRQ: s.RXIRQ, RXHWBytes: s.RXHWBytes, RXEnqueued: s.RXEnqueued, RXRingDrops: s.RXRingDrops,
+		RXOverrun: s.RXOverrun, RXBreak: s.RXBreak, RXParity: s.RXParity, RXFraming: s.RXFraming,
+		RXRingMax: s.RXRingMax, RXReadBytes: s.RXReadBytes, RXReadEmpty: s.RXReadEmpty, RXNotifyDrop: s.RXNotifyDrop,
+		TXIRQ: s.TXIRQ, TXAccepted: s.TXAccepted, TXHWBytes: s.TXHWBytes, TXRingFull: s.TXRingFull,
+		TXRingMax: s.TXRingMax, TXTryCalls: s.TXTryCalls, TXNotifyDrop: s.TXNotifyDrop,
+	}
+}
 
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
 
