@@ -515,12 +515,8 @@ func (r *Reactor) Run(ctx context.Context) {
 	stSub := r.uiConn.Subscribe(stTopic)
 	evSub := r.uiConn.Subscribe(evTopic)
 
-	// UART sessions. uart0 remains the original local JSON telemetry stream;
-	// uart1 is now reserved for the CM5 Fabric link. The logger still writes to
-	// the USB monitor, but no longer opens a competing uart1 log mirror.
-	const uartTele = "uart0"
-	subSessOpenTele := r.uiConn.Subscribe(tSessOpened(uartTele))
-	subSessClosedTele := r.uiConn.Subscribe(tSessClosed(uartTele))
+	// UART session for the CM5 Fabric link. The production hardware-update path
+	// keeps this UART Fabric-only; legacy JSON telemetry is not opened here.
 	var subSessOpenFabric *bus.Subscription
 	var subSessClosedFabric *bus.Subscription
 	if useHardwareFabricUART() {
@@ -529,13 +525,12 @@ func (r *Reactor) Run(ctx context.Context) {
 	}
 
 	// Kick open requests (fire-and-forget; events carry handles).
-	r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
 	if useHardwareFabricUART() {
 		r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(fabricUART), nil, false))
 	}
 
 	// Retry back-off guards.
-	var retryTeleAt, retryFabricAt time.Time
+	var retryFabricAt time.Time
 
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
@@ -546,26 +541,13 @@ func (r *Reactor) Run(ctx context.Context) {
 	for {
 		select {
 		// ---- UART session opened/closed ----
-		case m := <-subSessOpenTele.Channel():
-			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
-				log.Println("[uart0] telemetry session opened")
-			}
 		case m := <-subscriptionChannel(subSessOpenFabric):
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
 				r.startPassiveFabric(ctx, ev)
 			}
-		case <-subSessClosedTele.Channel():
-			r.jsonOut = nil
-			log.Println("[uart0] telemetry session closed")
-			// Auto-reopen with back-off
-			if time.Now().After(retryTeleAt) {
-				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
-				retryTeleAt = time.Now().Add(2 * time.Second)
-			}
 		case <-subscriptionChannel(subSessClosedFabric):
 			r.stopFabricLink()
-			log.Println("[uart1] fabric session closed")
+			log.Println(fabricLogPrefix + "fabric session closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryFabricAt) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(fabricUART), nil, false))

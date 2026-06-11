@@ -13,6 +13,7 @@ import (
 
 const (
 	fabricUART            = "uart1"
+	fabricLogPrefix       = "[" + fabricUART + "] "
 	fabricStopWaitTimeout = 500 * time.Millisecond
 )
 
@@ -47,7 +48,7 @@ func (r *Reactor) startPassiveFabric(ctx context.Context, ev types.SerialSession
 	rx := shmring.Get(shmring.Handle(ev.RXHandle))
 	tx := shmring.Get(shmring.Handle(ev.TXHandle))
 	if rx == nil || tx == nil {
-		log.Println("[uart1] fabric session missing rings")
+		log.Println(fabricLogPrefix + "fabric session missing rings")
 		return
 	}
 
@@ -55,7 +56,7 @@ func (r *Reactor) startPassiveFabric(ctx context.Context, ev types.SerialSession
 	fabricConn := r.uiConn.NewChildConnection("fabric")
 	if fabricConn == nil {
 		_ = tr.Close()
-		log.Println("[uart1] fabric session missing bus")
+		log.Println(fabricLogPrefix + "fabric session missing bus")
 		return
 	}
 
@@ -68,7 +69,7 @@ func (r *Reactor) startPassiveFabric(ctx context.Context, ev types.SerialSession
 	r.fabricDone = done
 	r.fabricSessionOpen = true
 
-	log.Println("[uart1] fabric session opening node=mcu peer=bigbox-cm5 link=mcu-uart0 transfer=", transferMode)
+	log.Println(fabricLogPrefix+"fabric session opening node=mcu peer=bigbox-cm5 link=mcu-uart0 transfer=", transferMode)
 	go func() {
 		defer close(done)
 		defer tr.Close()
@@ -78,7 +79,7 @@ func (r *Reactor) startPassiveFabric(ctx context.Context, ev types.SerialSession
 		// to the updater-owned stage controller.
 		fabric.RunWithOptions(fabricCtx, tr, fabricConn, "mcu", "bigbox-cm5", fabric.DefaultLinkConfig(), fabric.RunOptions{Buffers: &fabricBuffers, StageController: stageController})
 	}()
-	log.Println("[uart1] fabric session opened node=mcu peer=bigbox-cm5 link=mcu-uart0 transfer=", transferMode)
+	log.Println(fabricLogPrefix+"fabric session opened node=mcu peer=bigbox-cm5 link=mcu-uart0 transfer=", transferMode)
 }
 
 func (r *Reactor) stopFabricLink() {
@@ -91,6 +92,6 @@ func (r *Reactor) stopFabricLink() {
 	r.fabricDone = nil
 	r.fabricSessionOpen = false
 	if !waitFabricDone(done, fabricStopWaitTimeout) {
-		log.Println("[uart1] fabric session stop timed out")
+		log.Println(fabricLogPrefix + "fabric session stop timed out")
 	}
 }
