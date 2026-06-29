@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/updater"
 	"devicecode-go/x/xxhash"
 )
 
@@ -51,11 +54,37 @@ func (s *fakeTransferSink) Abort(reason string) error {
 	return nil
 }
 
+// Bytes returns nil because the test fake doesn't retain a RAM copy
+// of the transferred bytes — it tracks per-chunk writes instead.
+func (s *fakeTransferSink) Bytes() []byte { return nil }
+
+type blockingVerifier struct {
+	entered  chan struct{}
+	release  chan struct{}
+	manifest updater.Manifest
+}
+
+func (v *blockingVerifier) Verify(r io.Reader, sink updater.SlotSink) (updater.Manifest, error) {
+	select {
+	case <-v.entered:
+	default:
+		close(v.entered)
+	}
+	<-v.release
+	if _, err := io.Copy(sink, r); err != nil {
+		return updater.Manifest{}, err
+	}
+	if err := sink.Commit(); err != nil {
+		return updater.Manifest{}, err
+	}
+	return v.manifest, nil
+}
+
 func runSessionWithSink(ctx context.Context, tr Transport, conn *bus.Connection, sink *fakeTransferSink) {
 	s := session{
 		linkID:   defaultLinkID,
-		nodeID:   "mcu-1",
-		peerID:   "cm5-local",
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
 		localSID: "mcu-sid-test",
 		tr:       tr,
 		conn:     conn,
@@ -70,15 +99,336 @@ func rawURL(data []byte) string {
 	return base64.RawURLEncoding.EncodeToString(data)
 }
 
-// xxhashStr is the wire-format checksum: lower-case hex, 8 chars, no algorithm
-// field. Mirrors the Lua reference's M.digest_hex.
+// xxhashStr is the wire-format digest: lower-case hex, 8 chars. Mirrors
+// the Lua reference's M.digest_hex.
 func xxhashStr(data []byte) string {
 	return xxhashHex(xxhash.Sum32(data, 0))
 }
 
+func xferBegin(id string, payload []byte, meta json.RawMessage) protoXferBegin {
+	return protoXferBegin{
+		Type:      msgXferBegin,
+		XferID:    id,
+		Target:    updater.TargetUpdaterMain,
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    xxhashStr(payload),
+		Meta:      meta,
+	}
+}
+
+func xferChunk(id string, off uint32, payload []byte) protoXferChunk {
+	return protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      id,
+		Offset:      off,
+		Data:        rawURL(payload),
+		ChunkDigest: xxhashStr(payload),
+	}
+}
+
+func xferCommit(id string, payload []byte) protoXferCommit {
+	return protoXferCommit{
+		Type:      msgXferCommit,
+		XferID:    id,
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    xxhashStr(payload),
+	}
+}
+
+func installStageResponder(t *testing.T, b *bus.Bus, reply updater.StageReply) <-chan updater.StagePayload {
+	t.Helper()
+	conn := b.NewConnection("test-stage")
+	sub := conn.Subscribe(updater.TopicStageRPC)
+	t.Cleanup(func() { conn.Unsubscribe(sub) })
+	got := make(chan updater.StagePayload, 4)
+	go func() {
+		for msg := range sub.Channel() {
+			if msg == nil {
+				continue
+			}
+			if payload, ok := msg.Payload.(updater.StagePayload); ok {
+				select {
+				case got <- payload:
+				default:
+				}
+			}
+			conn.Reply(msg, reply, false)
+		}
+	}()
+	return got
+}
+
+func runUpdaterForFabricTest(t *testing.T, b *bus.Bus, opts updater.Options) (context.CancelFunc, *updater.Service) {
+	t.Helper()
+	if opts.Conn == nil {
+		opts.Conn = b.NewConnection("updater")
+	}
+	if opts.Identity.Version == "" {
+		opts.Identity = updater.Identity{Version: "0.0.0-test", Build: "build-test", ImageID: "img-test"}
+	}
+	probeConn := b.NewConnection("updater-probe")
+	probe := probeConn.Subscribe(updater.TopicSoftwareFact)
+	defer probeConn.Unsubscribe(probe)
+	svc := updater.New(opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	go svc.Run(ctx)
+	select {
+	case msg := <-probe.Channel():
+		if msg == nil {
+			cancel()
+			t.Fatal("nil initial updater software fact")
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("timeout waiting for updater service start")
+	}
+	return cancel, svc
+}
+
+func prepareUpdaterForFabricTest(t *testing.T, conn *bus.Connection) {
+	t.Helper()
+	msg := conn.NewMessage(updater.TopicPrepareRPC, updater.PrepareRequest{Target: updater.PrepareTargetMCU}, false)
+	sub := conn.Request(msg)
+	defer conn.Unsubscribe(sub)
+	select {
+	case rep := <-sub.Channel():
+		if rep == nil {
+			t.Fatal("nil prepare reply")
+		}
+		reply, ok := rep.Payload.(updater.PrepareReply)
+		if !ok || !reply.Ready {
+			t.Fatalf("prepare reply = %#v, want ready", rep.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for prepare reply")
+	}
+}
+
+func waitUpdaterFactForFabricTest(t *testing.T, sub *bus.Subscription, want func(updater.UpdaterFact) bool) updater.UpdaterFact {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case msg := <-sub.Channel():
+			if msg == nil {
+				continue
+			}
+			fact, ok := msg.Payload.(updater.UpdaterFact)
+			if ok && (want == nil || want(fact)) {
+				return fact
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for updater fact")
+		}
+	}
+}
+
+func requestUpdaterForFabricTest(t *testing.T, conn *bus.Connection, topic bus.Topic, payload any) any {
+	t.Helper()
+	msg := conn.NewMessage(topic, payload, false)
+	sub := conn.Request(msg)
+	defer conn.Unsubscribe(sub)
+	select {
+	case rep := <-sub.Channel():
+		if rep == nil {
+			t.Fatal("nil updater reply")
+		}
+		return rep.Payload
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for updater reply")
+	}
+	return nil
+}
+
+func readTransferReady(t *testing.T, tr Transport, id string, next uint32) {
+	t.Helper()
+	ready := readMsg[protoXferReady](t, tr)
+	if ready.Type != msgXferReady || ready.XferID != id {
+		t.Fatalf("bad xfer_ready: %+v", ready)
+	}
+	need := readMsg[protoXferNeed](t, tr)
+	if need.Type != msgXferNeed || need.XferID != id || need.Next != next {
+		t.Fatalf("bad initial xfer_need: %+v, want id=%s next=%d", need, id, next)
+	}
+}
+
+func readTransferNeed(t *testing.T, tr Transport, id string, next uint32) {
+	t.Helper()
+	need := readMsg[protoXferNeed](t, tr)
+	if need.Type != msgXferNeed || need.XferID != id || need.Next != next {
+		t.Fatalf("bad xfer_need: %+v, want id=%s next=%d", need, id, next)
+	}
+}
+
+func readTransferAbort(t *testing.T, tr Transport, id, reason string) {
+	t.Helper()
+	abort := readMsg[protoXferAbort](t, tr)
+	if abort.Type != msgXferAbort || abort.XferID != id || abort.Err != reason {
+		t.Fatalf("bad xfer_abort: %+v, want id=%s err=%s", abort, id, reason)
+	}
+}
+
+func writeRawLine(t *testing.T, tr Transport, line string) {
+	t.Helper()
+	if err := tr.WriteLine([]byte(line)); err != nil {
+		t.Fatalf("WriteLine: %v", err)
+	}
+}
+
+func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
+	b := newBus()
+	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	defer cancelUpdater()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-no-prepare", payload, nil))
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.Type != msgXferAbort || abort.XferID != "xfer-no-prepare" || abort.Err != "stage_not_prepared" {
+		t.Fatalf("xfer_begin without prepare frame = %+v, want stage_not_prepared abort", abort)
+	}
+}
+
+func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
+	b := newBus()
+	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	defer cancelUpdater()
+	caller := b.NewConnection("caller")
+	observer := b.NewConnection("observer")
+	upSub := observer.Subscribe(updater.TopicUpdaterFact)
+	defer observer.Unsubscribe(upSub)
+	prepareUpdaterForFabricTest(t, caller)
+
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-prepared", payload, nil))
+	readTransferReady(t, cm5, "xfer-prepared", 0)
+	waitUpdaterFactForFabricTest(t, upSub, func(f updater.UpdaterFact) bool {
+		return f.State == updater.StateReceiving
+	})
+}
+
+func TestInvalidTransferBeginRejectsNoActiveTransfer(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	beginCount := 0
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			beginCount++
+			return &fakeTransferSink{}, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, protoXferBegin{
+		Type:      msgXferBegin,
+		XferID:    "xfer-invalid",
+		Target:    "other/target",
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    xxhashStr(payload),
+	})
+	readTransferAbort(t, cm5, "xfer-invalid", "bad_message: unsupported_target")
+	if beginCount != 0 {
+		t.Fatalf("beginTransfer called %d times for invalid begin, want 0", beginCount)
+	}
+}
+
+func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
+	b := newBus()
+	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	defer cancelUpdater()
+	caller := b.NewConnection("caller")
+	observer := b.NewConnection("observer")
+	upSub := observer.Subscribe(updater.TopicUpdaterFact)
+	defer observer.Unsubscribe(upSub)
+	prepareUpdaterForFabricTest(t, caller)
+
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-abort-cancel", payload, nil))
+	readTransferReady(t, cm5, "xfer-abort-cancel", 0)
+	sendMsg(t, cm5, protoXferAbort{Type: msgXferAbort, XferID: "xfer-abort-cancel", Err: "host_abort"})
+
+	fact := waitUpdaterFactForFabricTest(t, upSub, func(f updater.UpdaterFact) bool {
+		return f.State == updater.StateFailed
+	})
+	if fact.LastError == nil || *fact.LastError != "host_abort" {
+		t.Fatalf("updater last_error = %v, want host_abort", fact.LastError)
+	}
+}
+
+func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
+	b := newBus()
+	memMD := updater.NewMemoryMetadata()
+	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+		Verifier:      updater.StubVerifier(),
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+	})
+	defer cancelUpdater()
+	caller := b.NewConnection("caller")
+	prepareUpdaterForFabricTest(t, caller)
+
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-target-reject", payload, nil))
+	readTransferReady(t, cm5, "xfer-target-reject", 0)
+	sendMsg(t, cm5, xferChunk("xfer-target-reject", 0, payload))
+	_ = readMsg[protoXferNeed](t, cm5)
+	sendMsg(t, cm5, xferCommit("xfer-target-reject", payload))
+
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.XferID != "xfer-target-reject" || !strings.Contains(abort.Err, "verifier_stub") {
+		t.Fatalf("xfer_abort = %+v, want verifier_stub rejection", abort)
+	}
+	if _, ok := memMD.StagedDescriptor(); ok {
+		t.Fatal("stage rejection left a staged descriptor")
+	}
+
+	replyPayload := requestUpdaterForFabricTest(t, caller, updater.TopicCommitRPC, updater.CommitRequest{})
+	reply, ok := replyPayload.(updater.Reply)
+	if !ok || reply.OK || reply.Error != updater.ErrNothingStaged {
+		t.Fatalf("commit after rejected transfer = %#v, want nothing_staged", replyPayload)
+	}
+}
+
 func TestTransferBeginPreservesMeta(t *testing.T) {
 	// xfer_begin's meta is opaque to fabric-protocol but must be preserved
-	// for fabric-update's receiver, which pulls meta.receiver out of it.
+	// for updater/main staging diagnostics.
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -88,8 +438,8 @@ func TestTransferBeginPreservesMeta(t *testing.T) {
 	sink := &fakeTransferSink{}
 	s := session{
 		linkID:   defaultLinkID,
-		nodeID:   "mcu-1",
-		peerID:   "cm5-local",
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
 		localSID: "mcu-sid-test",
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
@@ -102,16 +452,10 @@ func TestTransferBeginPreservesMeta(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	metaBlob := json.RawMessage(`{"receiver":["raw","member","mcu","cap","updater","main","rpc","receive"],"version":"1.2.3"}`)
+	metaBlob := json.RawMessage(`{"version":"1.2.3"}`)
 
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-meta",
-		Size:     uint32(len(payload)),
-		Checksum: xxhashStr(payload),
-		Meta:     metaBlob,
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-meta", payload, metaBlob))
+	readTransferReady(t, cm5, "xfer-meta", 0)
 
 	if string(captured.Meta) != string(metaBlob) {
 		t.Fatalf("transferMeta.Meta = %q, want %q", captured.Meta, metaBlob)
@@ -119,6 +463,29 @@ func TestTransferBeginPreservesMeta(t *testing.T) {
 	if captured.ID != "xfer-meta" || captured.Size != uint32(len(payload)) {
 		t.Fatalf("transferMeta basic fields wrong: %+v", captured)
 	}
+	if captured.Target != updater.TargetUpdaterMain || captured.DigestAlg != updater.DigestAlgXXHash32 || captured.Digest != xxhashStr(payload) {
+		t.Fatalf("transferMeta contract fields wrong: %+v", captured)
+	}
+}
+
+func TestTransferDuplicateBeginResendsReady(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	begin := xferBegin("xfer-dup", payload, nil)
+
+	sendMsg(t, cm5, begin)
+	readTransferReady(t, cm5, "xfer-dup", 0)
+
+	sendMsg(t, cm5, begin)
+	readTransferReady(t, cm5, "xfer-dup", 0)
 }
 
 func TestTransferReceiveSuccess(t *testing.T) {
@@ -133,34 +500,19 @@ func TestTransferReceiveSuccess(t *testing.T) {
 			SlotXIPAddr:  0x10280000,
 		},
 	}
+	stageCalls := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
 
 	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
 	bringUp(t, cm5)
 
 	payload := []byte("abcdefghij")
-	checksum := xxhashStr(payload)
-
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-2",
-		Size:     uint32(len(payload)),
-		Checksum: checksum,
-	})
-
-	ready := readMsg[protoXferReady](t, cm5)
-	if ready.Type != msgXferReady || ready.XferID != "xfer-2" {
-		t.Fatalf("bad xfer_ready: %+v", ready)
-	}
+	sendMsg(t, cm5, xferBegin("xfer-2", payload, nil))
+	readTransferReady(t, cm5, "xfer-2", 0)
 
 	parts := [][]byte{payload[:4], payload[4:8], payload[8:]}
 	off := uint32(0)
 	for i, part := range parts {
-		sendMsg(t, cm5, protoXferChunk{
-			Type:   msgXferChunk,
-			XferID: "xfer-2",
-			Offset: off,
-			Data:   rawURL(part),
-		})
+		sendMsg(t, cm5, xferChunk("xfer-2", off, part))
 		need := readMsg[protoXferNeed](t, cm5)
 		want := off + uint32(len(part))
 		if need.Next != want {
@@ -169,19 +521,21 @@ func TestTransferReceiveSuccess(t *testing.T) {
 		off = want
 	}
 
-	sendMsg(t, cm5, protoXferCommit{
-		Type:     msgXferCommit,
-		XferID:   "xfer-2",
-		Size:     uint32(len(payload)),
-		Checksum: checksum,
-	})
+	sendMsg(t, cm5, xferCommit("xfer-2", payload))
 
 	done := readMsg[protoXferDone](t, cm5)
 	if done.Type != msgXferDone || done.XferID != "xfer-2" {
 		t.Fatalf("bad xfer_done: %+v", done)
 	}
 
-	time.Sleep(postTransferDoneSettle + 50*time.Millisecond)
+	select {
+	case call := <-stageCalls:
+		if call.XferID != "xfer-2" || call.Target != updater.TargetUpdaterMain || call.Digest != xxhashStr(payload) {
+			t.Fatalf("stage payload wrong: %+v", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for stage call")
+	}
 
 	if got := string(sink.writes[0]) + string(sink.writes[1]) + string(sink.writes[2]); got != string(payload) {
 		t.Fatalf("sink writes = %q, want %q", got, payload)
@@ -189,15 +543,12 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	if !sink.committed {
 		t.Fatal("sink.Commit was not called")
 	}
-	if !sink.applied {
-		t.Fatal("sink.Apply was not called")
+	if sink.applied {
+		t.Fatal("sink.Apply should not be called by strict target staging")
 	}
 }
 
-func TestTransferChunkBadOffsetAborts(t *testing.T) {
-	// Lua transfer_mgr aborts and clears the active transfer on chunk faults
-	// (unexpected_offset, decode_failed, size_overflow). Match that — do not
-	// keep the transfer alive with an xfer_need.
+func TestTransferAcceptedChunkAdvancesNeed(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -208,36 +559,116 @@ func TestTransferChunkBadOffsetAborts(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-3",
-		Size:     uint32(len(payload)),
-		Checksum: xxhashStr(payload),
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-chunk-diag", payload, nil))
+	readTransferReady(t, cm5, "xfer-chunk-diag", 0)
 
-	// Send a chunk at the wrong byte offset; expect xfer_abort and
-	// sink.Abort, not an xfer_need retry.
-	sendMsg(t, cm5, protoXferChunk{
-		Type:   msgXferChunk,
-		XferID: "xfer-3",
-		Offset: 7,
-		Data:   rawURL(payload),
-	})
+	sendMsg(t, cm5, xferChunk("xfer-chunk-diag", 0, payload))
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next = %d, want %d", need.Next, len(payload))
+	}
+}
 
-	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Type != msgXferAbort || abort.XferID != "xfer-3" || abort.Err != "unexpected_offset" {
-		t.Fatalf("bad xfer_abort: %+v", abort)
+func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-future-offset", payload, nil))
+	readTransferReady(t, cm5, "xfer-future-offset", 0)
+
+	sendMsg(t, cm5, xferChunk("xfer-future-offset", 7, payload))
+
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Type != msgXferNeed || need.XferID != "xfer-future-offset" || need.Next != 0 {
+		t.Fatalf("future offset retry xfer_need = %+v, want next=0", need)
 	}
 	if len(sink.writes) != 0 {
 		t.Fatalf("sink received %d writes, want 0", len(sink.writes))
 	}
-	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink.Abort to be called on chunk fault")
+	if len(sink.abortReasons) != 0 {
+		t.Fatalf("sink.Abort called on recoverable future offset: %v", sink.abortReasons)
+	}
+
+	sendMsg(t, cm5, xferChunk("xfer-future-offset", 0, payload))
+	need = readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next after recovery = %d, want %d", need.Next, len(payload))
+	}
+
+	sendMsg(t, cm5, xferCommit("xfer-future-offset", payload))
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != "xfer-future-offset" {
+		t.Fatalf("bad xfer_done: %+v", done)
+	}
+	if got := string(sink.writes[0]); got != string(payload) {
+		t.Fatalf("sink writes = %q, want %q", got, payload)
+	}
+	if !sink.committed {
+		t.Fatal("sink.Commit was not called")
 	}
 }
 
-func TestTransferChunkDecodeFailureAborts(t *testing.T) {
+func TestTransferChunkStaleOffsetRequestsCurrentAndCompletes(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcdef")
+	sendMsg(t, cm5, xferBegin("xfer-stale-offset", payload, nil))
+	readTransferReady(t, cm5, "xfer-stale-offset", 0)
+
+	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 0, []byte("abc")))
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Next != 3 {
+		t.Fatalf("xfer_need.next after first chunk = %d, want 3", need.Next)
+	}
+
+	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 0, []byte("abc")))
+	need = readMsg[protoXferNeed](t, cm5)
+	if need.Type != msgXferNeed || need.XferID != "xfer-stale-offset" || need.Next != 3 {
+		t.Fatalf("stale offset retry xfer_need = %+v, want next=3", need)
+	}
+	if len(sink.writes) != 1 {
+		t.Fatalf("sink received %d writes after stale duplicate, want 1", len(sink.writes))
+	}
+	if len(sink.abortReasons) != 0 {
+		t.Fatalf("sink.Abort called on recoverable stale offset: %v", sink.abortReasons)
+	}
+
+	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 3, []byte("def")))
+	need = readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next after recovery = %d, want %d", need.Next, len(payload))
+	}
+
+	sendMsg(t, cm5, xferCommit("xfer-stale-offset", payload))
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != "xfer-stale-offset" {
+		t.Fatalf("bad xfer_done: %+v", done)
+	}
+	if got := string(sink.writes[0]) + string(sink.writes[1]); got != string(payload) {
+		t.Fatalf("sink writes = %q, want %q", got, payload)
+	}
+	if !sink.committed {
+		t.Fatal("sink.Commit was not called")
+	}
+}
+
+func TestTransferChunkDecodeFailureRequestsSameOffset(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -248,29 +679,400 @@ func TestTransferChunkDecodeFailureAborts(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-d1",
-		Size:     uint32(len(payload)),
-		Checksum: xxhashStr(payload),
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-d1", payload, nil))
+	readTransferReady(t, cm5, "xfer-d1", 0)
 
 	// Bogus base64 (uses non-base64url chars).
 	sendMsg(t, cm5, protoXferChunk{
-		Type:   msgXferChunk,
-		XferID: "xfer-d1",
-		Offset: 0,
-		Data:   "!!!not-base64!!!",
+		Type:        msgXferChunk,
+		XferID:      "xfer-d1",
+		Offset:      0,
+		Data:        "!!!not-base64!!!",
+		ChunkDigest: xxhashStr(payload),
 	})
 
-	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Err != "decode_failed" {
-		t.Fatalf("bad xfer_abort: %+v", abort)
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Type != msgXferNeed || need.XferID != "xfer-d1" || need.Next != 0 {
+		t.Fatalf("bad retry xfer_need: %+v", need)
 	}
+	if len(sink.abortReasons) != 0 {
+		t.Fatalf("sink.Abort called on recoverable decode failure: %v", sink.abortReasons)
+	}
+	if len(sink.writes) != 0 {
+		t.Fatalf("sink received %d writes before decode passed", len(sink.writes))
+	}
+
+	sendMsg(t, cm5, xferChunk("xfer-d1", 0, payload))
+	need = readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next after retry = %d, want %d", need.Next, len(payload))
+	}
+}
+
+func TestTransferChunkMissingDigestRetriesThenAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-missing-digest", payload, nil))
+	readTransferReady(t, cm5, "xfer-missing-digest", 0)
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:   msgXferChunk,
+			XferID: "xfer-missing-digest",
+			Offset: 0,
+			Data:   rawURL(payload),
+		})
+		readTransferNeed(t, cm5, "xfer-missing-digest", 0)
+	}
+	sendMsg(t, cm5, protoXferChunk{
+		Type:   msgXferChunk,
+		XferID: "xfer-missing-digest",
+		Offset: 0,
+		Data:   rawURL(payload),
+	})
+	readTransferAbort(t, cm5, "xfer-missing-digest", "bad_message")
 	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink.Abort on decode failure")
+		t.Fatal("expected sink.Abort on missing chunk digest")
 	}
+}
+
+func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-bad-b64", payload, nil))
+	readTransferReady(t, cm5, "xfer-bad-b64", 0)
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      "xfer-bad-b64",
+			Offset:      0,
+			Data:        "!!!not-base64!!!",
+			ChunkDigest: xxhashStr(payload),
+		})
+		readTransferNeed(t, cm5, "xfer-bad-b64", 0)
+	}
+	sendMsg(t, cm5, protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-bad-b64",
+		Offset:      0,
+		Data:        "!!!not-base64!!!",
+		ChunkDigest: xxhashStr(payload),
+	})
+	readTransferAbort(t, cm5, "xfer-bad-b64", "invalid_chunk_encoding")
+	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "invalid_chunk_encoding" {
+		t.Fatalf("sink.Abort reasons = %v, want invalid_chunk_encoding", sink.abortReasons)
+	}
+}
+
+func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-bad-chunk-digest", payload, nil))
+	readTransferReady(t, cm5, "xfer-bad-chunk-digest", 0)
+
+	sendMsg(t, cm5, protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-bad-chunk-digest",
+		Offset:      0,
+		Data:        rawURL(payload),
+		ChunkDigest: "00000000",
+	})
+	need := readMsg[protoXferNeed](t, cm5)
+	if need.Next != 0 {
+		t.Fatalf("retry xfer_need.next = %d, want 0", need.Next)
+	}
+	if len(sink.writes) != 0 {
+		t.Fatalf("sink received %d writes before digest passed", len(sink.writes))
+	}
+
+	sendMsg(t, cm5, xferChunk("xfer-bad-chunk-digest", 0, payload))
+	need = readMsg[protoXferNeed](t, cm5)
+	if need.Next != uint32(len(payload)) {
+		t.Fatalf("xfer_need.next after retry = %d, want %d", need.Next, len(payload))
+	}
+}
+
+func TestTransferChunkWriteErrorAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{writeErr: errors.New("write_boom")}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-write-error", payload, nil))
+	readTransferReady(t, cm5, "xfer-write-error", 0)
+
+	sendMsg(t, cm5, xferChunk("xfer-write-error", 0, payload))
+	readTransferAbort(t, cm5, "xfer-write-error", "write_boom")
+}
+
+func TestTransferChunkDigestMismatchRetriesThenAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-bad-digest-budget", payload, nil))
+	readTransferReady(t, cm5, "xfer-bad-digest-budget", 0)
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      "xfer-bad-digest-budget",
+			Offset:      0,
+			Data:        rawURL(payload),
+			ChunkDigest: "00000000",
+		})
+		readTransferNeed(t, cm5, "xfer-bad-digest-budget", 0)
+	}
+	sendMsg(t, cm5, protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-bad-digest-budget",
+		Offset:      0,
+		Data:        rawURL(payload),
+		ChunkDigest: "00000000",
+	})
+	readTransferAbort(t, cm5, "xfer-bad-digest-budget", "chunk_digest_mismatch")
+}
+
+func TestTransferMalformedCurrentChunkJSONRetriesThenAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	id := "xfer-malformed-json"
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+
+	line := `{"type":"xfer_chunk","xfer_id":"` + id + `","offset":0,"data":"` + rawURL(payload) + `","chunk_digest":"` + xxhashStr(payload) + `","extra":true}`
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		writeRawLine(t, cm5, line)
+		readTransferNeed(t, cm5, id, 0)
+	}
+	writeRawLine(t, cm5, line)
+	readTransferAbort(t, cm5, id, "bad_message")
+}
+
+func TestTransferMalformedWrongXferIDDoesNotChargeActiveTransfer(t *testing.T) {
+	payload := []byte("abcd")
+	activeID := "xfer-active-malformed"
+	cases := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "wrong_id",
+			line: `{"type":"xfer_chunk","xfer_id":"xfer-other","offset":0,"data":"` + rawURL(payload) + `","chunk_digest":"` + xxhashStr(payload) + `","extra":true}`,
+		},
+		{
+			name: "missing_id",
+			line: `{"type":"xfer_chunk","offset":0,"data":"` + rawURL(payload) + `","chunk_digest":"` + xxhashStr(payload) + `","extra":true}`,
+		},
+		{
+			name: "unreadable_id",
+			line: `{"type":"xfer_chunk","xfer_id":{"bad":true},"offset":0,"data":"` + rawURL(payload) + `","chunk_digest":"` + xxhashStr(payload) + `","extra":true}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &fakeTransferSink{}
+			tr := &captureTransport{}
+			s := &session{
+				link: linkUp,
+				tr:   tr,
+				incomingTransfer: &incomingTransfer{
+					meta:     transferMeta{ID: activeID},
+					sink:     sink,
+					deadline: time.Now().Add(time.Second),
+				},
+			}
+
+			for i := 0; i < transferCorruptRetryLimit+1; i++ {
+				s.dispatch([]byte(tc.line))
+			}
+			if len(tr.writes) != 0 {
+				t.Fatalf("malformed non-current xfer_chunk emitted %d frames, want none", len(tr.writes))
+			}
+			if s.incomingTransfer == nil {
+				t.Fatal("malformed non-current xfer_chunk cleared active transfer")
+			}
+			if got := s.incomingTransfer.corruptRetriesAtOffset; got != 0 {
+				t.Fatalf("corrupt retries at offset = %d, want 0", got)
+			}
+			if len(sink.abortReasons) != 0 {
+				t.Fatalf("sink aborted for non-current malformed chunk: %v", sink.abortReasons)
+			}
+		})
+	}
+}
+
+func TestTransferCorruptRetryBudgetResetsAfterAcceptedProgress(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	id := "xfer-retry-reset"
+	payload := []byte("abcdef")
+	first := []byte("abc")
+	second := []byte("def")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+
+	for i := 0; i < transferCorruptRetryLimit-1; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      id,
+			Offset:      0,
+			Data:        rawURL(first),
+			ChunkDigest: "00000000",
+		})
+		readTransferNeed(t, cm5, id, 0)
+	}
+	sendMsg(t, cm5, xferChunk(id, 0, first))
+	readTransferNeed(t, cm5, id, uint32(len(first)))
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      id,
+			Offset:      uint32(len(first)),
+			Data:        rawURL(second),
+			ChunkDigest: "00000000",
+		})
+		readTransferNeed(t, cm5, id, uint32(len(first)))
+	}
+	sendMsg(t, cm5, xferChunk(id, uint32(len(first)), second))
+	readTransferNeed(t, cm5, id, uint32(len(payload)))
+	sendMsg(t, cm5, xferCommit(id, payload))
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != id {
+		t.Fatalf("bad xfer_done: %+v", done)
+	}
+}
+
+func TestTransferFutureOffsetDoesNotResetCorruptRetryBudget(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	id := "xfer-future-no-reset"
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      id,
+			Offset:      0,
+			Data:        rawURL(payload),
+			ChunkDigest: "00000000",
+		})
+		readTransferNeed(t, cm5, id, 0)
+	}
+	sendMsg(t, cm5, xferChunk(id, 99, payload))
+	readTransferNeed(t, cm5, id, 0)
+	sendMsg(t, cm5, protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      id,
+		Offset:      0,
+		Data:        rawURL(payload),
+		ChunkDigest: "00000000",
+	})
+	readTransferAbort(t, cm5, id, "chunk_digest_mismatch")
+}
+
+func TestTransferStaleOffsetDoesNotResetCorruptRetryBudget(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := &fakeTransferSink{}
+	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
+	bringUp(t, cm5)
+
+	id := "xfer-stale-no-reset"
+	payload := []byte("abcdef")
+	first := []byte("abc")
+	second := []byte("def")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+	sendMsg(t, cm5, xferChunk(id, 0, first))
+	readTransferNeed(t, cm5, id, uint32(len(first)))
+
+	for i := 0; i < transferCorruptRetryLimit; i++ {
+		sendMsg(t, cm5, protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      id,
+			Offset:      uint32(len(first)),
+			Data:        rawURL(second),
+			ChunkDigest: "00000000",
+		})
+		readTransferNeed(t, cm5, id, uint32(len(first)))
+	}
+	sendMsg(t, cm5, xferChunk(id, 0, first))
+	readTransferNeed(t, cm5, id, uint32(len(first)))
+	sendMsg(t, cm5, protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      id,
+		Offset:      uint32(len(first)),
+		Data:        rawURL(second),
+		ChunkDigest: "00000000",
+	})
+	readTransferAbort(t, cm5, id, "chunk_digest_mismatch")
 }
 
 func TestTransferChunkSizeOverflowAborts(t *testing.T) {
@@ -285,28 +1087,24 @@ func TestTransferChunkSizeOverflowAborts(t *testing.T) {
 
 	payload := []byte("abcd")
 	// Advertise size=4 but send 6 bytes in the first chunk.
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-d2",
-		Size:     uint32(len(payload)),
-		Checksum: xxhashStr(payload),
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-d2", payload, nil))
+	readTransferReady(t, cm5, "xfer-d2", 0)
 
 	sendMsg(t, cm5, protoXferChunk{
-		Type:   msgXferChunk,
-		XferID: "xfer-d2",
-		Offset: 0,
-		Data:   rawURL([]byte("abcdef")),
+		Type:        msgXferChunk,
+		XferID:      "xfer-d2",
+		Offset:      0,
+		Data:        rawURL([]byte("abcdef")),
+		ChunkDigest: xxhashStr([]byte("abcdef")),
 	})
 
 	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Err != "size_overflow" {
+	if abort.Err != "size_too_large" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 }
 
-func TestTransferCommitChecksumMismatchAborts(t *testing.T) {
+func TestTransferCommitDigestMismatchAborts(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -317,40 +1115,314 @@ func TestTransferCommitChecksumMismatchAborts(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	// Begin with the wrong-checksum advertised. The only way to surface a
-	// commit-time mismatch is for begin/commit checksums to disagree, OR for
-	// the streamed bytes to disagree with the begin checksum. Use the
-	// latter: claim a bogus begin/commit checksum but stream the real bytes.
+	// Begin with the wrong digest advertised. The streamed bytes disagree
+	// with the begin/commit digest even though the frames agree.
 	bogus := strings.Repeat("0", 8)
 	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-4",
-		Size:     uint32(len(payload)),
-		Checksum: bogus,
+		Type:      msgXferBegin,
+		XferID:    "xfer-4",
+		Target:    updater.TargetUpdaterMain,
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    bogus,
 	})
-	_ = readMsg[protoXferReady](t, cm5)
+	readTransferReady(t, cm5, "xfer-4", 0)
 
-	sendMsg(t, cm5, protoXferChunk{
-		Type:   msgXferChunk,
-		XferID: "xfer-4",
-		Offset: 0,
-		Data:   rawURL(payload),
-	})
+	sendMsg(t, cm5, xferChunk("xfer-4", 0, payload))
 	_ = readMsg[protoXferNeed](t, cm5)
 
 	sendMsg(t, cm5, protoXferCommit{
-		Type:     msgXferCommit,
-		XferID:   "xfer-4",
-		Size:     uint32(len(payload)),
-		Checksum: bogus,
+		Type:      msgXferCommit,
+		XferID:    "xfer-4",
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    bogus,
 	})
 
 	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Type != msgXferAbort || abort.Err != "checksum_mismatch" {
+	if abort.Type != msgXferAbort || abort.Err != "digest_mismatch" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink abort on checksum mismatch")
+		t.Fatal("expected sink abort on digest mismatch")
+	}
+}
+
+// bufferingSinkAdapter wraps the production bufferSink so transfer tests
+// can assert the bytes passed to updater/main staging.
+type bufferingSinkAdapter struct {
+	*bufferSink
+	abortReasons []string
+}
+
+func (b *bufferingSinkAdapter) Abort(reason string) error {
+	b.abortReasons = append(b.abortReasons, reason)
+	return b.bufferSink.Abort(reason)
+}
+
+func TestTransferTargetInvokedAfterCommit(t *testing.T) {
+	// With target=updater/main, fabric calls the local updater stage RPC
+	// after xfer_commit and before xfer_done. The wire never names a
+	// raw/member receiver topic.
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gotPayload := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+
+	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			sink.bufferSink.meta = meta
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	metaBlob := json.RawMessage(`{"version":"1.2.3"}`)
+
+	sendMsg(t, cm5, xferBegin("xfer-stage", payload, metaBlob))
+	readTransferReady(t, cm5, "xfer-stage", 0)
+
+	sendMsg(t, cm5, xferChunk("xfer-stage", 0, payload))
+	_ = readMsg[protoXferNeed](t, cm5)
+
+	sendMsg(t, cm5, xferCommit("xfer-stage", payload))
+
+	select {
+	case p := <-gotPayload:
+		if p.XferID != "xfer-stage" {
+			t.Fatalf("stage xfer_id = %v, want xfer-stage", p.XferID)
+		}
+		if p.LinkID != defaultLinkID {
+			t.Fatalf("stage link_id = %q, want %q", p.LinkID, defaultLinkID)
+		}
+		if p.Target != updater.TargetUpdaterMain || p.DigestAlg != updater.DigestAlgXXHash32 || p.Digest != xxhashStr(payload) {
+			t.Fatalf("stage contract fields wrong: %+v", p)
+		}
+		if string(p.Artefact) != string(payload) {
+			t.Fatalf("stage artefact = %v, want %q", p.Artefact, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for stage call")
+	}
+
+	done := readMsg[protoXferDone](t, cm5)
+	if done.XferID != "xfer-stage" {
+		t.Fatalf("xfer_done xfer_id = %q, want xfer-stage", done.XferID)
+	}
+}
+
+func TestCompletedTransferDuplicateBeginSameTupleReplaysDone(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stageCalls := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+	sink := &fakeTransferSink{}
+	beginCount := 0
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			beginCount++
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	id := "xfer-completed-replay"
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+	sendMsg(t, cm5, xferChunk(id, 0, payload))
+	readTransferNeed(t, cm5, id, uint32(len(payload)))
+	sendMsg(t, cm5, xferCommit(id, payload))
+	select {
+	case p := <-stageCalls:
+		if p.XferID != id {
+			t.Fatalf("stage xfer_id = %q, want %q", p.XferID, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for first stage call")
+	}
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != id {
+		t.Fatalf("bad xfer_done: %+v", done)
+	}
+	if beginCount != 1 {
+		t.Fatalf("beginTransfer calls after first completion = %d, want 1", beginCount)
+	}
+
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	done = readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != id {
+		t.Fatalf("duplicate begin response = %+v, want xfer_done", done)
+	}
+	if beginCount != 1 {
+		t.Fatalf("duplicate completed begin reopened sink: beginCount=%d", beginCount)
+	}
+	select {
+	case p := <-stageCalls:
+		t.Fatalf("duplicate completed begin restaged transfer: %+v", p)
+	default:
+	}
+}
+
+func TestCompletedTransferDuplicateBeginConflictingTupleAborts(t *testing.T) {
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
+	sink := &fakeTransferSink{}
+	beginCount := 0
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			beginCount++
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	id := "xfer-completed-conflict"
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+	sendMsg(t, cm5, xferChunk(id, 0, payload))
+	readTransferNeed(t, cm5, id, uint32(len(payload)))
+	sendMsg(t, cm5, xferCommit(id, payload))
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != id {
+		t.Fatalf("bad xfer_done: %+v", done)
+	}
+
+	sendMsg(t, cm5, xferBegin(id, []byte("abcde"), nil))
+	readTransferAbort(t, cm5, id, "conflicting_transfer")
+	if beginCount != 1 {
+		t.Fatalf("conflicting completed begin reopened sink: beginCount=%d", beginCount)
+	}
+}
+
+func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
+	// updater/main stage replies {ok=false, err=...}. fabric must send
+	// xfer_abort with the stage reason rather than xfer_done.
+	b := newBus()
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_ = installStageResponder(t, b, updater.StageReply{OK: false, Err: "manifest_check_failed"})
+
+	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	s := session{
+		linkID:   defaultLinkID,
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
+		localSID: "mcu-sid-test",
+		tr:       mcu,
+		conn:     b.NewConnection("fabric"),
+		beginTransfer: func(meta transferMeta) (transferSink, error) {
+			sink.bufferSink.meta = meta
+			return sink, nil
+		},
+	}
+	go s.run(ctx)
+	bringUp(t, cm5)
+
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin("xfer-rej", payload, nil))
+	readTransferReady(t, cm5, "xfer-rej", 0)
+	sendMsg(t, cm5, xferChunk("xfer-rej", 0, payload))
+	_ = readMsg[protoXferNeed](t, cm5)
+	sendMsg(t, cm5, xferCommit("xfer-rej", payload))
+
+	abort := readMsg[protoXferAbort](t, cm5)
+	if abort.XferID != "xfer-rej" {
+		t.Fatalf("xfer_abort xfer_id = %q, want xfer-rej", abort.XferID)
+	}
+	if abort.Err != "manifest_check_failed" {
+		t.Fatalf("xfer_abort err = %q, want manifest_check_failed", abort.Err)
+	}
+}
+
+func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing.T) {
+	b := newBus()
+	memMD := updater.NewMemoryMetadata()
+	verif := &blockingVerifier{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		manifest: updater.Manifest{
+			Version:       "9.9.9",
+			BuildID:       "build-9.9.9",
+			ImageID:       "mcu-dev-9.9.9",
+			PayloadSHA256: strings.Repeat("a", 64),
+			PayloadLength: 4,
+		},
+	}
+	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+		Verifier:      verif,
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+	})
+	defer cancelUpdater()
+	caller := b.NewConnection("caller")
+	prepareUpdaterForFabricTest(t, caller)
+
+	oldTimeout := targetCallTimeout
+	targetCallTimeout = 20 * time.Millisecond
+	defer func() { targetCallTimeout = oldTimeout }()
+
+	cm5, mcu := pipePair()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	bringUp(t, cm5)
+
+	id := "xfer-stage-timeout"
+	payload := []byte("abcd")
+	sendMsg(t, cm5, xferBegin(id, payload, nil))
+	readTransferReady(t, cm5, id, 0)
+	sendMsg(t, cm5, xferChunk(id, 0, payload))
+	readTransferNeed(t, cm5, id, uint32(len(payload)))
+	sendMsg(t, cm5, xferCommit(id, payload))
+	select {
+	case <-verif.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("verifier did not start before stage timeout")
+	}
+	readTransferAbort(t, cm5, id, "stage_timeout")
+	if _, ok := memMD.StagedDescriptor(); ok {
+		t.Fatal("stage timeout persisted descriptor before verifier returned")
+	}
+
+	close(verif.release)
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := memMD.StagedDescriptor(); ok {
+		t.Fatal("late verifier completion after stage timeout persisted descriptor")
 	}
 }
 
@@ -367,8 +1439,8 @@ func TestTransferIdleChunkWatchdog(t *testing.T) {
 	sink := &fakeTransferSink{}
 	s := session{
 		linkID:   defaultLinkID,
-		nodeID:   "mcu-1",
-		peerID:   "cm5-local",
+		nodeID:   "mcu",
+		peerID:   "bigbox-cm5",
 		localSID: "mcu-sid-test",
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
@@ -381,16 +1453,18 @@ func TestTransferIdleChunkWatchdog(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-wd",
-		Size:     uint32(len(payload)),
-		Checksum: xxhashStr(payload),
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-wd", payload, nil))
+	readTransferReady(t, cm5, "xfer-wd", 0)
 
-	// Stop sending chunks; watchdog should fire within ~PhaseTimeout +
-	// one exportTickInterval (50ms).
+	// Stop sending chunks. The watchdog should resend the current offset a
+	// bounded number of times before aborting, so a lost xfer_need does not
+	// strand both sides until the first idle timeout.
+	for i := 0; i < transferIdleRetryLimit; i++ {
+		need := readMsg[protoXferNeed](t, cm5)
+		if need.Type != msgXferNeed || need.XferID != "xfer-wd" || need.Next != 0 {
+			t.Fatalf("bad retry xfer_need[%d]: %+v", i, need)
+		}
+	}
 	abort := readMsg[protoXferAbort](t, cm5)
 	if abort.Type != msgXferAbort || abort.XferID != "xfer-wd" || abort.Err != "timeout" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
@@ -400,8 +1474,8 @@ func TestTransferIdleChunkWatchdog(t *testing.T) {
 	}
 }
 
-func TestTransferCommitChecksumMismatchOnCommitFrameAborts(t *testing.T) {
-	// xfer_begin and xfer_commit must agree on the checksum. If they
+func TestTransferCommitDigestMismatchOnCommitFrameAborts(t *testing.T) {
+	// xfer_begin and xfer_commit must agree on the digest. If they
 	// disagree (even when the streamed bytes match begin), commit aborts.
 	b := newBus()
 	cm5, mcu := pipePair()
@@ -413,33 +1487,22 @@ func TestTransferCommitChecksumMismatchOnCommitFrameAborts(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	good := xxhashStr(payload)
-	sendMsg(t, cm5, protoXferBegin{
-		Type:     msgXferBegin,
-		XferID:   "xfer-5",
-		Size:     uint32(len(payload)),
-		Checksum: good,
-	})
-	_ = readMsg[protoXferReady](t, cm5)
+	sendMsg(t, cm5, xferBegin("xfer-5", payload, nil))
+	readTransferReady(t, cm5, "xfer-5", 0)
 
-	sendMsg(t, cm5, protoXferChunk{
-		Type:   msgXferChunk,
-		XferID: "xfer-5",
-		Offset: 0,
-		Data:   rawURL(payload),
-	})
+	sendMsg(t, cm5, xferChunk("xfer-5", 0, payload))
 	_ = readMsg[protoXferNeed](t, cm5)
 
-	// Commit advertises a different checksum than begin: must abort.
+	// Commit advertises a different digest than begin: must abort.
 	sendMsg(t, cm5, protoXferCommit{
-		Type:     msgXferCommit,
-		XferID:   "xfer-5",
-		Size:     uint32(len(payload)),
-		Checksum: strings.Repeat("0", 8),
+		Type:      msgXferCommit,
+		XferID:    "xfer-5",
+		Size:      uint32(len(payload)),
+		DigestAlg: updater.DigestAlgXXHash32,
+		Digest:    strings.Repeat("0", 8),
 	})
-
 	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Type != msgXferAbort || abort.Err != "checksum_mismatch" {
+	if abort.Type != msgXferAbort || abort.Err != "digest_mismatch" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
 }

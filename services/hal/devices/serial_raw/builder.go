@@ -2,6 +2,7 @@ package serial_raw
 
 import (
 	"context"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,11 @@ type Params struct {
 	RXSize int // power of two; default 512 if zero in SessionOpen
 	TXSize int // power of two; default 512 if zero in SessionOpen
 }
+
+const (
+	serialRawPumpRXBudget = 256
+	serialRawPumpTXBudget = 256
+)
 
 // ---- Device ----
 
@@ -52,14 +58,21 @@ type session struct {
 	txRing   *shmring.Ring
 
 	// Reactor-owned observability. Single writer only.
-	rxRingFull uint32
-	rxLogAt    time.Time
-	rxLogHits  uint32
+	rxRingFull     uint32
+	rxLogAt        time.Time
+	rxLogHits      uint32
+	rxPressureAt   time.Time
+	rxPressureHits uint32
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+type serialRXDiagnostics interface {
+	RXBuffered() int
+	RXBufferCap() int
 }
 
 // ---- Builder registration ----
@@ -345,8 +358,55 @@ func (d *Device) logRingFullChange(s *session, force bool) {
 		"[serial-raw]", "rx_ring_full",
 		"uart", d.a.Name,
 		"hits", strconvx.Utoa64(uint64(hits)),
+		"ring_avail", strconvx.Itoa(s.rxRing.Available()),
+		"ring_space", strconvx.Itoa(s.rxRing.Space()),
+		"ring_cap", strconvx.Itoa(s.rxRing.Cap()),
 	)
 	s.rxLogHits = hits
+}
+
+func (d *Device) logDriverPressure(s *session, force bool) {
+	const minInterval = 1 * time.Second
+
+	diag, ok := d.port.(serialRXDiagnostics)
+	if !ok {
+		return
+	}
+	used := diag.RXBuffered()
+	capacity := diag.RXBufferCap()
+	if capacity <= 0 || used < 0 {
+		return
+	}
+	threshold := (capacity * 3) / 4
+	if threshold < 1 {
+		threshold = 1
+	}
+	if !force && used < threshold {
+		return
+	}
+
+	hits := s.rxPressureHits + 1
+	if !force {
+		now := time.Now()
+		if now.Sub(s.rxPressureAt) < minInterval {
+			return
+		}
+		s.rxPressureAt = now
+	} else {
+		s.rxPressureAt = time.Now()
+	}
+	s.rxPressureHits = hits
+
+	println(
+		"[serial-raw]", "rx_driver_pressure",
+		"uart", d.a.Name,
+		"hits", strconvx.Utoa64(uint64(hits)),
+		"driver_used", strconvx.Itoa(used),
+		"driver_cap", strconvx.Itoa(capacity),
+		"ring_avail", strconvx.Itoa(s.rxRing.Available()),
+		"ring_space", strconvx.Itoa(s.rxRing.Space()),
+		"ring_cap", strconvx.Itoa(s.rxRing.Cap()),
+	)
 }
 
 func (d *Device) reactor(s *session) {
@@ -359,54 +419,22 @@ func (d *Device) reactor(s *session) {
 	for {
 		made := false
 
-		// UART RX -> rxRing (use spans; fill p1 completely before p2)
-		for {
-			p1, p2 := rxR.WriteAcquire()
-			if len(p1) == 0 {
-				s.rxRingFull++
-				break
-			}
-			n1 := u.TryRead(p1)
-			if n1 == 0 {
-				break
-			}
-			if n1 < len(p1) {
-				rxR.WriteCommit(n1)
-				made = true
-				continue
-			}
-			n2 := 0
-			if len(p2) > 0 {
-				n2 = u.TryRead(p2)
-			}
-			rxR.WriteCommit(n1 + n2)
+		if d.pumpRX(s, u, rxR, serialRawPumpRXBudget) {
 			made = true
 		}
 
-		// txRing -> UART TX (use spans; drain p1 completely before p2)
-		for {
-			p1, p2 := txR.ReadAcquire()
-			if len(p1) == 0 {
-				break
-			}
-			n1 := u.TryWrite(p1)
-			if n1 == 0 {
-				break
-			}
-			if n1 < len(p1) {
-				txR.ReadRelease(n1)
-				made = true
-				continue
-			}
-			n2 := 0
-			if len(p2) > 0 {
-				n2 = u.TryWrite(p2)
-			}
-			txR.ReadRelease(n1 + n2)
+		if d.pumpTX(u, txR, serialRawPumpTXBudget) {
 			made = true
 		}
 
 		if made {
+			select {
+			case <-s.ctx.Done():
+				d.logRingFullChange(s, true)
+				return
+			default:
+			}
+			runtime.Gosched()
 			continue
 		}
 
@@ -422,6 +450,98 @@ func (d *Device) reactor(s *session) {
 		case <-txR.Readable():
 		}
 	}
+}
+
+func (d *Device) pumpRX(s *session, u core.SerialPort, rxR *shmring.Ring, budget int) bool {
+	moved := 0
+
+	for moved < budget {
+		d.logDriverPressure(s, false)
+		p1, p2 := rxR.WriteAcquire()
+		if len(p1) == 0 {
+			s.rxRingFull++
+			break
+		}
+
+		remaining := budget - moved
+		p1 = limitSpan(p1, remaining)
+		n1 := u.TryRead(p1)
+		if n1 == 0 {
+			break
+		}
+		n := n1
+		moved += n1
+		if n1 < len(p1) {
+			rxR.WriteCommit(n)
+			break
+		}
+
+		remaining = budget - moved
+		if remaining > 0 && len(p2) > 0 {
+			p2 = limitSpan(p2, remaining)
+			n2 := u.TryRead(p2)
+			n += n2
+			moved += n2
+			if n2 < len(p2) {
+				rxR.WriteCommit(n)
+				break
+			}
+		}
+
+		rxR.WriteCommit(n)
+	}
+
+	return moved > 0
+}
+
+func (d *Device) pumpTX(u core.SerialPort, txR *shmring.Ring, budget int) bool {
+	moved := 0
+
+	for moved < budget {
+		p1, p2 := txR.ReadAcquire()
+		if len(p1) == 0 {
+			break
+		}
+
+		remaining := budget - moved
+		p1 = limitSpan(p1, remaining)
+		n1 := u.TryWrite(p1)
+		if n1 == 0 {
+			break
+		}
+		n := n1
+		moved += n1
+		if n1 < len(p1) {
+			txR.ReadRelease(n)
+			break
+		}
+
+		remaining = budget - moved
+		if remaining > 0 && len(p2) > 0 {
+			p2 = limitSpan(p2, remaining)
+			n2 := u.TryWrite(p2)
+			n += n2
+			moved += n2
+			if n2 < len(p2) {
+				txR.ReadRelease(n)
+				break
+			}
+		}
+
+		txR.ReadRelease(n)
+	}
+
+	return moved > 0
+}
+
+func limitSpan(p []byte, max int) []byte {
+	if max <= 0 {
+		return p[:0]
+	}
+	if len(p) > max {
+		return p[:max]
+	}
+	return p
 }
 
 // ---- Helpers ----

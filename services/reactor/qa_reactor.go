@@ -7,9 +7,9 @@ import (
 	"runtime"
 	"time"
 
-	"devicecode-go/utilities"
 	"devicecode-go/bus"
 	"devicecode-go/types"
+	"devicecode-go/utilities"
 	"devicecode-go/x/shmring"
 	"devicecode-go/x/strconvx"
 )
@@ -165,16 +165,26 @@ type Reactor struct {
 
 	// telemetry drop counters (bytes)
 	droppedUART0Bytes int
+	bootBuyRC         int32
+}
+
+type Options struct {
+	BootBuyRC int32
 }
 
 func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
+	return NewReactorWithOptions(b, uiConn, Options{})
+}
+
+func NewReactorWithOptions(b *bus.Bus, uiConn *bus.Connection, opts Options) *Reactor {
 	return &Reactor{
-		bus:     b,
-		uiConn:  uiConn,
-		levelUp: true,
-		state:   stateOff,
-		now:     time.Now(),
-		ledTick: 0,
+		bus:       b,
+		uiConn:    uiConn,
+		levelUp:   true,
+		state:     stateOff,
+		now:       time.Now(),
+		bootBuyRC: opts.BootBuyRC,
+		ledTick:   0,
 	}
 }
 
@@ -436,7 +446,7 @@ func (r *Reactor) emitMemSnapshot() {
 }
 
 func (r *Reactor) Run(ctx context.Context) {
-// Subscriptions (env + power)
+	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
 	tempSub := r.uiConn.Subscribe(tTempValue)
 	tempDieSub := r.uiConn.Subscribe(tDieTempValue)
