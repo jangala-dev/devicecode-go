@@ -9,6 +9,7 @@ import (
 	"devicecode-go/services/hal/internal/core"
 	"devicecode-go/types"
 	"devicecode-go/x/shmring"
+	"devicecode-go/x/strconvx"
 )
 
 // ---- Parameters ----
@@ -49,6 +50,11 @@ type session struct {
 	rxRing   *shmring.Ring
 	txHandle shmring.Handle
 	txRing   *shmring.Ring
+
+	// Reactor-owned observability. Single writer only.
+	rxRingFull uint32
+	rxLogAt    time.Time
+	rxLogHits  uint32
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -169,6 +175,12 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		}
 
 		d.startSession(rxSize, txSize)
+		println(
+			"[serial-raw]", "session_open",
+			"uart", d.a.Name,
+			"rx_size", strconvx.Itoa(rxSize),
+			"tx_size", strconvx.Itoa(txSize),
+		)
 
 		// --- Device-level hygiene: drain spurious RX before signalling link up ---
 		// Discard any pre-existing or immediately-arriving bytes on the UART RX path.
@@ -311,6 +323,32 @@ func (d *Device) stopSession() {
 
 // ---- Reactor (single goroutine) ----
 
+func (d *Device) logRingFullChange(s *session, force bool) {
+	const rxLogMinInterval = 1 * time.Second
+
+	hits := s.rxRingFull
+
+	if !force {
+		now := time.Now()
+		if now.Sub(s.rxLogAt) < rxLogMinInterval {
+			return
+		}
+		if hits == s.rxLogHits {
+			return
+		}
+		s.rxLogAt = now
+	} else {
+		s.rxLogAt = time.Now()
+	}
+
+	println(
+		"[serial-raw]", "rx_ring_full",
+		"uart", d.a.Name,
+		"hits", strconvx.Utoa64(uint64(hits)),
+	)
+	s.rxLogHits = hits
+}
+
 func (d *Device) reactor(s *session) {
 	defer close(s.done)
 
@@ -325,6 +363,7 @@ func (d *Device) reactor(s *session) {
 		for {
 			p1, p2 := rxR.WriteAcquire()
 			if len(p1) == 0 {
+				s.rxRingFull++
 				break
 			}
 			n1 := u.TryRead(p1)
@@ -372,8 +411,10 @@ func (d *Device) reactor(s *session) {
 		}
 
 		// Idle: wait for any edge, then re-check.
+		d.logRingFullChange(s, false)
 		select {
 		case <-s.ctx.Done():
+			d.logRingFullChange(s, true)
 			return
 		case <-u.Readable():
 		case <-u.Writable():

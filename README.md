@@ -4,7 +4,7 @@
 tinygo flash -stack-size=3KB -monitor -scheduler tasks -target=pico -tags "pico_bb_proto_1" main.go
 
 ## Flashing ISOC Power Board via USB port on Pico2
-tinygo flash -stack-size=3KB -monitor -scheduler tasks -target=pico2 -tags "pico_bb_proto_1" main.go
+tinygo flash -stack-size=8KB -monitor -scheduler tasks -target=pico2 -tags "pico_bb_proto_1" main.go
 
 -------------------
 

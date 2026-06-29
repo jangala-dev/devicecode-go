@@ -27,7 +27,12 @@ func main() {
 	ctx := context.Background()
 
 	log.Println("[main] bootstrapping bus …")
-	b := bus.NewBus(3, "+", "#")
+	// Queue length must cover the retained replay burst when fabric
+	// subscribes to wildcard export patterns (hal/cap/env/#,
+	// hal/cap/power/#). Each capability publishes retained info +
+	// status + value; pico_bb_proto_1 has ~26 retained topics across
+	// env and power domains. 32 provides margin for growth.
+	b := bus.NewBus(32, "+", "#")
 	halConn := b.NewConnection("hal")
 	uiConn := b.NewConnection("ui")
 
@@ -43,7 +48,7 @@ func main() {
 	}
 
 	// Reactor
-	r := reactor.NewReactor(uiConn)
+	r := reactor.NewReactor(b, uiConn)
 	r.Run(ctx)
 }
 
