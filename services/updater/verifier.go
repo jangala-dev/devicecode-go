@@ -7,7 +7,7 @@ import (
 
 // Manifest is the small subset of the signed-image manifest that updater
 // staging needs after verification succeeds. The full canonical manifest lives
-// in pico2-a-b/imagev1; this type is the local interface carried across the
+// in pico2-a-b/signedimage; this type is the local interface carried across the
 // staging -> updater -> state/self/updater pipeline.
 type Manifest struct {
 	Version       string
@@ -52,7 +52,7 @@ type Verifier interface {
 var ErrUnsignedNotSupported = errors.New("verifier_stub: unsigned images not supported on this build")
 
 // Applier is the slot-switch + reboot hook for the commit RPC. Split in two so
-// handleCommit can publish the rebooting retain and reply accepted before the
+// commit can publish the rebooting retain and return accepted before the
 // reboot fires; an implementation that reboots inside Apply would otherwise
 // skip both the wire reply and the state/self/updater retain.
 //
@@ -69,7 +69,7 @@ type Applier interface {
 	CanApply(d StagedDescriptor) error
 
 	// ArmReboot schedules the slot-switch + reboot. Called only AFTER
-	// handleCommit has published state=rebooting and replied accepted to the
+	// commit endpoint has published state=rebooting and returned accepted to the
 	// caller. Real implementations may reboot inside this call (it
 	// won't return); the spec contract is that callers must do their
 	// pre-reboot work first. If it returns an error, the updater service
@@ -79,7 +79,7 @@ type Applier interface {
 
 // refusingApplier is the production default. CanApply always returns
 // ErrApplyUnavailable so commit refuses with
-// `error: "apply_unavailable"` and never reaches ArmReboot.
+// `error: "commit_failed"` and never reaches ArmReboot.
 type refusingApplier struct{}
 
 // RefusingApplier returns the safe-default Applier for this branch.

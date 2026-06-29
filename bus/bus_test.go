@@ -8,6 +8,20 @@ import (
 	"time"
 )
 
+func topicStringForTest(tp Topic) string {
+	if tp == nil {
+		return ""
+	}
+	out := ""
+	for i := 0; i < tp.Len(); i++ {
+		if i > 0 {
+			out += "/"
+		}
+		out += tp.At(i).(string)
+	}
+	return out
+}
+
 const (
 	TopicConfig = "config"
 	TopicGeo    = "geo"
@@ -180,7 +194,7 @@ func TestRequestReply_RequestWait(t *testing.T) {
 
 	go func() {
 		if msg, ok := <-respSub.Channel(); ok {
-			respConn.Reply(msg, "OK", false)
+			respConn.Reply(&msg, "OK", false)
 		}
 	}()
 
@@ -234,7 +248,7 @@ func TestRequestReply_ManualSubscription(t *testing.T) {
 	go func() {
 		defer close(done)
 		if msg, ok := <-reqSub.Channel(); ok {
-			respConn.Reply(msg, map[string]any{"value": 42}, false)
+			respConn.Reply(&msg, map[string]any{"value": 42}, false)
 		}
 	}()
 
@@ -346,4 +360,100 @@ func TestTopic_InvalidTokenPanics(t *testing.T) {
 
 	// []byte is not comparable, so T should panic
 	_ = T([]byte{1, 2, 3})
+}
+
+func TestSubscriptionSetSignalsForAnyMember(t *testing.T) {
+	b := NewBus(4, "+", "#")
+	c := b.NewConnection("test")
+	ss := c.NewSubscriptionSet()
+	defer ss.Close()
+
+	a := ss.Subscribe(T("a"))
+	bb := ss.Subscribe(T("b"))
+
+	c.Publish(c.NewMessage(T("b"), "bee", false))
+	select {
+	case <-ss.Ready():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for subscription set readiness")
+	}
+
+	select {
+	case m := <-bb.Channel():
+		if m.Payload != "bee" {
+			t.Fatalf("unexpected b payload: %#v", m.Payload)
+		}
+	default:
+		t.Fatal("b subscription was not ready after set signal")
+	}
+
+	select {
+	case m := <-a.Channel():
+		t.Fatalf("unexpected a message: %#v", m)
+	default:
+	}
+}
+
+func TestSubscriptionSetCoalescesReadiness(t *testing.T) {
+	b := NewBus(4, "+", "#")
+	c := b.NewConnection("test")
+	ss := c.NewSubscriptionSet()
+	defer ss.Close()
+
+	sub := ss.Subscribe(T("a"))
+	c.Publish(c.NewMessage(T("a"), "one", false))
+	c.Publish(c.NewMessage(T("a"), "two", false))
+
+	select {
+	case <-ss.Ready():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for first readiness")
+	}
+
+	got := drainPayloads(t, sub, 2)
+	assertUnorderedEqual(t, got, []string{"one", "two"})
+}
+
+func TestRetainedWatchReplayAndLifecycle(t *testing.T) {
+	b := NewBus(8, "+", "#")
+	pub := b.NewConnection("pub")
+	pub.Publish(pub.NewMessage(T("state", "self", "software"), "v1", true))
+	pub.Publish(pub.NewMessage(T("event", "self", "ignore"), "event", false))
+
+	watcher := b.NewConnection("watcher")
+	watch := watcher.WatchRetained(T("state", "self", "#"), RetainedWatchOptions{Replay: true, QueueLen: 8})
+	defer watcher.UnwatchRetained(watch)
+
+	ev, ok := watch.TryNext()
+	if !ok || ev.Op != RetainedSet || topicStringForTest(ev.Topic) != "state/self/software" || ev.Payload.(string) != "v1" {
+		t.Fatalf("first retained event = %+v, %v", ev, ok)
+	}
+	ev, ok = watch.TryNext()
+	if !ok || ev.Op != RetainedReplayDone {
+		t.Fatalf("second retained event = %+v, %v; want replay done", ev, ok)
+	}
+
+	pub.Publish(pub.NewMessage(T("state", "self", "software"), nil, true))
+	ev, ok = watch.TryNext()
+	if !ok || ev.Op != RetainedUnset || topicStringForTest(ev.Topic) != "state/self/software" {
+		t.Fatalf("unretain event = %+v, %v", ev, ok)
+	}
+}
+
+func TestBindCall(t *testing.T) {
+	b := NewBus(4, "+", "#")
+	svc := b.NewConnection("svc")
+	binding := svc.Bind(T("rpc", "echo"), func(ctx context.Context, payload any) (any, error) {
+		return payload.(string) + "-reply", nil
+	})
+	defer binding.Close()
+
+	caller := b.NewConnection("caller")
+	got, err := caller.Call(context.Background(), T("rpc", "echo"), "hello")
+	if err != nil {
+		t.Fatalf("call failed: %v", err)
+	}
+	if got != "hello-reply" {
+		t.Fatalf("call reply = %v, want hello-reply", got)
+	}
 }

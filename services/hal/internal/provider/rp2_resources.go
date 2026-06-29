@@ -338,18 +338,23 @@ type i2cReq struct {
 
 // per-bus owner that hosts a single worker goroutine
 type i2cOwner struct {
-	id   core.ResourceID
-	hw   *machine.I2C
-	reqs chan i2cReq
-	quit chan struct{}
+	id       core.ResourceID
+	hw       *machine.I2C
+	reqs     chan i2cReq
+	quit     chan struct{}
+	donePool chan chan error
 }
 
 func newI2COwner(id core.ResourceID, hw *machine.I2C) *i2cOwner {
 	o := &i2cOwner{
-		id:   id,
-		hw:   hw,
-		reqs: make(chan i2cReq, 16),
-		quit: make(chan struct{}),
+		id:       id,
+		hw:       hw,
+		reqs:     make(chan i2cReq, 16),
+		quit:     make(chan struct{}),
+		donePool: make(chan chan error, 8),
+	}
+	for i := 0; i < cap(o.donePool); i++ {
+		o.donePool <- make(chan error, 1)
 	}
 	go o.loop()
 	return o
@@ -373,57 +378,103 @@ func (o *i2cOwner) loop() {
 
 func (o *i2cOwner) stop() { close(o.quit) }
 
+func (o *i2cOwner) acquireDone() chan error {
+	select {
+	case ch := <-o.donePool:
+		select {
+		case <-ch:
+		default:
+		}
+		return ch
+	default:
+		// Should be rare: the pool covers the expected real-hardware concurrency.
+		return make(chan error, 1)
+	}
+}
+
+func (o *i2cOwner) releaseDone(ch chan error) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case o.donePool <- ch:
+	default:
+		// Pool full; let the rare surplus channel be collected.
+	}
+}
+
+func stopAndDrainTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 // driversI2C adapts the owner to tinygo.org/x/drivers.I2C.
 // It posts a request and optionally enforces a per-call timeout.
 type driversI2C struct {
 	o       *i2cOwner
 	timeout time.Duration // 0 => no deadline
+	mu      sync.Mutex
+	timer   *time.Timer
 }
 
 // Ensure compile-time conformance with drivers.I2C
 var _ drivers.I2C = (*driversI2C)(nil)
 
 func (d *driversI2C) Tx(addr uint16, w, r []byte) error {
-	req := i2cReq{addr: addr, w: w, r: r, done: make(chan error, 1)}
+	// A claimed I2C handle is normally driven by one device worker, but guard it
+	// anyway so we can reuse the timeout timer without allocating per transaction.
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	done := d.o.acquireDone()
+	releaseDone := true
+	defer func() {
+		if releaseDone {
+			d.o.releaseDone(done)
+		}
+	}()
+	req := i2cReq{addr: addr, w: w, r: r, done: done}
 
 	if d.timeout <= 0 {
-		// Unbounded enqueue (blocks until space is available)
 		d.o.reqs <- req
-	} else {
-		t := time.NewTimer(0)
-		// Ensure clean state before use.
-		if !t.Stop() {
-			select {
-			case <-t.C:
-			default:
-			}
-		}
-		t.Reset(d.timeout)
-		select {
-		case d.o.reqs <- req:
-			if !t.Stop() {
-				select {
-				case <-t.C:
-				default:
-				}
-			}
-		case <-t.C:
-			return errcode.Busy
-		}
-		// Reuse 't' for completion wait below.
-		defer t.Stop()
+		return <-done
 	}
 
-	// Completion
-	if d.timeout <= 0 {
-		return <-req.done
+	if d.timer == nil {
+		d.timer = time.NewTimer(time.Hour)
+		stopAndDrainTimer(d.timer)
 	}
-	t := time.NewTimer(d.timeout)
-	defer t.Stop()
+
+	d.timer.Reset(d.timeout)
 	select {
-	case err := <-req.done:
+	case d.o.reqs <- req:
+		stopAndDrainTimer(d.timer)
+	case <-d.timer.C:
+		return errcode.Busy
+	}
+
+	d.timer.Reset(d.timeout)
+	select {
+	case err := <-done:
+		stopAndDrainTimer(d.timer)
 		return err
-	case <-t.C:
+	case <-d.timer.C:
+		// The bus worker may still complete later and write into this channel.
+		// Do not return it to the pool, otherwise a stale completion could poison a
+		// later transaction. Timeouts should be exceptional; sacrificing one pooled
+		// channel is preferable to allocating a new channel for every normal I2C op.
+		releaseDone = false
 		return errcode.Timeout
 	}
 }
@@ -710,54 +761,9 @@ func (p *rp2SerialPort) Writable() <-chan struct{} { return p.u.Writable() }
 func (p *rp2SerialPort) TryRead(b []byte) int      { return p.u.TryRead(b) }
 func (p *rp2SerialPort) TryWrite(b []byte) int     { return p.u.TryWrite(b) }
 func (p *rp2SerialPort) Flush() error              { return p.u.Flush() }
-
-func (p *rp2SerialPort) RXBuffered() int {
-	if p.u == nil || p.u.Buffer == nil {
-		return -1
-	}
-	return int(p.u.Buffer.Used())
-}
-
-func (p *rp2SerialPort) RXBufferCap() int {
-	if p.u == nil || p.u.Buffer == nil {
-		return -1
-	}
-	return int(p.u.Buffer.Size())
-}
-
-func (p *rp2SerialPort) RXDropCount() uint32 {
-	if p.u == nil {
-		return 0
-	}
-	return p.u.RXDropCount()
-}
-
-func (p *rp2SerialPort) RXOverrunCount() uint32 {
-	if p.u == nil {
-		return 0
-	}
-	return p.u.RXOverrunCount()
-}
-
-func (p *rp2SerialPort) RXBreakCount() uint32 {
-	if p.u == nil {
-		return 0
-	}
-	return p.u.RXBreakCount()
-}
-
-func (p *rp2SerialPort) RXParityCount() uint32 {
-	if p.u == nil {
-		return 0
-	}
-	return p.u.RXParityCount()
-}
-
-func (p *rp2SerialPort) RXFramingCount() uint32 {
-	if p.u == nil {
-		return 0
-	}
-	return p.u.RXFramingCount()
+func (p *rp2SerialPort) DebugStats() core.SerialDebugStats {
+	// The upstream uartx module does not expose diagnostic counters.
+	return core.SerialDebugStats{}
 }
 
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }

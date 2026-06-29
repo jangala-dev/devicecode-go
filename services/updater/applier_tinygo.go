@@ -24,7 +24,7 @@ const postCommitReplyFlushDelay = 750 * time.Millisecond
 func (abupdateApplier) CanApply(d StagedDescriptor) error {
 	_ = d
 	if !sharedUpdaterInit {
-		return errFromRC("apply_unavailable_uninited", 0)
+		return errors.New(ErrApplyUnavailable)
 	}
 	return nil
 }
@@ -41,7 +41,7 @@ func (abupdateApplier) ArmReboot(d StagedDescriptor) error {
 
 func scheduleArmReboot(a Applier, d StagedDescriptor, results chan<- applyRebootResult) {
 	go func() {
-		// handleCommit has only replied on the local bus. The fabric
+		// commit endpoint has returned accepted. The fabric
 		// session still needs a scheduler turn to marshal and write the
 		// wire reply (and the state=rebooting retain) back to CM5 before
 		// RebootIntoSlot stops the process.

@@ -3,7 +3,7 @@
 //
 // This package mirrors devicecode-lua/src/shared/hash/xxhash32.lua at
 // update-migration tip (commit 2c88090). It is used for fabric wire-protocol
-// integrity (xfer_begin / xfer_commit checksum field) and for HAL artefact
+// integrity (xfer_begin / xfer_commit digest field) and for HAL artefact
 // hashing. It is not a security primitive.
 package xxhash
 

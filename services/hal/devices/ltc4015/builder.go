@@ -37,7 +37,17 @@ type Params struct {
 	DomainCharger string // required
 	Name          string // required
 
+	// Boot actions are optional charger control writes applied after startup.
+	// They are deliberately paced because LTC4015 I2C bursts at boot have
+	// previously interfered with the UART0 Fabric path on real hardware.
 	Boot []types.BootAction `json:"boot,omitempty"`
+
+	// Optional pacing for Boot actions. Zero uses conservative defaults:
+	// defer for 5s, leave 100ms between actions, and coalesce a single
+	// sample 250ms after the last control write.
+	BootDelayMs              uint32 `json:"boot_delay_ms,omitempty"`
+	BootGapMs                uint32 `json:"boot_gap_ms,omitempty"`
+	PostConfigureReadDelayMs uint32 `json:"post_configure_read_delay_ms,omitempty"`
 }
 
 // Builder registration (strict; no legacy shims).

@@ -40,22 +40,23 @@ func (l *txLane) pop() []byte {
 // writer in priority order. With a single producer goroutine the queue
 // is normally drained empty before the next caller, but the lane
 // discipline kicks in when multiple frames are queued in a single tick
-// (e.g. drainExports + drainOutbound generating frames back-to-back).
+// (e.g. drainExports or transfer/control paths generating frames back-to-back).
+//
+// Control frames are normally immediate ping/pong/session-control replies.
+// If all lanes are empty, write them directly rather than appending to a
+// one-element slice and immediately popping it again. When any lane already
+// has backlog, keep the normal queue path so control priority over queued
+// RPC/bulk frames is preserved.
 func (s *session) enqueueFrame(l lane, data []byte) bool {
-	s.lane(l).push(data)
-	if fabricTraceEnabled {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"enqueue_frame",
-			"lane", laneName(l),
-			"type", protoType(data),
-			"len", len(data),
-			"q_control", s.txControl.len(),
-			"q_rpc", s.txRPC.len(),
-			"q_bulk", s.txBulk.len(),
-		)
+	if s.writerIdle() {
+		return s.writeFrame(l, data)
 	}
+	s.lane(l).push(data)
 	return s.flushWriter()
+}
+
+func (s *session) writerIdle() bool {
+	return s.txControl.len() == 0 && s.txRPC.len() == 0 && s.txBulk.len() == 0
 }
 
 func (s *session) lane(l lane) *txLane {
@@ -124,16 +125,6 @@ func (s *session) flushWriter() bool {
 func (s *session) writeFrame(l lane, data []byte) bool {
 	if len(data) > 0 && data[len(data)-1] == '\n' {
 		data = data[:len(data)-1]
-	}
-	if fabricTraceEnabled {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"tx_frame",
-			"lane", laneName(l),
-			"type", protoType(data),
-			"len", len(data),
-			"line", tracePreview(data),
-		)
 	}
 	if err := s.tr.WriteLine(data); err != nil {
 		if errors.Is(err, ErrLineTooLong) {

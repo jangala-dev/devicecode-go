@@ -4,7 +4,7 @@
 tinygo flash -stack-size=3KB -monitor -scheduler tasks -target=pico -tags "pico_bb_proto_1" main.go
 
 ## Flashing ISOC Power Board via USB port on Pico2
-tinygo flash -stack-size=8KB -monitor -scheduler tasks -target=pico2 -tags "pico_bb_proto_1" main.go
+tinygo flash -stack-size=3KB -monitor -scheduler tasks -target=pico2 -tags "pico_bb_proto_1" main.go
 
 -------------------
 
@@ -36,3 +36,21 @@ The Darwin Kernel requires the debugger to have special permissions before it is
 An OpenOCD server will be started, a GDB session started.  Then the project will be built with flags specified in .vscode/tasks.json. Next, the compiled .elf file will be flashed to the MCU. The MCU will then be reset and control is handed over to you for the debug session.
 
 You'll then be able to add breakpoints, pause, resume and reset the MCU remotely using VsCode debug tools.
+
+## UART1 diagnostic facade
+
+This bundle keeps the original direct UART1 logger architecture and adds a small importable diagnostic facade at `devicecode-go/utilities/diag`.
+
+Use it from deep code as a TinyGo-serial-safe analogue of `print` / `println`:
+
+```go
+import "devicecode-go/utilities/diag"
+
+diag.Print("ltc sample us=", sampleUS)
+diag.Println("fabric reject", reason)
+diag.WriteLine([]byte("raw diagnostic"))
+```
+
+The facade does not use TinyGo's standard serial path. The Reactor attaches the existing `uart1` serial_raw TX ring to it when the log session opens. It has no goroutine, no channel, no queue, and no blocking write path. Calls are best-effort and may drop bytes if UART1 is busy or its TX ring is full.
+
+The proven CRLF line-ending fix is retained.

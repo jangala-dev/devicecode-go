@@ -1,182 +1,453 @@
 package updater
 
 import (
+	"context"
 	"errors"
-	"sync"
-	"time"
-
-	"devicecode-go/services/otadiag"
 )
 
-var (
-	activeServiceMu sync.Mutex
-	activeService   *Service
+type streamedStageCommandKind uint8
+
+const (
+	streamedStageCommandBegin streamedStageCommandKind = iota + 1
+	streamedStageCommandWrite
+	streamedStageCommandCommit
+	streamedStageCommandAbort
+	streamedStageCommandCancel
 )
 
-func registerActiveService(s *Service) func() {
-	activeServiceMu.Lock()
-	activeService = s
-	activeServiceMu.Unlock()
-	return func() {
-		activeServiceMu.Lock()
-		if activeService == s {
-			activeService = nil
+type streamedStageCommand struct {
+	kind       streamedStageCommandKind
+	xferID     string
+	generation uint64
+	size       uint32
+	data       []byte
+	reason     string
+	reply      chan streamedStageCommandResult
+}
+
+type streamedStageCommandResult struct {
+	generation uint64
+	written    uint32
+	err        error
+}
+
+type streamedStageWorkerCommand struct {
+	kind       streamedStageCommandKind
+	xferID     string
+	generation uint64
+	size       uint32
+	data       []byte
+	reason     string
+}
+
+type streamedStageWorkerResult struct {
+	kind       streamedStageCommandKind
+	xferID     string
+	generation uint64
+	staged     streamedStage
+	err        error
+}
+
+// BeginStreamedStage submits a transfer-begin operation to the updater reactor.
+// The updater loop owns the lease/state decision; the stage worker owns any
+// verifier or flash setup needed to accept the stream.
+func (s *Service) BeginStreamedStage(xferID string, size uint32) (uint64, error) {
+	res := s.submitStreamedStageCommand(streamedStageCommand{
+		kind:   streamedStageCommandBegin,
+		xferID: xferID,
+		size:   size,
+	})
+	return res.generation, res.err
+}
+
+func (s *Service) WriteStreamedStage(xferID string, generation uint64, data []byte) error {
+	res := s.submitStreamedStageCommand(streamedStageCommand{
+		kind:       streamedStageCommandWrite,
+		xferID:     xferID,
+		generation: generation,
+		data:       data,
+	})
+	return res.err
+}
+
+func (s *Service) CommitStreamedStage(xferID string, generation uint64) (uint32, error) {
+	res := s.submitStreamedStageCommand(streamedStageCommand{
+		kind:       streamedStageCommandCommit,
+		xferID:     xferID,
+		generation: generation,
+	})
+	return res.written, res.err
+}
+
+func (s *Service) AbortStreamedStage(xferID string, generation uint64, reason string) {
+	_ = s.submitStreamedStageCommand(streamedStageCommand{
+		kind:       streamedStageCommandAbort,
+		xferID:     xferID,
+		generation: generation,
+		reason:     reason,
+	})
+}
+
+func (s *Service) CancelStreamedStage(xferID string, generation uint64, reason string) {
+	_ = s.submitStreamedStageCommand(streamedStageCommand{
+		kind:       streamedStageCommandCancel,
+		xferID:     xferID,
+		generation: generation,
+		reason:     reason,
+	})
+}
+
+func (s *Service) submitStreamedStageCommand(cmd streamedStageCommand) streamedStageCommandResult {
+	if s == nil {
+		return streamedStageCommandResult{err: errors.New("updater_not_running")}
+	}
+	if !s.streamedStageReady() {
+		return streamedStageCommandResult{err: errors.New("updater_not_running")}
+	}
+	reply, ok := s.acquireStreamedStageReply()
+	if !ok {
+		return streamedStageCommandResult{err: errors.New(ErrBusy)}
+	}
+	cmd.reply = reply
+	select {
+	case s.stageCommands <- cmd:
+	case <-s.stageStopped:
+		return streamedStageCommandResult{err: errors.New("updater_not_running")}
+	}
+	select {
+	case res := <-reply:
+		s.releaseStreamedStageReply(reply)
+		return res
+	case <-s.stageStopped:
+		return streamedStageCommandResult{err: errors.New("updater_not_running")}
+	}
+}
+
+func (s *Service) streamedStageReady() bool {
+	select {
+	case <-s.stageStopped:
+		return false
+	default:
+	}
+	select {
+	case <-s.stageReady:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) acquireStreamedStageReply() (chan streamedStageCommandResult, bool) {
+	select {
+	case ch := <-s.stageReplyPool:
+		return ch, true
+	default:
+		return nil, false
+	}
+}
+
+func (s *Service) releaseStreamedStageReply(ch chan streamedStageCommandResult) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case s.stageReplyPool <- ch:
+	default:
+	}
+}
+
+func replyStreamedStage(cmd streamedStageCommand, res streamedStageCommandResult) {
+	if cmd.reply != nil {
+		cmd.reply <- res
+	}
+}
+
+func (s *Service) runStreamedStageWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			abortStreamedStage()
+			s.clearActiveABUpdateDiagHook()
+			return
+		case cmd, ok := <-s.stageWorkerCommands:
+			if !ok {
+				abortStreamedStage()
+				s.clearActiveABUpdateDiagHook()
+				return
+			}
+			res := streamedStageWorkerResult{kind: cmd.kind, xferID: cmd.xferID, generation: cmd.generation}
+			switch cmd.kind {
+			case streamedStageCommandBegin:
+				res.err = startStreamedStage(cmd.xferID, cmd.generation, cmd.size)
+			case streamedStageCommandWrite:
+				res.err = writeStreamedStage(cmd.xferID, cmd.generation, cmd.data)
+			case streamedStageCommandCommit:
+				res.staged, res.err = commitStreamedStage(s, cmd.xferID, cmd.generation)
+			case streamedStageCommandAbort, streamedStageCommandCancel:
+				abortStreamedStage()
+				clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+			default:
+				res.err = errors.New("bad_stage_command")
+			}
+			select {
+			case s.stageWorkerResults <- res:
+			case <-ctx.Done():
+				abortStreamedStage()
+				s.clearActiveABUpdateDiagHook()
+				return
+			}
 		}
-		activeServiceMu.Unlock()
 	}
 }
 
-func currentService() *Service {
-	activeServiceMu.Lock()
-	defer activeServiceMu.Unlock()
-	return activeService
+func (s *Service) handleStreamedStageCommand(cmd streamedStageCommand) {
+	if cmd.reply == nil {
+		return
+	}
+	if s.pendingStageCommand != nil {
+		switch cmd.kind {
+		case streamedStageCommandAbort, streamedStageCommandCancel:
+			s.cancelPendingStreamedStage(cmd)
+		default:
+			replyStreamedStage(cmd, streamedStageCommandResult{err: errors.New(ErrBusy)})
+		}
+		return
+	}
+	switch cmd.kind {
+	case streamedStageCommandBegin:
+		s.startStreamedStageBegin(cmd)
+	case streamedStageCommandWrite:
+		s.startStreamedStageWrite(cmd)
+	case streamedStageCommandCommit:
+		s.startStreamedStageCommit(cmd)
+	case streamedStageCommandAbort, streamedStageCommandCancel:
+		s.startStreamedStageAbort(cmd)
+	default:
+		replyStreamedStage(cmd, streamedStageCommandResult{err: errors.New("bad_stage_command")})
+	}
 }
 
-// BeginStreamedStage acquires the updater-owned staging lease opened by the
-// last successful prepare-update call. Fabric calls this from xfer_begin before
-// any sink mutates flash or buffers transfer state.
-func BeginStreamedStage(xferID string, size uint32) (uint64, error) {
-	beginAt := time.Now()
-	otadiag.SetActiveXfer(xferID)
-	otadiag.Event("[updater-stream]", "begin_entry", xferID, otadiag.KV("size", size))
-	s := currentService()
-	if s == nil {
-		otadiag.Event(
-			"[updater-stream]", "begin_error", xferID,
-			otadiag.KV("err", "updater_not_running"),
-			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
-		)
-		otadiag.StopUpdateWindow("updater_not_running")
-		return 0, errors.New("updater_not_running")
+func (s *Service) cancelPendingStreamedStage(cmd streamedStageCommand) {
+	if cmd.reason == "" {
+		cmd.reason = "abort"
 	}
-	gen, err := s.beginStreamedStageLease(xferID)
+	// The updater reactor owns logical cancellation even while a flash/verifier
+	// worker command is in progress. The worker cannot be interrupted inside a
+	// bounded operation, but its eventual result will be rejected by the lease
+	// checks because the lease is cancelled here first.
+	s.cancelStreamedStageLease(cmd.xferID, cmd.generation, cmd.reason)
+	clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+	s.queueStageWorkerAbort(cmd.xferID, cmd.generation, cmd.reason)
+	replyStreamedStage(cmd, streamedStageCommandResult{})
+}
+
+func (s *Service) startStreamedStageBegin(cmd streamedStageCommand) {
+	gen, err := s.beginStreamedStageLease(cmd.xferID)
 	if err != nil {
-		otadiag.Event(
-			"[updater-stream]", "lease_error", xferID,
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
-		)
-		return 0, err
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
 	}
-	otadiag.Event("[updater-stream]", "lease_ok", xferID, otadiag.KV("generation", gen))
-	installABUpdateDiagHook(xferID, gen)
-	startAt := time.Now()
-	otadiag.Event(
-		"[updater-stream]", "start_entry", xferID,
-		otadiag.KV("generation", gen),
-		otadiag.KV("size", size),
-	)
-	if err := startStreamedStage(xferID, gen, size); err != nil {
-		otadiag.Event(
-			"[updater-stream]", "start_error", xferID,
-			otadiag.KV("generation", gen),
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("dur_ms", int(time.Since(startAt)/time.Millisecond)),
-		)
-		clearABUpdateDiagHook()
-		s.cancelStreamedStageLease(xferID, gen, err.Error())
-		otadiag.Event(
-			"[updater-stream]", "begin_error", xferID,
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("generation", gen),
-			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
-		)
-		otadiag.StopUpdateWindow("start_streamed_stage_error")
-		return 0, err
-	}
-	otadiag.Event(
-		"[updater-stream]", "start_exit", xferID,
-		otadiag.KV("generation", gen),
-		otadiag.KV("dur_ms", int(time.Since(startAt)/time.Millisecond)),
-	)
-	markAt := time.Now()
-	otadiag.Event("[updater-stream]", "mark_receiving_entry", xferID, otadiag.KV("generation", gen))
-	if err := s.markStreamedStageReceiving(xferID, gen); err != nil {
-		otadiag.Event(
-			"[updater-stream]", "mark_receiving_error", xferID,
-			otadiag.KV("generation", gen),
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("dur_ms", int(time.Since(markAt)/time.Millisecond)),
-		)
-		abortStreamedStage()
-		clearABUpdateDiagHook()
-		s.cancelStreamedStageLease(xferID, gen, err.Error())
-		otadiag.Event(
-			"[updater-stream]", "begin_error", xferID,
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("generation", gen),
-			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
-		)
-		otadiag.StopUpdateWindow("mark_receiving_error")
-		return 0, err
-	}
-	otadiag.Event(
-		"[updater-stream]", "mark_receiving_exit", xferID,
-		otadiag.KV("generation", gen),
-		otadiag.KV("dur_ms", int(time.Since(markAt)/time.Millisecond)),
-	)
-	otadiag.Event(
-		"[updater-stream]", "begin_exit", xferID,
-		otadiag.KV("generation", gen),
-		otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
-	)
-	return gen, nil
+	installABUpdateDiagHook(cmd.xferID, gen)
+	cmd.generation = gen
+	s.pendingStageCommand = &cmd
+	s.sendStageWorkerCommand(streamedStageWorkerCommand{
+		kind:       streamedStageCommandBegin,
+		xferID:     cmd.xferID,
+		generation: gen,
+		size:       cmd.size,
+	})
 }
 
-func WriteStreamedStage(xferID string, generation uint64, data []byte) error {
-	s := currentService()
+func (s *Service) startStreamedStageWrite(cmd streamedStageCommand) {
+	if err := s.checkStreamedStageLease(cmd.xferID, cmd.generation, false); err != nil {
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
+	}
+	s.pendingStageCommand = &cmd
+	s.sendStageWorkerCommand(streamedStageWorkerCommand{
+		kind:       streamedStageCommandWrite,
+		xferID:     cmd.xferID,
+		generation: cmd.generation,
+		data:       cmd.data,
+	})
+}
+
+func (s *Service) startStreamedStageCommit(cmd streamedStageCommand) {
+	if err := s.checkStreamedStageLease(cmd.xferID, cmd.generation, false); err != nil {
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
+	}
+	s.pendingStageCommand = &cmd
+	s.sendStageWorkerCommand(streamedStageWorkerCommand{
+		kind:       streamedStageCommandCommit,
+		xferID:     cmd.xferID,
+		generation: cmd.generation,
+	})
+}
+
+func (s *Service) startStreamedStageAbort(cmd streamedStageCommand) {
+	if cmd.reason == "" {
+		cmd.reason = "abort"
+	}
+	// Mark the logical lease cancelled in the updater reactor first. The
+	// worker then performs the storage/verifier abort at its next safe point.
+	if cmd.kind == streamedStageCommandCancel {
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, cmd.reason)
+	} else {
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, cmd.reason)
+	}
+	clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+	s.pendingStageCommand = &cmd
+	s.sendStageWorkerCommand(streamedStageWorkerCommand{
+		kind:       cmd.kind,
+		xferID:     cmd.xferID,
+		generation: cmd.generation,
+		reason:     cmd.reason,
+	})
+}
+
+func (s *Service) sendStageWorkerCommand(cmd streamedStageWorkerCommand) {
+	select {
+	case s.stageWorkerCommands <- cmd:
+	default:
+		// The updater reactor admits only one pending command at a time, so the
+		// worker queue should not fill. If it does, fail and cancel the logical
+		// lease from the reactor rather than blocking it.
+		if s.pendingStageCommand != nil && s.pendingStageCommand.reply != nil {
+			pending := s.pendingStageCommand
+			s.pendingStageCommand = nil
+			if pending.generation != 0 {
+				s.cancelStreamedStageLease(pending.xferID, pending.generation, ErrBusy)
+				clearABUpdateDiagHookFor(pending.xferID, pending.generation)
+			}
+			replyStreamedStage(*pending, streamedStageCommandResult{err: errors.New(ErrBusy)})
+		}
+	}
+}
+
+func (s *Service) handleStreamedStageWorkerResult(res streamedStageWorkerResult) {
+	cmd := s.pendingStageCommand
+	if cmd == nil || cmd.xferID != res.xferID || cmd.generation != res.generation || cmd.kind != res.kind {
+		// Stale worker result from an already-cancelled generation. The updater
+		// reactor is authoritative, so ignore it.
+		return
+	}
+	s.pendingStageCommand = nil
+	switch res.kind {
+	case streamedStageCommandBegin:
+		s.finishStreamedStageBegin(*cmd, res)
+	case streamedStageCommandWrite:
+		s.finishStreamedStageWrite(*cmd, res)
+	case streamedStageCommandCommit:
+		s.finishStreamedStageCommit(*cmd, res)
+	case streamedStageCommandAbort, streamedStageCommandCancel:
+		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+		replyStreamedStage(*cmd, streamedStageCommandResult{})
+	default:
+		replyStreamedStage(*cmd, streamedStageCommandResult{err: errors.New("bad_stage_command")})
+	}
+}
+
+func (s *Service) finishStreamedStageBegin(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	if res.err != nil {
+		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, res.err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: res.err})
+		return
+	}
+	if err := s.markStreamedStageReceiving(cmd.xferID, cmd.generation); err != nil {
+		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, err.Error())
+		s.queueStageWorkerAbort(cmd.xferID, cmd.generation, err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
+	}
+	replyStreamedStage(cmd, streamedStageCommandResult{generation: cmd.generation})
+}
+
+func (s *Service) finishStreamedStageWrite(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	if res.err != nil {
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, res.err.Error())
+		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+		s.queueStageWorkerAbort(cmd.xferID, cmd.generation, res.err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: res.err})
+		return
+	}
+	if err := s.checkStreamedStageLease(cmd.xferID, cmd.generation, false); err != nil {
+		clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+		s.queueStageWorkerAbort(cmd.xferID, cmd.generation, err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
+	}
+	replyStreamedStage(cmd, streamedStageCommandResult{})
+}
+
+func (s *Service) finishStreamedStageCommit(cmd streamedStageCommand, res streamedStageWorkerResult) {
+	clearABUpdateDiagHookFor(cmd.xferID, cmd.generation)
+	if res.err != nil {
+		s.cancelStreamedStageLease(cmd.xferID, cmd.generation, res.err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: res.err})
+		return
+	}
+	if err := s.markStreamedStageCommitted(cmd.xferID, cmd.generation); err != nil {
+		s.queueStageWorkerAbort(cmd.xferID, cmd.generation, err.Error())
+		replyStreamedStage(cmd, streamedStageCommandResult{err: err})
+		return
+	}
+	s.setStreamedStageResult(res.staged)
+	replyStreamedStage(cmd, streamedStageCommandResult{written: res.staged.Length})
+}
+
+func (s *Service) queueStageWorkerAbort(xferID string, generation uint64, reason string) {
+	if reason == "" {
+		reason = "abort"
+	}
+	select {
+	case s.stageWorkerCommands <- streamedStageWorkerCommand{kind: streamedStageCommandAbort, xferID: xferID, generation: generation, reason: reason}:
+	default:
+	}
+}
+
+func (s *Service) setStreamedStageResult(staged streamedStage) {
+	s.mu.Lock()
+	s.streamStageResult = staged
+	s.streamStageResultOK = true
+	s.mu.Unlock()
+}
+
+func (s *Service) clearActiveABUpdateDiagHook() {
 	if s == nil {
-		return errors.New("updater_not_running")
+		return
 	}
-	if err := s.checkStreamedStageLease(xferID, generation, false); err != nil {
-		return err
+	s.mu.Lock()
+	xferID := s.streamXferID
+	generation := s.stageGeneration
+	s.mu.Unlock()
+	if xferID == "" || generation == 0 {
+		return
 	}
-	return writeStreamedStage(xferID, generation, data)
+	clearABUpdateDiagHookFor(xferID, generation)
 }
 
-func CommitStreamedStage(xferID string, generation uint64) (uint32, error) {
-	s := currentService()
-	if s == nil {
-		return 0, errors.New("updater_not_running")
+func (s *Service) consumeStreamedStageResult() (streamedStage, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.streamStageResultOK {
+		return streamedStage{}, false
 	}
-	if err := s.checkStreamedStageLease(xferID, generation, false); err != nil {
-		return 0, err
-	}
-	staged, err := commitStreamedStage(xferID, generation)
-	clearABUpdateDiagHook()
-	if err != nil {
-		s.cancelStreamedStageLease(xferID, generation, err.Error())
-		return 0, err
-	}
-	if err := s.markStreamedStageCommitted(xferID, generation); err != nil {
-		abortStreamedStage()
-		return 0, err
-	}
-	return staged.Length, nil
+	out := s.streamStageResult
+	s.streamStageResult = streamedStage{}
+	s.streamStageResultOK = false
+	return out, true
 }
 
-func CommitBufferedStage(xferID string, generation uint64) error {
-	s := currentService()
-	if s == nil {
-		return errors.New("updater_not_running")
-	}
-	if err := s.markStreamedStageCommitted(xferID, generation); err != nil {
-		return err
-	}
-	clearABUpdateDiagHook()
-	return nil
-}
-
-func AbortStreamedStage(xferID string, generation uint64, reason string) {
-	abortStreamedStage()
-	clearABUpdateDiagHook()
-	if s := currentService(); s != nil {
-		s.cancelStreamedStageLease(xferID, generation, reason)
-	}
-}
-
-func CancelStreamedStage(xferID string, generation uint64, reason string) {
-	AbortStreamedStage(xferID, generation, reason)
+func (s *Service) discardStreamedStageResultLocked() {
+	s.streamStageResult = streamedStage{}
+	s.streamStageResultOK = false
 }
 
 func (s *Service) openStageGenerationLocked() uint64 {
@@ -188,7 +459,7 @@ func (s *Service) openStageGenerationLocked() uint64 {
 	s.streamXferID = ""
 	s.streamCancelled = false
 	s.streamCommitted = false
-	discardStreamedStageResult()
+	s.discardStreamedStageResultLocked()
 	return s.stageGeneration
 }
 
@@ -214,10 +485,9 @@ func (s *Service) beginStreamedStageLease(xferID string) (uint64, error) {
 	s.streamXferID = xferID
 	s.streamCancelled = false
 	s.streamCommitted = false
-	snap := s.diagSnapshotLocked()
+	s.discardStreamedStageResultLocked()
 	gen := s.stageGeneration
 	s.mu.Unlock()
-	setDiagSnapshot(snap)
 	return gen, nil
 }
 
@@ -289,6 +559,7 @@ func (s *Service) cancelStreamedStageLease(xferID string, generation uint64, rea
 		s.streamXferID = ""
 		s.stagedImageID = ""
 		s.pendingVersion = ""
+		s.discardStreamedStageResultLocked()
 		if s.state == StateReady || s.state == StateReceiving || s.state == StateStaged {
 			s.state = StateFailed
 		}
@@ -296,9 +567,7 @@ func (s *Service) cancelStreamedStageLease(xferID string, generation uint64, rea
 			s.lastError = reason
 		}
 	}
-	snap := s.diagSnapshotLocked()
 	s.mu.Unlock()
-	setDiagSnapshot(snap)
 	if matches {
 		_ = s.metadataWrite.ClearStagedDescriptor()
 		s.PublishCriticalFacts()

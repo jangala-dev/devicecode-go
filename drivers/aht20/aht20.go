@@ -181,6 +181,15 @@ func (d *Device) Read() error {
 		return err
 	}
 	deadline := time.Now().Add(d.cfg.CollectTimeout)
+	// Avoid an immediate not-ready I2C read after triggering a conversion.
+	// The AHT20 nominal conversion time is much longer than the bus transaction,
+	// so waiting for the advertised hint materially reduces polling traffic while
+	// still retaining the bounded timeout below.
+	if hint := d.TriggerHint(); hint > 0 {
+		if now := time.Now(); now.Add(hint).Before(deadline) {
+			time.Sleep(hint)
+		}
+	}
 	for {
 		var s Sample
 		err := d.Collect(&s)

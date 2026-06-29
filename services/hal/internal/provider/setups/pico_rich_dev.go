@@ -13,8 +13,8 @@ import (
 
 var SelectedPlan = ResourcePlan{
 	I2C: []I2CPlan{
-		{ID: "i2c0", SDA: 12, SCL: 13, Hz: 400_000},
-		{ID: "i2c1", SDA: 18, SCL: 19, Hz: 400_000},
+		{ID: "i2c0", SDA: 12, SCL: 13, Hz: 100_000},
+		{ID: "i2c1", SDA: 18, SCL: 19, Hz: 100_000},
 	},
 	UART: []UARTPlan{
 		// RP2040 default pins for Pico
@@ -22,6 +22,15 @@ var SelectedPlan = ResourcePlan{
 		{ID: "uart1", TX: 4, RX: 5, Baud: 115_200},
 	},
 }
+
+// Keep raw serial rings at the default diagnostic size for this test build.
+// This preserves serial_raw as the single UART abstraction while allowing the
+// line-reader/copy optimisations to be tested without extra RX buffering.
+const (
+	rawSerialSessionSize  = 512
+	fabricRawSerialRXSize = 512
+	fabricRawSerialTXSize = 512
+)
 
 var SelectedSetup = types.HALConfig{
 	Devices: []types.HALDevice{
@@ -42,8 +51,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart0",
 			Baud:   115_200,
-			RXSize: 32,
-			TXSize: 2048,
+			RXSize: fabricRawSerialRXSize,
+			TXSize: fabricRawSerialTXSize,
 		}},
 
 		// Raw serial device bound to uart1 (public address hal/cap/io/serial/uart1/…)
@@ -52,8 +61,8 @@ var SelectedSetup = types.HALConfig{
 			Domain: "io",
 			Name:   "uart1",
 			Baud:   115_200,
-			RXSize: 32,
-			TXSize: 512,
+			RXSize: rawSerialSessionSize,
+			TXSize: rawSerialSessionSize,
 		}},
 
 		{ID: "charger0", Type: "ltc4015", Params: ltc4015dev.Params{
@@ -63,6 +72,9 @@ var SelectedSetup = types.HALConfig{
 			NTCBiasOhm: 10000, R25Ohm: 10000, BetaK: 3435,
 			QCountPrescale: 0,
 			DomainBattery:  "power", DomainCharger: "power", Name: "internal",
+			BootDelayMs:              5_000,
+			BootGapMs:                100,
+			PostConfigureReadDelayMs: 250,
 
 			Boot: []types.BootAction{
 				// {Verb: "disable"},

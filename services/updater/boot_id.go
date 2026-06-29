@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"devicecode-go/utilities/diag"
 	"encoding/hex"
 	"runtime"
 	"sync/atomic"
@@ -61,7 +62,7 @@ func generate() string {
 	// all-zero. This is best-effort per-boot jitter, not contract-grade entropy.
 	// The log line below is the failure-mode signal for tests and diagnostics.
 	tick := atomic.AddUint64(&fallbackTick, 1)
-	println("[updater] boot_id fallback engaged tick=", itoaU64(tick))
+	diag.Println("[updater] boot_id fallback engaged tick=", itoaU64(tick))
 
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)

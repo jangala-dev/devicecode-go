@@ -153,6 +153,31 @@ func TestCodecAllTypes(t *testing.T) {
 	}
 }
 
+func TestFastStringDecoderAcceptsEscapedSlashProtocol(t *testing.T) {
+	line := []byte(`{"node":"bigbox-cm5","type":"hello","identity":{"id":"bigbox-cm5","role":"controller"},"proto":"fabric-jsonl\/1","sid":"s1"}`)
+	if got := protoType(line); got != msgHello {
+		t.Fatalf("protoType = %q", got)
+	}
+	msg, ok := decodeHelloFast(line)
+	if !ok {
+		t.Fatalf("decodeHelloFast rejected escaped slash proto")
+	}
+	if msg.Proto != protocolName || msg.SID != "s1" || msg.Node != "bigbox-cm5" {
+		t.Fatalf("bad hello: %+v", msg)
+	}
+}
+
+func TestFastStringArrayDecoderAcceptsEscapedValues(t *testing.T) {
+	line := []byte(`{"type":"call","id":"c1","topic":["cap","update-manager","main","rpc","commit-job\/test"],"payload":{}}`)
+	msg, ok := decodeCallFast(line)
+	if !ok {
+		t.Fatalf("decodeCallFast rejected escaped topic")
+	}
+	if len(msg.Topic) != 5 || msg.Topic[4] != "commit-job/test" {
+		t.Fatalf("topic = %#v", msg.Topic)
+	}
+}
+
 func TestWireTypeBadInput(t *testing.T) {
 	for _, b := range [][]byte{[]byte("not json"), []byte(`{"no_type":true}`), nil} {
 		if got := protoType(b); got != "" {
@@ -229,7 +254,7 @@ func TestOversizeLineRecovery(t *testing.T) {
 }
 
 func TestReleaseTransferChunkFitsLineLimit(t *testing.T) {
-	raw := bytes.Repeat([]byte{'x'}, int(DefaultLinkConfig().ChunkSize))
+	raw := bytes.Repeat([]byte{'x'}, int(DefaultLinkConfig().MaxAcceptedChunkSize))
 	line := marshal(protoXferChunk{
 		Type:        msgXferChunk,
 		XferID:      "xfer-line-limit",
@@ -684,7 +709,7 @@ func TestReadyHeldUntilExportHoldoff(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
 	bringUp(t, cm5)
 	go func() {
-		for i := 0; i < len(criticalExportTopics); i++ {
+		for i := 0; i < 3; i++ {
 			_, _ = cm5.ReadLine()
 		}
 	}()
@@ -920,11 +945,45 @@ func TestWriterControlPreemptsRPCAndBulk(t *testing.T) {
 	}
 }
 
-func TestInboundCallBusyAtCapacity(t *testing.T) {
-	// rpc_bridge.lua's spawn_local_call_helper rejects with err="busy"
-	// when inbound_helpers >= max_inbound_helpers, before the route check.
-	// With MaxInboundHelpers=1, the second concurrent inbound call must
-	// reply busy without going through routing.
+func TestWriterControlFastPathWhenIdle(t *testing.T) {
+	tr := &captureTransport{}
+	s := session{tr: tr, cfg: DefaultLinkConfig()}
+
+	if !s.sendControl([]byte(`{"type":"ping"}`)) {
+		t.Fatal("sendControl returned false")
+	}
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes = %d, want 1", len(tr.writes))
+	}
+	if string(tr.writes[0]) != `{"type":"ping"}` {
+		t.Fatalf("write = %q, want ping", tr.writes[0])
+	}
+	if s.txControl.len() != 0 || s.txRPC.len() != 0 || s.txBulk.len() != 0 {
+		t.Fatalf("writer queues not empty after fast path: control=%d rpc=%d bulk=%d",
+			s.txControl.len(), s.txRPC.len(), s.txBulk.len())
+	}
+}
+
+func TestWriterControlUsesQueueWhenBacklogExists(t *testing.T) {
+	tr := &captureTransport{}
+	s := session{tr: tr, cfg: DefaultLinkConfig()}
+	s.txRPC.push([]byte(`{"type":"pub","i":0}`))
+
+	if !s.sendControl([]byte(`{"type":"pong"}`)) {
+		t.Fatal("sendControl returned false")
+	}
+	if len(tr.writes) != 2 {
+		t.Fatalf("writes = %d, want 2", len(tr.writes))
+	}
+	want := []string{`{"type":"pong"}`, `{"type":"pub","i":0}`}
+	for i, w := range want {
+		if string(tr.writes[i]) != w {
+			t.Fatalf("write[%d] = %q, want %q", i, tr.writes[i], w)
+		}
+	}
+}
+
+func TestInboundCallNoRouteUsesEndpointPlane(t *testing.T) {
 	prev := importCallRules
 	importCallRules = append([]importRule{}, prev...)
 	importCallRules = append(importCallRules, importRule{
@@ -940,30 +999,13 @@ func TestInboundCallBusyAtCapacity(t *testing.T) {
 	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", LinkConfig{MaxInboundHelpers: 1})
 	bringUp(t, cm5)
 
-	// First call holds the only helper slot. The bus has no handler, so
-	// the call sits as a pending request until timeout.
-	sendMsg(t, cm5, protoCall{
-		Type:      msgCall,
-		ID:        "c1",
-		Topic:     []string{"rpc", "test", "noop"},
-		Payload:   json.RawMessage(`{}`),
-		TimeoutMs: 5000,
-	})
-
-	// Second call arrives while the helper is full → busy reply.
-	sendMsg(t, cm5, protoCall{
-		Type:    msgCall,
-		ID:      "c2",
-		Topic:   []string{"rpc", "test", "noop"},
-		Payload: json.RawMessage(`{}`),
-	})
-
+	sendMsg(t, cm5, protoCall{Type: msgCall, ID: "c1", Topic: []string{"rpc", "test", "noop"}, Payload: json.RawMessage(`{}`)})
 	reply := readMsg[protoReply](t, cm5)
-	if reply.Corr != "c2" {
-		t.Fatalf("first reply corr = %q, want c2", reply.Corr)
+	if reply.Corr != "c1" {
+		t.Fatalf("reply corr = %q, want c1", reply.Corr)
 	}
-	if reply.OK || reply.Err != "busy" {
-		t.Fatalf("expected busy reply for c2, got %+v", reply)
+	if reply.OK || reply.Err != reasonNoRoute {
+		t.Fatalf("expected no_route reply, got %+v", reply)
 	}
 }
 
@@ -1044,7 +1086,7 @@ func TestLinkStatePublishedOnHandshake(t *testing.T) {
 
 	ack := bringUp(t, cm5)
 	go func() {
-		for i := 0; i < len(criticalExportTopics); i++ {
+		for i := 0; i < 3; i++ {
 			_, _ = cm5.ReadLine()
 		}
 	}()
@@ -1054,7 +1096,7 @@ func TestLinkStatePublishedOnHandshake(t *testing.T) {
 	for {
 		select {
 		case msg := <-sub.Channel():
-			if msg == nil {
+			if false {
 				t.Fatal("nil link-state message")
 			}
 			payload, ok := msg.Payload.(linkStatePayload)
@@ -1149,7 +1191,6 @@ func TestExportTopic(t *testing.T) {
 		{bus.T("state", "self", "software"), []string{"state", "self", "software"}},
 		{bus.T("state", "self", "power", "battery"), []string{"state", "self", "power", "battery"}},
 		{bus.T("event", "self", "power", "charger", "alert"), []string{"event", "self", "power", "charger", "alert"}},
-		{bus.T("hal", "cap", "env", "temperature", "core", "value"), nil}, // legacy gone
 		{bus.T("hal", "state"), nil}, // legacy gone
 		{bus.T("other", "topic"), nil},
 	} {
@@ -1164,17 +1205,14 @@ func TestExportTopic(t *testing.T) {
 	}
 }
 
-func TestExportCallTopic(t *testing.T) {
-	// exportCallRules is empty; the MCU does not originate outbound RPC calls.
-	if got := exportCallTopic(bus.T("fabric", "out", "rpc", "hal", "dump")); got != nil {
-		t.Errorf("exportCallTopic(legacy dump path) = %v, want nil", got)
+func TestRemoteClientIsExplicitlyStubbed(t *testing.T) {
+	client := NewRemoteClient(nil)
+	reply, err := client.Call(context.Background(), CM5TimeSnapshotWireTopic, map[string]any{"schema": "time-sync/request/1"})
+	if reply != nil {
+		t.Fatalf("reply = %#v, want nil", reply)
 	}
-}
-
-func TestExportCallPatterns(t *testing.T) {
-	patterns := exportCallPatterns()
-	if len(patterns) != 0 {
-		t.Fatalf("len(exportCallPatterns()) = %d, want 0", len(patterns))
+	if err != ErrRemoteCallsStubbed {
+		t.Fatalf("err = %v, want %v", err, ErrRemoteCallsStubbed)
 	}
 }
 
@@ -1199,8 +1237,8 @@ func TestDrainExportsReturnsWhenSubscriptionClosed(t *testing.T) {
 	conn.Unsubscribe(sub)
 
 	s := session{
-		link:       linkUp,
-		exportSubs: []*bus.Subscription{sub},
+		link:            linkUp,
+		exportEventSubs: []*bus.Subscription{sub},
 	}
 
 	done := make(chan struct{})
@@ -1220,20 +1258,20 @@ func TestDrainExportsWaitsForStartupHoldoff(t *testing.T) {
 	b := newBus()
 	conn := b.NewConnection("fabric")
 	pub := b.NewConnection("hal")
-	sub := conn.Subscribe(bus.T("hal", "cap", "env", "#"))
+	sub := conn.Subscribe(bus.T("event", "self", "test", "#"))
 	defer conn.Unsubscribe(sub)
 
 	msg := pub.NewMessage(
-		bus.T("hal", "cap", "env", "temperature", "core", "value"),
+		bus.T("event", "self", "test", "value"),
 		map[string]int{"deci_c": 412},
 		true,
 	)
 
 	s := session{
-		link:           linkUp,
-		exportsEnabled: true,
-		exportSubs:     []*bus.Subscription{sub},
-		exportReadyAt:  time.Now().Add(time.Second),
+		link:            linkUp,
+		exportsEnabled:  true,
+		exportEventSubs: []*bus.Subscription{sub},
+		exportReadyAt:   time.Now().Add(time.Second),
 	}
 
 	pub.Publish(msg)
@@ -1251,7 +1289,7 @@ func TestDrainExportsWaitsForStartupHoldoff(t *testing.T) {
 	}
 }
 
-func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
+func TestDrainExportsContinuesDuringIncomingTransfer(t *testing.T) {
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1274,19 +1312,12 @@ func TestDrainExportsPausesDuringIncomingTransfer(t *testing.T) {
 	))
 	s.drainExports()
 
-	if len(tr.writes) != 0 {
-		t.Fatalf("writes during transfer = %d, want 0", len(tr.writes))
-	}
-
-	s.incomingTransfer = nil
-	s.drainExports()
-
 	if len(tr.writes) != 1 {
-		t.Fatalf("writes after transfer = %d, want 1", len(tr.writes))
+		t.Fatalf("writes during transfer = %d, want 1", len(tr.writes))
 	}
 }
 
-func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
+func TestDrainExportsContinuesAfterPrepareCall(t *testing.T) {
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1303,7 +1334,6 @@ func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
 
 	s.setupExports()
 	defer s.teardownExports()
-	defer s.teardownInbound()
 
 	s.onCall(&protoCall{
 		Type:  msgCall,
@@ -1332,32 +1362,22 @@ func TestDrainExportsPausesAfterPrepareCall(t *testing.T) {
 	))
 	s.drainExports()
 
-	if len(tr.writes) != 0 {
-		t.Fatalf("writes during prepare quiet = %d, want 0", len(tr.writes))
-	}
-
-	s.transferQuietUntil = time.Time{}
-	s.transferQuietReason = ""
-	s.drainExports()
-
-	if len(tr.writes) != 1 {
-		t.Fatalf("writes after prepare quiet = %d, want 1", len(tr.writes))
+	if len(tr.writes) != 2 {
+		t.Fatalf("writes after prepare call = %d, want reply plus retained export", len(tr.writes))
 	}
 }
 
-func TestDrainExportsAllowsOnlyCriticalFactsDuringPostTransferQuiet(t *testing.T) {
+func TestDrainExportsDoesNotUsePostTransferQuietWindow(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
 	tr := &captureTransport{}
 	s := session{
-		conn:                fabricConn,
-		tr:                  tr,
-		link:                linkUp,
-		exportsEnabled:      true,
-		exportReadyAt:       time.Now().Add(-time.Second),
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "xfer_done",
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
 	}
 
 	s.setupExports()
@@ -1384,27 +1404,34 @@ func TestDrainExportsAllowsOnlyCriticalFactsDuringPostTransferQuiet(t *testing.T
 		true,
 	))
 
-	for i := 0; i < len(criticalExportTopics)+4; i++ {
+	for i := 0; i < 4; i++ {
 		s.drainExports()
 	}
-	if len(tr.writes) != len(criticalExportTopics) {
-		t.Fatalf("writes during post-transfer quiet = %d, want %d critical facts",
-			len(tr.writes), len(criticalExportTopics))
+	if len(tr.writes) != 4 {
+		t.Fatalf("writes after transfer = %d, want 4 retained facts", len(tr.writes))
 	}
-	want := [][]string{
-		{"state", "self", "software"},
-		{"state", "self", "updater"},
-		{"state", "self", "health"},
+	want := map[string]bool{
+		"state/self/runtime/memory": false,
+		"state/self/software":       false,
+		"state/self/updater":        false,
+		"state/self/health":         false,
 	}
-	for i, topic := range want {
-		pub := decodePubWrite(t, tr.writes[i])
-		if !slicesEqual(pub.Topic, topic) {
-			t.Fatalf("write %d topic = %v, want %v", i, pub.Topic, topic)
+	for _, write := range tr.writes {
+		pub := decodePubWrite(t, write)
+		key := wireTopicString(pub.Topic)
+		if _, ok := want[key]; !ok {
+			t.Fatalf("unexpected topic after transfer: %s", key)
+		}
+		want[key] = true
+	}
+	for key, seen := range want {
+		if !seen {
+			t.Fatalf("missing retained topic after transfer: %s", key)
 		}
 	}
 }
 
-func TestDrainExportsPrioritizesCriticalRetainedFacts(t *testing.T) {
+func TestDrainExportsReplaysRetainedFactsUniformly(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1441,48 +1468,34 @@ func TestDrainExportsPrioritizesCriticalRetainedFacts(t *testing.T) {
 	s.setupExports()
 	defer s.teardownExports()
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		s.drainExports()
 	}
-	if len(tr.writes) != 3 {
-		t.Fatalf("writes after critical drains = %d, want 3", len(tr.writes))
+	if len(tr.writes) != 4 {
+		t.Fatalf("writes = %d, want 4 retained facts", len(tr.writes))
 	}
 
-	want := [][]string{
-		{"state", "self", "software"},
-		{"state", "self", "updater"},
-		{"state", "self", "health"},
-	}
-	for i, topic := range want {
-		pub := decodePubWrite(t, tr.writes[i])
-		if !slicesEqual(pub.Topic, topic) {
-			t.Fatalf("write %d topic = %v, want %v", i, pub.Topic, topic)
-		}
-		if !pub.Retain {
-			t.Fatalf("write %d retain = false, want true", i)
-		}
-	}
-
-	for i := 0; i < 8; i++ {
-		s.drainExports()
-	}
 	counts := map[string]int{}
 	for _, write := range tr.writes {
 		pub := decodePubWrite(t, write)
+		if !pub.Retain {
+			t.Fatalf("retain = false for topic %v, want true", pub.Topic)
+		}
 		counts[wireTopicString(pub.Topic)]++
 	}
-	for _, topic := range want {
-		key := wireTopicString(topic)
+	for _, key := range []string{
+		"state/self/runtime/memory",
+		"state/self/software",
+		"state/self/updater",
+		"state/self/health",
+	} {
 		if counts[key] != 1 {
-			t.Fatalf("critical topic %s sent %d times, want exactly once", key, counts[key])
+			t.Fatalf("topic %s sent %d times, want exactly once; counts=%v", key, counts[key], counts)
 		}
-	}
-	if counts["state/self/runtime/memory"] != 1 {
-		t.Fatalf("telemetry topic sent %d times, want once", counts["state/self/runtime/memory"])
 	}
 }
 
-func TestDrainCriticalExportsCoalescesLatestRetainedFact(t *testing.T) {
+func TestDrainExportsCoalescesLatestRetainedFact(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1527,7 +1540,135 @@ func TestDrainCriticalExportsCoalescesLatestRetainedFact(t *testing.T) {
 	}
 }
 
-func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
+func TestDrainExportsCoalescesQueuedRetainedTelemetry(t *testing.T) {
+	b := bus.NewBus(16, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"seq": 1},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"seq": 2},
+		true,
+	))
+
+	watch := fabricConn.WatchRetained(bus.T("state", "self", "runtime", "#"), bus.RetainedWatchOptions{Replay: true, QueueLen: 8})
+	defer fabricConn.UnwatchRetained(watch)
+	s := session{
+		conn:                  fabricConn,
+		tr:                    tr,
+		link:                  linkUp,
+		exportsEnabled:        true,
+		exportReadyAt:         time.Now().Add(-time.Second),
+		exportRetainedWatches: []*bus.RetainedWatch{watch},
+	}
+
+	s.drainExports()
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes = %d, want one coalesced retained export", len(tr.writes))
+	}
+	pub := decodePubWrite(t, tr.writes[0])
+	if !slicesEqual(pub.Topic, []string{"state", "self", "runtime", "memory"}) {
+		t.Fatalf("topic = %v, want state/self/runtime/memory", pub.Topic)
+	}
+	var payload map[string]int
+	if err := json.Unmarshal(pub.Payload, &payload); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if payload["seq"] != 2 {
+		t.Fatalf("payload seq = %d, want latest seq 2", payload["seq"])
+	}
+}
+
+func busTopicFromStrings(parts []string) bus.Topic {
+	tokens := make([]bus.Token, len(parts))
+	for i, part := range parts {
+		tokens[i] = part
+	}
+	return bus.T(tokens...)
+}
+
+func TestWildcardRetainedExportReplaySurvivesSmallBusQueue(t *testing.T) {
+	b := bus.NewBus(3, "+", "#")
+	fabricConn := b.NewConnection("fabric")
+	pubConn := b.NewConnection("publisher")
+	tr := &captureTransport{}
+
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "software"),
+		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "updater"),
+		map[string]string{"state": "running"},
+		true,
+	))
+	pubConn.Publish(pubConn.NewMessage(
+		bus.T("state", "self", "health"),
+		map[string]string{"state": "ok"},
+		true,
+	))
+
+	telemetryTopics := [][]string{
+		{"state", "self", "environment", "humidity"},
+		{"state", "self", "environment", "temperature"},
+		{"state", "self", "runtime", "memory"},
+		{"state", "self", "power", "battery"},
+		{"state", "self", "power", "charger"},
+		{"state", "self", "power", "charger", "config"},
+	}
+	for i, topic := range telemetryTopics {
+		pubConn.Publish(pubConn.NewMessage(
+			busTopicFromStrings(topic),
+			map[string]int{"seq": i + 1},
+			true,
+		))
+	}
+
+	s := session{
+		conn:           fabricConn,
+		tr:             tr,
+		link:           linkUp,
+		exportsEnabled: true,
+		exportReadyAt:  time.Now().Add(-time.Second),
+	}
+	s.setupExports()
+	defer s.teardownExports()
+
+	for i := 0; i < 24; i++ {
+		s.drainExports()
+	}
+
+	counts := map[string]int{}
+	for _, write := range tr.writes {
+		pub := decodePubWrite(t, write)
+		counts[wireTopicString(pub.Topic)]++
+	}
+	for _, topic := range [][]string{
+		{"state", "self", "software"},
+		{"state", "self", "updater"},
+		{"state", "self", "health"},
+	} {
+		key := wireTopicString(topic)
+		if counts[key] != 1 {
+			t.Fatalf("retained topic %s sent %d times, want exactly once", key, counts[key])
+		}
+	}
+	for _, topic := range telemetryTopics {
+		key := wireTopicString(topic)
+		if counts[key] != 1 {
+			t.Fatalf("telemetry retained topic %s sent %d times, want exactly once; counts=%v", key, counts[key], counts)
+		}
+	}
+}
+
+func TestReadyDoesNotWaitForSpecificRetainedFacts(t *testing.T) {
 	b := bus.NewBus(16, "+", "#")
 	fabricConn := b.NewConnection("fabric")
 	pubConn := b.NewConnection("publisher")
@@ -1537,18 +1678,8 @@ func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
 	tr := &captureTransport{}
 
 	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "software"),
-		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "updater"),
-		map[string]string{"state": "idle"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "health"),
-		map[string]string{"state": "ok"},
+		bus.T("state", "self", "runtime", "memory"),
+		map[string]int{"alloc_bytes": 241376},
 		true,
 	))
 
@@ -1567,28 +1698,8 @@ func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
 	defer s.teardownExports()
 
 	s.tickReady(time.Now())
-	if s.rpcReady {
-		t.Fatal("rpcReady raised before critical replay drain")
-	}
-	if _, ok := readLinkState(linkSub); ok {
-		t.Fatal("link state published before critical replay drain")
-	}
-
-	for i := 0; i < len(criticalExportTopics)-1; i++ {
-		s.drainExports()
-		s.tickReady(time.Now())
-		if s.rpcReady {
-			t.Fatalf("rpcReady raised after %d critical writes, want still false", i+1)
-		}
-		if _, ok := readLinkState(linkSub); ok {
-			t.Fatalf("link state published after %d critical writes, want none", i+1)
-		}
-	}
-
-	s.drainExports()
-	s.tickReady(time.Now())
 	if !s.rpcReady {
-		t.Fatal("rpcReady did not raise after critical replay drain")
+		t.Fatal("rpcReady did not raise after export holdoff")
 	}
 	state, ok := readLinkState(linkSub)
 	if !ok {
@@ -1597,192 +1708,14 @@ func TestReadyWaitsForQueuedCriticalReplayAdmission(t *testing.T) {
 	if !state.Ready || state.Status != statusReady {
 		t.Fatalf("link state = %+v, want ready", state)
 	}
-	if len(tr.writes) != len(criticalExportTopics) {
-		t.Fatalf("critical writes = %d, want %d", len(tr.writes), len(criticalExportTopics))
-	}
-}
-
-func TestReadyBlocksWhenCriticalReplayFactsAreAbsentAndSuppressesTelemetry(t *testing.T) {
-	b := bus.NewBus(16, "+", "#")
-	fabricConn := b.NewConnection("fabric")
-	pubConn := b.NewConnection("publisher")
-	tr := &captureTransport{}
-
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "runtime", "memory"),
-		map[string]int{"alloc_bytes": 241376},
-		true,
-	))
-
-	s := session{
-		linkID:         defaultLinkID,
-		peerID:         "mcu",
-		localSID:       "mcu-sid",
-		peerSID:        "cm5-sid",
-		conn:           fabricConn,
-		tr:             tr,
-		link:           linkUp,
-		exportsEnabled: true,
-		exportReadyAt:  time.Now().Add(-time.Second),
-	}
-	s.setupExports()
-	defer s.teardownExports()
-
-	s.tickReady(time.Now())
-	if s.rpcReady {
-		t.Fatal("rpcReady raised before critical replay drain")
-	}
-	for i := 0; i < 3; i++ {
-		s.drainExports()
-		s.tickReady(time.Now())
-	}
-	if s.rpcReady {
-		t.Fatal("rpcReady raised after absent critical replay facts")
-	}
-	if len(tr.writes) != 0 {
-		t.Fatalf("writes = %d, want no telemetry while critical replay is absent", len(tr.writes))
-	}
-}
-
-func TestLateCriticalExportsDrainBeforeWildcardTelemetryAndReady(t *testing.T) {
-	b := bus.NewBus(16, "+", "#")
-	fabricConn := b.NewConnection("fabric")
-	pubConn := b.NewConnection("publisher")
-	tr := &captureTransport{}
-
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "runtime", "memory"),
-		map[string]int{"alloc_bytes": 241376},
-		true,
-	))
-
-	s := session{
-		linkID:         defaultLinkID,
-		peerID:         "mcu",
-		localSID:       "mcu-sid",
-		peerSID:        "cm5-sid",
-		conn:           fabricConn,
-		tr:             tr,
-		link:           linkUp,
-		exportsEnabled: true,
-		exportReadyAt:  time.Now().Add(-time.Second),
-	}
-	s.setupExports()
-	defer s.teardownExports()
 
 	s.drainExports()
-	s.tickReady(time.Now())
-	if s.rpcReady {
-		t.Fatal("rpcReady raised before initial critical replay facts")
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes = %d, want one retained telemetry fact", len(tr.writes))
 	}
-	if len(tr.writes) != 0 {
-		t.Fatalf("initial writes = %d, want no telemetry before critical replay", len(tr.writes))
-	}
-	start := len(tr.writes)
-
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "runtime", "cpu"),
-		map[string]int{"load_pct": 42},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "health"),
-		map[string]string{"state": "ok"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "updater"),
-		map[string]string{"state": "running"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "software"),
-		map[string]string{"image_id": "mcu-new", "boot_id": "boot-new"},
-		true,
-	))
-
-	wantCritical := [][]string{
-		{"state", "self", "software"},
-		{"state", "self", "updater"},
-		{"state", "self", "health"},
-	}
-	for i, topic := range wantCritical {
-		s.drainExports()
-		pub := decodePubWrite(t, tr.writes[start+i])
-		if !slicesEqual(pub.Topic, topic) {
-			t.Fatalf("post-ready write %d topic = %v, want %v", i, pub.Topic, topic)
-		}
-		s.tickReady(time.Now())
-		if i < len(wantCritical)-1 && s.rpcReady {
-			t.Fatalf("rpcReady raised after %d critical writes, want still false", i+1)
-		}
-	}
-	if !s.rpcReady {
-		t.Fatal("rpcReady did not raise after all critical facts were exported")
-	}
-
-	for i := 0; i < 8; i++ {
-		s.drainExports()
-	}
-	counts := map[string]int{}
-	for _, write := range tr.writes[start:] {
-		pub := decodePubWrite(t, write)
-		counts[wireTopicString(pub.Topic)]++
-	}
-	for _, topic := range wantCritical {
-		key := wireTopicString(topic)
-		if counts[key] != 1 {
-			t.Fatalf("post-ready critical topic %s sent %d times, want exactly once", key, counts[key])
-		}
-	}
-	if counts["state/self/runtime/cpu"] != 1 {
-		t.Fatalf("post-ready telemetry sent %d times, want once", counts["state/self/runtime/cpu"])
-	}
-
-	start = len(tr.writes)
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "runtime", "temperature"),
-		map[string]int{"deci_c": 421},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "health"),
-		map[string]string{"state": "ok", "reason": "ready-edge"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "updater"),
-		map[string]string{"state": "idle"},
-		true,
-	))
-	pubConn.Publish(pubConn.NewMessage(
-		bus.T("state", "self", "software"),
-		map[string]string{"image_id": "mcu-newer", "boot_id": "boot-newer"},
-		true,
-	))
-	for i, topic := range wantCritical {
-		s.drainExports()
-		pub := decodePubWrite(t, tr.writes[start+i])
-		if !slicesEqual(pub.Topic, topic) {
-			t.Fatalf("post-ready write %d topic = %v, want %v", i, pub.Topic, topic)
-		}
-	}
-	for i := 0; i < 8; i++ {
-		s.drainExports()
-	}
-	counts = map[string]int{}
-	for _, write := range tr.writes[start:] {
-		pub := decodePubWrite(t, write)
-		counts[wireTopicString(pub.Topic)]++
-	}
-	for _, topic := range wantCritical {
-		key := wireTopicString(topic)
-		if counts[key] != 1 {
-			t.Fatalf("post-ready critical topic %s sent %d times, want exactly once", key, counts[key])
-		}
-	}
-	if counts["state/self/runtime/temperature"] != 1 {
-		t.Fatalf("post-ready telemetry sent %d times, want once", counts["state/self/runtime/temperature"])
+	pub := decodePubWrite(t, tr.writes[0])
+	if !slicesEqual(pub.Topic, []string{"state", "self", "runtime", "memory"}) {
+		t.Fatalf("topic = %v, want state/self/runtime/memory", pub.Topic)
 	}
 }
 
@@ -1801,7 +1734,7 @@ func decodePubWrite(t *testing.T, line []byte) protoPub {
 func readLinkState(sub *bus.Subscription) (linkStatePayload, bool) {
 	select {
 	case msg, ok := <-sub.Channel():
-		if !ok || msg == nil {
+		if !ok {
 			return linkStatePayload{}, false
 		}
 		state, ok := msg.Payload.(linkStatePayload)
@@ -1837,21 +1770,19 @@ func TestPongAllowedDuringIncomingTransfer(t *testing.T) {
 	}
 }
 
-func TestPongAllowedDuringPrepareQuietForEstablishedPeer(t *testing.T) {
+func TestPongAllowedForEstablishedPeerWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "cm5-sid",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "cm5-sid"})
 
 	if len(tr.writes) != 1 {
-		t.Fatalf("pong writes during prepare quiet = %d, want 1", len(tr.writes))
+		t.Fatalf("pong writes = %d, want 1", len(tr.writes))
 	}
 	var pong protoPong
 	if err := json.Unmarshal(tr.writes[0], &pong); err != nil {
@@ -1862,15 +1793,13 @@ func TestPongAllowedDuringPrepareQuietForEstablishedPeer(t *testing.T) {
 	}
 }
 
-func TestPongRejectsWrongSIDDuringPrepareQuiet(t *testing.T) {
+func TestPongRejectsWrongSIDWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "cm5-sid",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "cm5-sid",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "other-sid"})
@@ -1910,15 +1839,13 @@ func TestWrongSIDPingPongDoNotRefreshLiveness(t *testing.T) {
 	}
 }
 
-func TestPongRejectsSelfSIDDuringPrepareQuiet(t *testing.T) {
+func TestPongRejectsSelfSIDWithoutQuietWindow(t *testing.T) {
 	tr := &captureTransport{}
 	s := session{
-		tr:                  tr,
-		link:                linkUp,
-		localSID:            "mcu-sid-test",
-		peerSID:             "mcu-sid-test",
-		transferQuietUntil:  time.Now().Add(time.Second),
-		transferQuietReason: "prepare_call_rx",
+		tr:       tr,
+		link:     linkUp,
+		localSID: "mcu-sid-test",
+		peerSID:  "mcu-sid-test",
 	}
 
 	s.onPing(&protoPing{Type: msgPing, SID: "mcu-sid-test"})
@@ -1968,7 +1895,7 @@ func TestUnretainIgnoredBeforeHandshake(t *testing.T) {
 	defer reader.Unsubscribe(sub)
 	select {
 	case m := <-sub.Channel():
-		if m == nil || m.Payload == nil {
+		if m.Payload == nil {
 			t.Fatalf("expected retained config/device, got %+v", m)
 		}
 	case <-time.After(2 * time.Second):
@@ -1999,7 +1926,7 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 
 	sendMsg(t, cm5, protoCall{
 		Type: "call", ID: "pre-hello-1", Topic: []string{"rpc", "hal", "dump"},
-		Payload: json.RawMessage(`{}`), TimeoutMs: 5000,
+		Payload: json.RawMessage(`{}`),
 	})
 
 	select {
@@ -2007,45 +1934,6 @@ func TestCallIgnoredBeforeHandshake(t *testing.T) {
 		t.Fatalf("unexpected pre-handshake call dispatch: %+v", m)
 	case <-time.After(100 * time.Millisecond):
 	}
-}
-
-func TestCallImport(t *testing.T) {
-	// Test the canonical inbound call route: cap/self/updater/main/rpc/prepare-update
-	// maps to local rpc/updater/prepare where services/updater binds.
-	diag := captureOTADiag(t)
-	mcu, cm5 := pipePair()
-	b := newBus()
-	fabricConn := b.NewConnection("fabric")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go Run(ctx, mcu, fabricConn, "mcu", "bigbox-cm5", DefaultLinkConfig())
-	bringUp(t, cm5)
-
-	handler := b.NewConnection("handler")
-	sub := handler.Subscribe(bus.T("rpc", "updater", "prepare"))
-	go func() {
-		for m := range sub.Channel() {
-			handler.Reply(m, map[string]string{"result": "ok"}, false)
-		}
-	}()
-
-	sendMsg(t, cm5, protoCall{
-		Type: "call", ID: "test-corr-1", Topic: []string{"cap", "self", "updater", "main", "rpc", "prepare-update"},
-		Payload: json.RawMessage(`{"job_id":"job-prepare","expected_image_id":"mcu-dev-15.3"}`), TimeoutMs: 5000,
-	})
-
-	reply := readMsg[protoReply](t, cm5)
-	if reply.Corr != "test-corr-1" {
-		t.Errorf("corr = %q", reply.Corr)
-	}
-	if !reply.OK {
-		t.Errorf("reply not ok: %s", reply.Err)
-	}
-	lines := diag.snapshot()
-	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_rx", "call_id test-corr-1", "job_id job-prepare", "expected_image_id mcu-dev-15.3")
-	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_route_ok", "local_topic rpc/updater/prepare")
-	assertDiagContains(t, lines, "[fabric-rpc]", "ev call_dispatch_start", "timeout_ms 5000")
-	waitDiagContains(t, diag, "[fabric-rpc]", "ev call_reply_tx", "ok true", "sent true")
 }
 
 func TestCallNoRoute(t *testing.T) {
@@ -2058,7 +1946,7 @@ func TestCallNoRoute(t *testing.T) {
 
 	sendMsg(t, cm5, protoCall{
 		Type: "call", ID: "no-route-1", Topic: []string{"unknown", "endpoint"},
-		Payload: json.RawMessage(`{}`), TimeoutMs: 1000,
+		Payload: json.RawMessage(`{}`),
 	})
 
 	reply := readMsg[protoReply](t, cm5)
@@ -2095,39 +1983,28 @@ func TestDrainExportsDropsUnmarshalablePayload(t *testing.T) {
 	}
 }
 
-func TestDrainPendingCallsReportsMarshalFailure(t *testing.T) {
+func TestOnCallReportsMarshalFailure(t *testing.T) {
 	b := newBus()
 	fabricConn := b.NewConnection("fabric")
 	handlerConn := b.NewConnection("handler")
 	tr := &captureTransport{}
 
-	sub := handlerConn.Subscribe(bus.T("rpc", "hal", "dump"))
-	defer handlerConn.Unsubscribe(sub)
-	req := fabricConn.NewMessage(bus.T("rpc", "hal", "dump"), map[string]string{"ask": "status"}, false)
-	replySub := fabricConn.Request(req)
-
-	var msg *bus.Message
-	select {
-	case msg = <-sub.Channel():
-		if msg == nil {
-			t.Fatal("nil request message")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for request message")
-	}
-	handlerConn.Reply(msg, make(chan int), false)
+	binding := handlerConn.Bind(bus.T("rpc", "updater", "prepare"), func(ctx context.Context, payload any) (any, error) {
+		return make(chan int), nil
+	})
+	defer binding.Close()
 
 	s := session{
 		conn: fabricConn,
 		tr:   tr,
-		inboundCalls: []*inboundCall{{
-			id:       "call-1",
-			sub:      replySub,
-			deadline: time.Now().Add(time.Second),
-		}},
+		link: linkUp,
 	}
-
-	s.drainInbound(time.Now())
+	s.onCall(&protoCall{
+		Type:    msgCall,
+		ID:      "call-1",
+		Topic:   []string{"cap", "self", "updater", "main", "rpc", "prepare-update"},
+		Payload: json.RawMessage(`{"ask":"status"}`),
+	})
 
 	if len(tr.writes) != 1 {
 		t.Fatalf("writes = %d, want 1", len(tr.writes))
@@ -2142,7 +2019,7 @@ func TestDrainPendingCallsReportsMarshalFailure(t *testing.T) {
 	if reply.OK {
 		t.Fatal("expected ok=false")
 	}
-	if reply.Err != errPayloadMarshal {
-		t.Fatalf("err = %q, want %q", reply.Err, errPayloadMarshal)
+	if reply.Err != "bad_reply_payload" {
+		t.Fatalf("err = %q, want bad_reply_payload", reply.Err)
 	}
 }

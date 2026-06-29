@@ -194,5 +194,5 @@ func (s *Service) emitAlert(v types.ChargerValue, kind AlertKind) {
 		UptimeMs:   s.uptimeMs(),
 	}
 	// Sparse alerts: NOT retained.
-	s.conn.Publish(s.conn.NewMessage(TopicChargerAlert, ev, false))
+	s.conn.PublishValue(TopicChargerAlert, ev, false)
 }

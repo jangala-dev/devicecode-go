@@ -14,12 +14,12 @@ package telemetry
 
 import (
 	"context"
-	"encoding/json"
 	"runtime"
 	"sync/atomic"
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/retainedpub"
 	"devicecode-go/types"
 )
 
@@ -33,14 +33,6 @@ var (
 	TopicRuntimeMem  = bus.T("state", "self", "runtime", "memory")
 
 	TopicChargerAlert = bus.T("event", "self", "power", "charger", "alert")
-
-	// TopicFabricLink mirrors the updater's link-ready watcher: telemetry
-	// republishes the charger config retain on every link-ready edge
-	// so the CM5 sees a fresh config fact on every newly established
-	// session, warm or cold. (Per-value retains like
-	// state/self/power/battery refresh naturally on the next HAL
-	// publish; the static-ish config fact needs an explicit re-emit.)
-	topicFabricLink = bus.T("state", "fabric", "link", "+")
 )
 
 // HAL source topics — single point of truth for what we subscribe to.
@@ -51,9 +43,9 @@ var (
 )
 
 // MemSnapshotInterval is how often the runtime/memory fact republishes.
-// Keep it on the order of the existing reactor mem-stat cadence to
-// avoid burning UART bandwidth on changes that don't affect anything.
-const MemSnapshotInterval = 3 * time.Second
+// Memory pressure is a diagnostic signal, not a safety input, so keep it
+// much slower than HAL sampling to avoid burning UART bandwidth.
+const MemSnapshotInterval = 30 * time.Second
 
 // ChargerThresholds carries the analog comparison thresholds used by
 // both the state/self/power/charger/config retained fact and the charger
@@ -149,16 +141,60 @@ type Service struct {
 	// alert FSM previous-bitfield state. Compared against incoming
 	// values to detect bit-set transitions.
 	alertFSM chargerAlertFSM
+
+	// Retained telemetry de-chatter policy. HAL continues to sample at
+	// its safety cadence; telemetry decides whether each new observation
+	// is material enough to republish onto state/self/*.
+	policy Policy
+
+	batteryGate publishGate
+	chargerGate publishGate
+	envTempGate publishGate
+	envHumGate  publishGate
+
+	lastBattery          types.BatteryValue
+	lastPublishedBattery types.BatteryValue
+	lastCharger          types.ChargerValue
+	lastEnvTemp          types.TemperatureValue
+	lastEnvHum           types.HumidityValue
+
+	haveBatteryObservation      bool
+	havePublishedBatteryMeasure bool
+	haveChargerObservation      bool
+	lastBatteryPresence         batteryPresenceState
+
+	batteryPub    retainedpub.Publisher[BatteryFact]
+	chargerPub    retainedpub.Publisher[ChargerFact]
+	chargerCfgPub retainedpub.Publisher[ChargerConfigFact]
+	envTempPub    retainedpub.Publisher[EnvTempFact]
+	envHumPub     retainedpub.Publisher[EnvHumFact]
+	runtimeMemPub retainedpub.Publisher[RuntimeMemFact]
 }
 
 // New constructs the service. conn must be a fresh bus connection
 // dedicated to telemetry (not shared with the updater or fabric).
 func New(conn *bus.Connection) *Service {
-	return &Service{
+	return NewWithPolicy(conn, DefaultPolicy)
+}
+
+// NewWithPolicy constructs the service with an explicit publication
+// policy. Production normally uses New; tests and bring-up images may
+// pass a shorter keepalive or different drift thresholds while the
+// central config service is still absent.
+func NewWithPolicy(conn *bus.Connection, policy Policy) *Service {
+	s := &Service{
 		conn:       conn,
 		startedAt:  time.Now(),
 		chargerCfg: DefaultChargerConfig(),
+		policy:     policy.withDefaults(),
 	}
+	s.batteryPub = retainedpub.New(conn, TopicBattery, retainedpub.ComparableEqual[BatteryFact])
+	s.chargerPub = retainedpub.New[ChargerFact](conn, TopicCharger, nil)
+	s.chargerCfgPub = retainedpub.New(conn, TopicChargerCfg, retainedpub.ComparableEqual[ChargerConfigFact])
+	s.envTempPub = retainedpub.New(conn, TopicEnvTemp, retainedpub.ComparableEqual[EnvTempFact])
+	s.envHumPub = retainedpub.New(conn, TopicEnvHumidity, retainedpub.ComparableEqual[EnvHumFact])
+	s.runtimeMemPub = retainedpub.New(conn, TopicRuntimeMem, retainedpub.ComparableEqual[RuntimeMemFact])
+	return s
 }
 
 func (s *Service) chargerThresholds() ChargerThresholds {
@@ -182,120 +218,36 @@ func (s *Service) Run(ctx context.Context) {
 	// against.
 	s.publishChargerConfig()
 
-	linkSub := s.conn.Subscribe(topicFabricLink)
-	defer s.conn.Unsubscribe(linkSub)
-
 	memTick := time.NewTicker(MemSnapshotInterval)
 	defer memTick.Stop()
-
-	linkState := map[string]linkObservation{}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case msg, ok := <-tempSub.Channel():
-			if !ok || msg == nil {
+			if !ok {
 				continue
 			}
 			if v, ok := msg.Payload.(types.TemperatureValue); ok {
 				s.publishEnvTemp(v)
 			}
 		case msg, ok := <-humSub.Channel():
-			if !ok || msg == nil {
+			if !ok {
 				continue
 			}
 			if v, ok := msg.Payload.(types.HumidityValue); ok {
 				s.publishEnvHum(v)
 			}
 		case msg, ok := <-pwrSub.Channel():
-			if !ok || msg == nil {
+			if !ok {
 				continue
 			}
-			s.dispatchPower(msg)
-		case msg, ok := <-linkSub.Channel():
-			if !ok || msg == nil {
-				continue
-			}
-			linkID, obs := decodeLinkReady(msg)
-			if linkID == "" {
-				continue
-			}
-			prev, hadPrev := linkState[linkID]
-			if linkReadyEdgeReason(prev, obs, hadPrev) != "" {
-				s.publishChargerConfig()
-			}
-			linkState[linkID] = obs
+			s.dispatchPower(&msg)
 		case <-memTick.C:
 			s.publishRuntimeMem()
 		}
 	}
-}
-
-// decodeLinkReady mirrors services/updater's helper but local to the
-// telemetry package — kept duplicated rather than reaching into
-// updater (cleaner package boundary).
-type linkObservation struct {
-	Ready    bool
-	PeerSID  string
-	LocalSID string
-}
-
-func linkReadyEdgeReason(prev, cur linkObservation, hadPrev bool) string {
-	if !cur.Ready {
-		return ""
-	}
-	if !hadPrev || !prev.Ready {
-		return "ready_edge"
-	}
-	if prev.PeerSID != cur.PeerSID {
-		return "peer_sid_changed"
-	}
-	if prev.LocalSID != cur.LocalSID {
-		return "local_sid_changed"
-	}
-	return ""
-}
-
-func decodeLinkReady(msg *bus.Message) (string, linkObservation) {
-	var obs linkObservation
-	if msg == nil {
-		return "", obs
-	}
-	t := msg.Topic
-	if t == nil || t.Len() < 4 {
-		return "", obs
-	}
-	id, _ := t.At(t.Len() - 1).(string)
-	if id == "" {
-		return "", obs
-	}
-	switch p := msg.Payload.(type) {
-	case nil:
-		return id, obs
-	case map[string]any:
-		obs.Ready, _ = p["ready"].(bool)
-		obs.PeerSID, _ = p["peer_sid"].(string)
-		obs.LocalSID, _ = p["local_sid"].(string)
-		return id, obs
-	}
-	// Probe via JSON for the typed-struct payload fabric publishes.
-	b, err := json.Marshal(msg.Payload)
-	if err != nil {
-		return id, obs
-	}
-	var probe struct {
-		Ready    bool   `json:"ready"`
-		PeerSID  string `json:"peer_sid"`
-		LocalSID string `json:"local_sid"`
-	}
-	if err := json.Unmarshal(b, &probe); err != nil {
-		return id, obs
-	}
-	obs.Ready = probe.Ready
-	obs.PeerSID = probe.PeerSID
-	obs.LocalSID = probe.LocalSID
-	return id, obs
 }
 
 // dispatchPower splits the power-domain wildcard into per-kind
@@ -341,127 +293,140 @@ func (s *Service) uptimeMs() int64 {
 
 // ---- retained-state publishers -------------------------------------
 
+type batteryPresenceState struct {
+	Presence          string
+	MeasurementsValid bool
+	Reason            string
+}
+
+func (a batteryPresenceState) equal(b batteryPresenceState) bool {
+	return a.Presence == b.Presence &&
+		a.MeasurementsValid == b.MeasurementsValid &&
+		a.Reason == b.Reason
+}
+
 // BatteryFact is the retained payload at state/self/power/battery.
-// All units are integer engineering units per the spec.
+//
+// The LTC4015 reports battery-missing and battery-short as charger
+// state-machine faults rather than as a clean independent presence
+// signal. Telemetry therefore derives presence from the latest charger
+// state and omits analogue battery measurements while the pack is
+// absent, faulted, or not yet known. This keeps Fabric from exporting
+// meaningless floating BATSENS values as credible battery telemetry.
 type BatteryFact struct {
-	PackMV         int32  `json:"pack_mV"`
-	PerCellMV      int32  `json:"per_cell_mV"`
-	IBatMA         int32  `json:"ibat_mA"`
-	TempMC         int32  `json:"temp_mC"`
-	BSRUOhmPerCell uint32 `json:"bsr_uohm_per_cell"`
-	Seq            uint32 `json:"seq"`
-	UptimeMs       int64  `json:"uptime_ms"`
+	Presence          string `json:"presence"`
+	MeasurementsValid bool   `json:"measurements_valid"`
+	Reason            string `json:"reason,omitempty"`
+	PackMV            int32  `json:"-"`
+	PerCellMV         int32  `json:"-"`
+	IBatMA            int32  `json:"-"`
+	TempMC            int32  `json:"-"`
+	BSRUOhmPerCell    uint32 `json:"-"`
+	Seq               uint32 `json:"seq"`
+	UptimeMs          int64  `json:"uptime_ms"`
+}
+
+func (f BatteryFact) MarshalJSON() ([]byte, error) {
+	return f.AppendJSON(make([]byte, 0, 224)), nil
+}
+
+func (s *Service) deriveBatteryPresence() batteryPresenceState {
+	if !s.haveChargerObservation {
+		return batteryPresenceState{
+			Presence:          "unknown",
+			MeasurementsValid: false,
+			Reason:            "charger_state_unknown",
+		}
+	}
+	state := types.ChargerStateBits(s.lastCharger.State)
+	if state&types.BatShortFault != 0 {
+		return batteryPresenceState{
+			Presence:          "fault",
+			MeasurementsValid: false,
+			Reason:            "bat_short_fault",
+		}
+	}
+	if state&types.BatMissingFault != 0 {
+		return batteryPresenceState{
+			Presence:          "absent",
+			MeasurementsValid: false,
+			Reason:            "bat_missing_fault",
+		}
+	}
+	return batteryPresenceState{
+		Presence:          "present",
+		MeasurementsValid: true,
+	}
 }
 
 func (s *Service) publishBattery(v types.BatteryValue) {
-	fact := BatteryFact{
-		PackMV:         v.PackMilliV,
-		PerCellMV:      v.PerCellMilliV,
-		IBatMA:         v.IBatMilliA,
-		TempMC:         v.TempMilliC,
-		BSRUOhmPerCell: v.BSR_uOhmPerCell,
-		Seq:            s.seqBattery.Add(1),
-		UptimeMs:       s.uptimeMs(),
+	s.haveBatteryObservation = true
+	s.lastBattery = v
+	s.maybePublishBattery(time.Now())
+}
+
+func (s *Service) maybePublishBattery(now time.Time) {
+	presence := s.deriveBatteryPresence()
+	if presence.MeasurementsValid && !s.haveBatteryObservation {
+		presence.MeasurementsValid = false
+		presence.Reason = "battery_measurement_unavailable"
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicBattery, fact, true))
+
+	presenceChanged := !presence.equal(s.lastBatteryPresence)
+	keepalive := s.batteryGate.shouldPublish(now, s.policy.KeepaliveInterval)
+	meaningful := presence.MeasurementsValid && (!s.havePublishedBatteryMeasure || batteryMeaningful(s.lastBattery, s.lastPublishedBattery, s.policy))
+	if !presenceChanged && !keepalive && !meaningful {
+		return
+	}
+
+	fact := BatteryFact{
+		Presence:          presence.Presence,
+		MeasurementsValid: presence.MeasurementsValid,
+		Reason:            presence.Reason,
+		Seq:               s.seqBattery.Add(1),
+		UptimeMs:          s.uptimeMs(),
+	}
+	if presence.MeasurementsValid {
+		fact.PackMV = s.lastBattery.PackMilliV
+		fact.PerCellMV = s.lastBattery.PerCellMilliV
+		fact.IBatMA = s.lastBattery.IBatMilliA
+		fact.TempMC = s.lastBattery.TempMilliC
+		fact.BSRUOhmPerCell = s.lastBattery.BSR_uOhmPerCell
+	}
+
+	if presence.MeasurementsValid {
+		s.lastPublishedBattery = s.lastBattery
+		s.havePublishedBatteryMeasure = true
+	}
+	s.lastBatteryPresence = presence
+	s.batteryGate.markPublished(now)
+	_ = s.batteryPub.PublishNow(now, fact)
 }
 
 // ChargerFact is the retained payload at state/self/power/charger.
-// Carries raw bitfields AND 3 decoded boolean objects.
 //
-// The canonical key names below come from
-// ../docs/updating.md. They are NOT the existing display names in
-// types.ChargerStateTable etc.
-// (those drop the `_charge` / `_active` / `_fault` suffixes for
-// log-line brevity). The wire-canonical names are spec-frozen because
-// the Lua import side keys off them; renaming any of these is a
-// wire-break.
+// The MCU publishes the compact wire shape only: analogue readings plus
+// LTC4015 bitfields.  Rich decoded boolean objects are deliberately no
+// longer emitted here; the CM5/Lua device layer expands state_bits,
+// status_bits and system_bits after importing the raw retained fact.
 type ChargerFact struct {
-	VinMV      int32           `json:"vin_mV"`
-	VsysMV     int32           `json:"vsys_mV"`
-	IinMA      int32           `json:"iin_mA"`
-	StateBits  uint16          `json:"state_bits"`
-	StatusBits uint16          `json:"status_bits"`
-	SystemBits uint16          `json:"system_bits"`
-	State      map[string]bool `json:"state"`
-	Status     map[string]bool `json:"status"`
-	System     map[string]bool `json:"system"`
-	Seq        uint32          `json:"seq"`
-	UptimeMs   int64           `json:"uptime_ms"`
-}
-
-// Canonical name tables. Each entry is a (bit, canonical-name) pair.
-// Counts match the spec's "27 booleans total: 11 + 4 + 12".
-var chargerStateNames = []struct {
-	bit  types.ChargerStateBits
-	name string
-}{
-	{types.EqualizeCharge, "equalize_charge"},
-	{types.AbsorbCharge, "absorb_charge"},
-	{types.ChargerSuspended, "charger_suspended"},
-	{types.Precharge, "precharge"},
-	{types.CCCVCharge, "cccv_charge"},
-	{types.NTCPause, "ntc_pause"},
-	{types.TimerTerm, "timer_term"},
-	{types.COverXTerm, "c_over_x_term"},
-	{types.MaxChargeTimeFault, "max_charge_time_fault"},
-	{types.BatMissingFault, "bat_missing_fault"},
-	{types.BatShortFault, "bat_short_fault"},
-}
-
-var chargerStatusNames = []struct {
-	bit  types.ChargeStatusBits
-	name string
-}{
-	{types.VinUvclActive, "vin_uvcl_active"},
-	{types.IinLimitActive, "iin_limit_active"},
-	{types.ConstCurrent, "const_current"},
-	{types.ConstVoltage, "const_voltage"},
-}
-
-var chargerSystemNames = []struct {
-	bit  types.SystemStatus
-	name string
-}{
-	{types.ChargerEnabled, "charger_enabled"},
-	{types.MpptEnPin, "mppt_en_pin"},
-	{types.EqualizeReq, "equalize_req"},
-	{types.DrvccGood, "drvcc_good"},
-	{types.CellCountError, "cell_count_error"},
-	{types.OkToCharge, "ok_to_charge"},
-	{types.NoRt, "no_rt"},
-	{types.ThermalShutdown, "thermal_shutdown"},
-	{types.VinOvlo, "vin_ovlo"},
-	{types.VinGtVbat, "vin_gt_vbat"},
-	{types.IntvccGt4p3V, "intvcc_gt_4p3v"},
-	{types.IntvccGt2p8V, "intvcc_gt_2p8v"},
-}
-
-func decodeChargerState(v uint16) map[string]bool {
-	out := make(map[string]bool, len(chargerStateNames))
-	for _, e := range chargerStateNames {
-		out[e.name] = (v & uint16(e.bit)) != 0
-	}
-	return out
-}
-
-func decodeChargerStatus(v uint16) map[string]bool {
-	out := make(map[string]bool, len(chargerStatusNames))
-	for _, e := range chargerStatusNames {
-		out[e.name] = (v & uint16(e.bit)) != 0
-	}
-	return out
-}
-
-func decodeChargerSystem(v uint16) map[string]bool {
-	out := make(map[string]bool, len(chargerSystemNames))
-	for _, e := range chargerSystemNames {
-		out[e.name] = (v & uint16(e.bit)) != 0
-	}
-	return out
+	VinMV      int32  `json:"vin_mV"`
+	VsysMV     int32  `json:"vsys_mV"`
+	IinMA      int32  `json:"iin_mA"`
+	StateBits  uint16 `json:"state_bits"`
+	StatusBits uint16 `json:"status_bits"`
+	SystemBits uint16 `json:"system_bits"`
+	Seq        uint32 `json:"seq"`
+	UptimeMs   int64  `json:"uptime_ms"`
 }
 
 func (s *Service) publishCharger(v types.ChargerValue) {
+	now := time.Now()
+	if !s.chargerGate.shouldPublish(now, s.policy.KeepaliveInterval) && !chargerMeaningful(v, s.lastCharger, s.policy) {
+		return
+	}
+
+	prevBatteryPresence := s.deriveBatteryPresence()
 	fact := ChargerFact{
 		VinMV:      v.VIN_mV,
 		VsysMV:     v.VSYS_mV,
@@ -469,13 +434,25 @@ func (s *Service) publishCharger(v types.ChargerValue) {
 		StateBits:  v.State,
 		StatusBits: v.Status,
 		SystemBits: v.Sys,
-		State:      decodeChargerState(v.State),
-		Status:     decodeChargerStatus(v.Status),
-		System:     decodeChargerSystem(v.Sys),
 		Seq:        s.seqCharger.Add(1),
 		UptimeMs:   s.uptimeMs(),
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicCharger, fact, true))
+	s.lastCharger = v
+	s.haveChargerObservation = true
+	s.chargerGate.markPublished(now)
+	_ = s.chargerPub.PublishNow(now, fact)
+
+	// Charger-state faults are the best battery-presence signal the
+	// LTC4015 gives us. When that derived presence changes, refresh the
+	// battery retained fact. For an observed-present charger with no
+	// battery telemetry yet, wait for the next BatteryValue so the first
+	// present fact can carry measurements. For absent/fault/unknown, publish
+	// immediately even without a BatteryValue because the useful fact is the
+	// absence itself.
+	nextBatteryPresence := s.deriveBatteryPresence()
+	if !nextBatteryPresence.equal(prevBatteryPresence) {
+		s.maybePublishBattery(now)
+	}
 }
 
 // ChargerConfigFact — state/self/power/charger/config. Effective
@@ -510,7 +487,7 @@ func (s *Service) publishChargerConfig() {
 		Seq:           s.seqChargerCfg.Add(1),
 		UptimeMs:      s.uptimeMs(),
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicChargerCfg, fact, true))
+	_ = s.chargerCfgPub.PublishNow(time.Now(), fact)
 }
 
 // EnvTempFact — state/self/environment/temperature.
@@ -521,12 +498,20 @@ type EnvTempFact struct {
 }
 
 func (s *Service) publishEnvTemp(v types.TemperatureValue) {
+	now := time.Now()
+	deciC := int32(v.DeciC)
+	lastDeciC := int32(s.lastEnvTemp.DeciC)
+	if !s.envTempGate.shouldPublish(now, s.policy.KeepaliveInterval) && !meaningfulDeltaI32(deciC, lastDeciC, s.policy.EnvTempMinDeltaDeciC, s.policy.EnvTempMinDeltaPct) {
+		return
+	}
 	fact := EnvTempFact{
-		DeciC:    int32(v.DeciC),
+		DeciC:    deciC,
 		Seq:      s.seqEnvTemp.Add(1),
 		UptimeMs: s.uptimeMs(),
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicEnvTemp, fact, true))
+	s.lastEnvTemp = v
+	s.envTempGate.markPublished(now)
+	_ = s.envTempPub.PublishNow(now, fact)
 }
 
 // EnvHumFact — state/self/environment/humidity.
@@ -537,12 +522,20 @@ type EnvHumFact struct {
 }
 
 func (s *Service) publishEnvHum(v types.HumidityValue) {
+	now := time.Now()
+	rh := int32(v.RHx100)
+	lastRH := int32(s.lastEnvHum.RHx100)
+	if !s.envHumGate.shouldPublish(now, s.policy.KeepaliveInterval) && !meaningfulDeltaI32(rh, lastRH, s.policy.EnvHumMinDeltaRHx100, s.policy.EnvHumMinDeltaPct) {
+		return
+	}
 	fact := EnvHumFact{
-		RHx100:   int32(v.RHx100),
+		RHx100:   rh,
 		Seq:      s.seqEnvHum.Add(1),
 		UptimeMs: s.uptimeMs(),
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicEnvHumidity, fact, true))
+	s.lastEnvHum = v
+	s.envHumGate.markPublished(now)
+	_ = s.envHumPub.PublishNow(now, fact)
 }
 
 // RuntimeMemFact — state/self/runtime/memory. Sourced from
@@ -562,5 +555,5 @@ func (s *Service) publishRuntimeMem() {
 		Seq:        s.seqRuntimeMem.Add(1),
 		UptimeMs:   s.uptimeMs(),
 	}
-	s.conn.Publish(s.conn.NewMessage(TopicRuntimeMem, fact, true))
+	_ = s.runtimeMemPub.PublishNow(time.Now(), fact)
 }

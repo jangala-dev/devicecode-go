@@ -19,6 +19,18 @@ type capKey struct {
 	name   string
 }
 
+type capTopicSet struct {
+	info   bus.Topic
+	status bus.Topic
+	value  bus.Topic
+	event  bus.Topic
+}
+
+type capEventKey struct {
+	capKey
+	tag string
+}
+
 type HAL struct {
 	conn *bus.Connection
 	res  Resources
@@ -26,8 +38,10 @@ type HAL struct {
 	// Device registry
 	dev map[string]Device // devID -> device
 
-	// Capability index: (domain,kind,name) -> devID
-	capIndex map[capKey]string
+	// Capability index: (domain,kind,name) -> devID and precomputed topics.
+	capIndex      map[capKey]string
+	capTopics     map[capKey]capTopicSet
+	capEventTopic map[capEventKey]bus.Topic
 
 	cfgSub  *bus.Subscription
 	ctrlSub *bus.Subscription
@@ -55,13 +69,15 @@ type HAL struct {
 
 func NewHAL(conn *bus.Connection, res Resources) *HAL {
 	h := &HAL{
-		conn:        conn,
-		res:         res,
-		dev:         map[string]Device{},
-		capIndex:    map[capKey]string{},
-		evCh:        make(chan Event, eventQueueLen),
-		lastEmit:    make(map[capKey]int64),
-		lastDevEmit: make(map[string]int64),
+		conn:          conn,
+		res:           res,
+		dev:           map[string]Device{},
+		capIndex:      map[capKey]string{},
+		capTopics:     map[capKey]capTopicSet{},
+		capEventTopic: map[capEventKey]bus.Topic{},
+		evCh:          make(chan Event, eventQueueLen),
+		lastEmit:      make(map[capKey]int64),
+		lastDevEmit:   make(map[string]int64),
 		lastStatus: make(map[capKey]struct {
 			link types.Link
 			err  string
@@ -140,10 +156,10 @@ func (h *HAL) Run(ctx context.Context) {
 		case m := <-h.ctrlSub.Channel():
 			if !ready {
 				// Reject controls until HAL has a configuration.
-				h.replyErr(m, errcode.HALNotReady)
+				h.replyErr(&m, errcode.HALNotReady)
 				continue
 			}
-			h.handleControl(m) // strictly non-blocking
+			h.handleControl(&m) // strictly non-blocking
 
 		case ev := <-h.evCh:
 			// All device→HAL telemetry is published from this goroutine.
@@ -313,9 +329,9 @@ func (h *HAL) handleEvent(ev Event) {
 	}
 	// 2) Success: event vs value
 	if ev.EventTag != "" {
-		h.conn.Publish(h.conn.NewMessage(capEventTagged(d, k, n, ev.EventTag), ev.Payload, false))
+		h.conn.PublishValue(h.taggedEventTopic(ck, ev.EventTag), ev.Payload, false)
 	} else {
-		h.conn.Publish(h.conn.NewMessage(capValue(d, k, n), ev.Payload, true))
+		h.conn.PublishValue(h.topicsFor(ck).value, ev.Payload, true)
 		// Record last successful retained value emission for coalescing (capability-level).
 		h.lastEmit[ck] = ts
 		// Also record device-level emission time for cross-capability coalescing.
@@ -328,11 +344,11 @@ func (h *HAL) handleEvent(ev Event) {
 }
 
 func (h *HAL) pubHALState(level, status string) {
-	h.conn.Publish(h.conn.NewMessage(
+	h.conn.PublishValue(
 		T("hal", "state"),
 		types.HALState{Level: level, Status: status, TS: time.Now().UnixNano()},
 		true,
-	))
+	)
 }
 
 // registerCap indexes the capability and publishes its info and initial status:down (retained).
@@ -343,29 +359,62 @@ func (h *HAL) registerCap(devID string, cs CapabilitySpec) {
 	domain := cs.Domain
 	k := cs.Kind
 	name := cs.Name
-	// Index for control routing.
-	h.capIndex[capKey{domain: domain, kind: k, name: name}] = devID
+	ck := capKey{domain: domain, kind: k, name: name}
+	// Index for control routing and cache hot-path topics once at registration.
+	h.capIndex[ck] = devID
+	base := capBase(domain, k, name)
+	ts := capTopicSet{
+		info:   base.Append("info"),
+		status: base.Append("status"),
+		value:  base.Append("value"),
+		event:  base.Append("event"),
+	}
+	h.capTopics[ck] = ts
 	// Publish static info (retained).
-	h.conn.Publish(h.conn.NewMessage(
-		capInfo(domain, k, name),
+	h.conn.PublishValue(
+		ts.info,
 		types.Info{
 			SchemaVersion: cs.Info.SchemaVersion,
 			Driver:        cs.Info.Driver,
 			Detail:        cs.Info.Detail,
 		},
 		true,
-	))
+	)
 	// Publish initial status: down (retained).
-	h.conn.Publish(h.conn.NewMessage(
-		capStatus(domain, k, name),
+	h.conn.PublishValue(
+		ts.status,
 		types.CapabilityStatus{Link: types.LinkDown, TS: time.Now().UnixNano()},
 		true,
-	))
-	h.lastStatus[capKey{domain: domain, kind: k, name: name}] =
+	)
+	h.lastStatus[ck] =
 		struct {
 			link types.Link
 			err  string
 		}{link: types.LinkDown, err: ""}
+}
+
+func (h *HAL) topicsFor(ck capKey) capTopicSet {
+	if ts, ok := h.capTopics[ck]; ok {
+		return ts
+	}
+	base := capBase(ck.domain, ck.kind, ck.name)
+	return capTopicSet{
+		info:   base.Append("info"),
+		status: base.Append("status"),
+		value:  base.Append("value"),
+		event:  base.Append("event"),
+	}
+}
+
+func (h *HAL) taggedEventTopic(ck capKey, tag string) bus.Topic {
+	key := capEventKey{capKey: ck, tag: tag}
+	if t, ok := h.capEventTopic[key]; ok {
+		return t
+	}
+	base := h.topicsFor(ck).event
+	t := base.Append(tag)
+	h.capEventTopic[key] = t
+	return t
 }
 
 // pubStatus publishes a retained status update for a capability.
@@ -384,11 +433,11 @@ func (h *HAL) pubStatus(domain string, kind types.Kind, name string, ts int64, e
 		link types.Link
 		err  string
 	}{link: link, err: err}
-	h.conn.Publish(h.conn.NewMessage(
-		capStatus(domain, kind, name),
+	h.conn.PublishValue(
+		h.topicsFor(ck).status,
 		types.CapabilityStatus{Link: link, TS: ts, Error: err},
 		true,
-	))
+	)
 }
 
 // ---- HAL as EventEmitter (enqueue to single publisher) ----

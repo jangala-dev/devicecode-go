@@ -18,7 +18,7 @@ type Logger struct {
 	droppedUART1Bytes int // mirror dropped bytes
 }
 
-var nl = [...]byte{'\n'}
+var nl = [...]byte{'\r', '\n'}
 
 func (l *Logger) SetStart(t time.Time)     { l.t0, l.LineStart = t, true }
 func (l *Logger) SetUART1(r *shmring.Ring) { l.target = r }

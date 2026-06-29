@@ -28,11 +28,13 @@ func (d *Device) SnapshotInto(out *Snapshot) {
 	if v, e := d.Vsys_mV(); e == nil {
 		s.Vsys_mV = v
 	}
-	if v, e := d.Battery_mVPack(); e == nil {
-		s.Pack_mV = v
-	}
 	if v, e := d.Battery_mVPerCell(); e == nil {
 		s.PerCell_mV = v
+		if d.cells == 0 {
+			s.Pack_mV = v
+		} else {
+			s.Pack_mV = v * int32(d.cells)
+		}
 	}
 	if v, e := d.Ibat_mA(); e == nil {
 		s.IBat_mA = v

@@ -187,21 +187,21 @@ func main() {
 				valCh = nil
 				continue
 			}
-			printCapValue(m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
+			printCapValue(&m, &lastIIn, &haveIIn, &lastIBat, &haveIBat)
 
 		case m, ok := <-stCh:
 			if !ok {
 				stCh = nil
 				continue
 			}
-			printCapStatus(m)
+			printCapStatus(&m)
 
 		case m, ok := <-evCh:
 			if !ok {
 				evCh = nil
 				continue
 			}
-			printCapEvent(m)
+			printCapEvent(&m)
 
 		case <-ctx.Done():
 			return

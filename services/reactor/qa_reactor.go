@@ -4,12 +4,12 @@ package reactor
 
 import (
 	"context"
-	"runtime"
 	"time"
 
 	"devicecode-go/bus"
 	"devicecode-go/types"
 	"devicecode-go/utilities"
+	"devicecode-go/utilities/diag"
 	"devicecode-go/x/shmring"
 	"devicecode-go/x/strconvx"
 )
@@ -128,11 +128,11 @@ const (
 )
 
 type Reactor struct {
-	bus    *bus.Bus
 	uiConn *bus.Connection
 
 	// UART
 	jsonOut *shmring.Ring // telemetry (JSON UART TX)
+	// Logger UART1 already handled by global logger (see SetUART1)
 
 	// inputs (latest)
 	vin_mV, vbat_mV int32
@@ -165,26 +165,15 @@ type Reactor struct {
 
 	// telemetry drop counters (bytes)
 	droppedUART0Bytes int
-	bootBuyRC         int32
 }
 
-type Options struct {
-	BootBuyRC int32
-}
-
-func NewReactor(b *bus.Bus, uiConn *bus.Connection) *Reactor {
-	return NewReactorWithOptions(b, uiConn, Options{})
-}
-
-func NewReactorWithOptions(b *bus.Bus, uiConn *bus.Connection, opts Options) *Reactor {
+func NewReactor(uiConn *bus.Connection) *Reactor {
 	return &Reactor{
-		bus:       b,
-		uiConn:    uiConn,
-		levelUp:   true,
-		state:     stateOff,
-		now:       time.Now(),
-		bootBuyRC: opts.BootBuyRC,
-		ledTick:   0,
+		uiConn:  uiConn,
+		levelUp: true,
+		state:   stateOff,
+		now:     time.Now(),
+		ledTick: 0,
 	}
 }
 
@@ -219,12 +208,12 @@ func (r *Reactor) updateLatchesFromValues() {
 	if r.freshTMP() {
 		if r.lastTDeci >= TEMP_LIMIT {
 			if !r.otActive {
-				log.Println("[thermal] over-temp → latch active")
+				log.Println("thermal hot")
 			}
 			r.otActive = true
 		} else if r.lastTDeci <= (TEMP_LIMIT - TEMP_HYST) {
 			if r.otActive {
-				log.Println("[thermal] temp recovered below hysteresis")
+				log.Println("thermal ok")
 			}
 			r.otActive = false
 		}
@@ -244,7 +233,7 @@ func (r *Reactor) updateLatchesFromValues() {
 // ---- sequencing (non-blocking) ----
 
 func (r *Reactor) startUpSeq() {
-	log.Println("[power] PG debounced + Temp OK → rails UP")
+	log.Println("pwr up")
 	r.state = stateUpSeq
 	r.seqIdx = 0            // next to apply
 	r.nextActionDue = r.now // first step fires immediately
@@ -254,7 +243,7 @@ func (r *Reactor) startUpSeq() {
 }
 
 func (r *Reactor) startDownSeq() {
-	log.Println("[power] brownout/stale/over-temp → rails DOWN")
+	log.Println("pwr down")
 	r.state = stateDownSeq
 	if r.seqOnCount < 0 {
 		r.seqOnCount = 0
@@ -283,7 +272,7 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		log.Println("[event] powering rail UP: ", step.Name)
+		log.Println("rail+ ", step.Name)
 		r.publishSwitch(step.Name, true)
 		r.seqOnCount++
 		r.seqIdx++
@@ -298,7 +287,7 @@ func (r *Reactor) advanceSequenceIfDue() {
 			return
 		}
 		step := powerSeq[r.seqIdx]
-		log.Println("[event] powering rail down: ", step.Name)
+		log.Println("rail- ", step.Name)
 		r.publishSwitch(step.Name, false)
 		r.seqOnCount--
 		r.seqIdx--
@@ -421,30 +410,6 @@ func (r *Reactor) OnTempDeciC(label string, deci int, jsonKey string) {
 	}
 }
 
-// ---- memory snapshot telemetry (every ~2 s in main loop) ----
-
-func (r *Reactor) emitMemSnapshot() {
-	var ms runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	// log line
-	log.Println(
-		"[mem] ",
-		"alloc:", int(ms.Alloc), " ",
-		"heapSys:", int(ms.HeapSys), " ",
-		"mallocs:", int(ms.Mallocs), " ",
-		"frees:", int(ms.Frees),
-	)
-	// JSON (minimal to keep overhead low)
-	if r.jsonOut != nil {
-		var w utilities.JSONWriter
-		w.Write = r.jsonWrite
-		w.Begin()
-		w.KvInt("sys/mem/alloc", int(ms.Alloc))
-		w.End()
-	}
-}
-
 func (r *Reactor) Run(ctx context.Context) {
 	// Subscriptions (env + power)
 	log.Println("[main] subscribing env + power …")
@@ -475,25 +440,26 @@ func (r *Reactor) Run(ctx context.Context) {
 	// Supervisory ticker
 	ticker := time.NewTicker(TICK)
 	defer ticker.Stop()
-	memTick := 0
 
-	log.Println("[main] entering reactor loop …")
+	log.Println("reactor run")
 	for {
 		select {
 		// ---- UART session opened/closed ----
 		case m := <-subSessOpenTele.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
 				r.jsonOut = shmring.Get(shmring.Handle(ev.TXHandle))
-				log.Println("[uart0] telemetry session opened")
+				log.Println("uart0 open")
 			}
 		case m := <-subSessOpenLog.Channel():
 			if ev, ok := m.Payload.(types.SerialSessionOpened); ok {
-				log.SetUART1(shmring.Get(shmring.Handle(ev.TXHandle)))
-				log.Println("[uart1] log session opened")
+				ring := shmring.Get(shmring.Handle(ev.TXHandle))
+				log.SetUART1(ring)
+				diag.SetUART1(ring)
+				log.Println("uart1 open")
 			}
 		case <-subSessClosedTele.Channel():
 			r.jsonOut = nil
-			log.Println("[uart0] telemetry session closed")
+			log.Println("uart0 closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryTeleAt) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartTele), nil, false))
@@ -501,7 +467,8 @@ func (r *Reactor) Run(ctx context.Context) {
 			}
 		case <-subSessClosedLog.Channel():
 			log.SetUART1(nil)
-			log.Println("[uart1] log session closed")
+			diag.SetUART1(nil)
+			log.Println("uart1 closed")
 			// Auto-reopen with back-off
 			if time.Now().After(retryLogAt) {
 				r.uiConn.Publish(r.uiConn.NewMessage(tSessOpen(uartLog), nil, false))
@@ -518,11 +485,11 @@ func (r *Reactor) Run(ctx context.Context) {
 				deci := int(v.DeciC)
 				r.lastTDeci = deci
 				r.tsTemp = r.now
-				r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
+				r.OnTempDeciC("envT=", deci, "env/temperature/core")
 			}
 		case m := <-humidSub.Channel():
 			if v, ok := m.Payload.(types.HumidityValue); ok {
-				log.Hundredths("[value] env/humidity/core %RH=", int(v.RHx100))
+				log.Hundredths("envH=", int(v.RHx100))
 				// JSON
 				if r.jsonOut != nil {
 					var w utilities.JSONWriter
@@ -542,7 +509,7 @@ func (r *Reactor) Run(ctx context.Context) {
 					aht20Alive = false
 					r.lastTDeci = deci
 					r.tsTemp = r.now
-					r.OnTempDeciC("[value] env/temperature/core °C=", deci, "env/temperature/core")
+					r.OnTempDeciC("envT=", deci, "env/temperature/core")
 				}
 			}
 
@@ -552,19 +519,19 @@ func (r *Reactor) Run(ctx context.Context) {
 			switch v := m.Payload.(type) {
 			case types.BatteryValue:
 				r.OnBattery(v)
-				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
+				printCapValue(&m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.ChargerValue:
 				r.OnCharger(v)
-				printCapValue(m, &r.iin_mA, nil, &r.ibat_mA, nil)
+				printCapValue(&m, &r.iin_mA, nil, &r.ibat_mA, nil)
 			case types.TemperatureValue:
-				r.OnTempDeciC("[value] power/temperature/internal °C=", int(v.DeciC), "power/temperature/internal")
+				r.OnTempDeciC("pwrT=", int(v.DeciC), "power/temperature/internal")
 			}
 
 		case m := <-stSub.Channel():
-			printCapStatus(m)
+			printCapStatus(&m)
 
 		case m := <-evSub.Channel():
-			printCapEvent(m)
+			printCapEvent(&m)
 			// JSON: {"<dom>/<kind>/<name>/event":"<tag>"}
 			if r.jsonOut != nil {
 				dom, _ := m.Topic.At(2).(string)
@@ -590,11 +557,6 @@ func (r *Reactor) Run(ctx context.Context) {
 			// 2) LED behaviour
 			r.stepLED()
 
-			// 3) Periodic memory snapshot (~3 s)
-			memTick++
-			if memTick%30 == 0 { // 30 * 100 ms = 3 s
-				r.emitMemSnapshot()
-			}
 		case <-ctx.Done():
 			return
 		}
@@ -633,70 +595,28 @@ func printCapValue(m *bus.Message, lastIIn *int32, _ *bool, lastIBat *int32, _ *
 
 	switch v := m.Payload.(type) {
 	case types.BatteryValue:
-		log.Print("[value] ", dom, "/", kind, "/", name,
-			" | VBAT=", int(v.PackMilliV), "mV per=", int(v.PerCellMilliV), "mV | IBAT=", int(v.IBatMilliA), "mA | BSR=", int(v.BSR_uOhmPerCell), "uR")
+		log.Print("bat ", dom, "/", kind, "/", name,
+			" v=", int(v.PackMilliV), "mV cell=", int(v.PerCellMilliV), "mV i=", int(v.IBatMilliA), "mA bsr=", int(v.BSR_uOhmPerCell), "uR")
 		if lastIBat != nil {
 			*lastIBat = v.IBatMilliA
 		}
 		if lastIIn != nil {
 			isys := *lastIIn - v.IBatMilliA
-			log.Print(" | ISYS≈", int(isys), "mA")
+			log.Print(" isys=", int(isys), "mA")
 		}
 		log.Println()
 
 	case types.ChargerValue:
-		log.Print("[value] ", dom, "/", kind, "/", name,
-			" | VIN=", int(v.VIN_mV), "mV | VSYS=", int(v.VSYS_mV), "mV | IIN=", int(v.IIn_mA), "mA")
+		log.Print("chg ", dom, "/", kind, "/", name,
+			" vin=", int(v.VIN_mV), "mV vsys=", int(v.VSYS_mV), "mV iin=", int(v.IIn_mA), "mA")
 		if lastIIn != nil {
 			*lastIIn = v.IIn_mA
 			if lastIBat != nil {
 				isys := *lastIIn - *lastIBat
-				log.Print(" | ISYS≈", int(isys), "mA")
+				log.Print(" isys=", int(isys), "mA")
 			}
 		}
-		// ---- human-readable (SET bits only) ----
-		{
-			it := types.NewBitIter(types.SystemStatus(v.Sys), types.SystemStatusTable[:])
-			first := true
-			log.Print(" | system=[")
-			for name, ok := it.Next(); ok; name, ok = it.Next() {
-				if !first {
-					log.Print(",")
-				} else {
-					first = false
-				}
-				log.Print(name)
-			}
-			log.Print("]")
-		}
-		{
-			it := types.NewBitIter(types.ChargeStatusBits(v.Status), types.ChargeStatusTable[:])
-			first := true
-			log.Print(" | status=[")
-			for name, ok := it.Next(); ok; name, ok = it.Next() {
-				if !first {
-					log.Print(",")
-				} else {
-					first = false
-				}
-				log.Print(name)
-			}
-			log.Print("]")
-		}
-		{
-			it := types.NewBitIter(types.ChargerStateBits(v.State), types.ChargerStateTable[:])
-			first := true
-			log.Print(" | state=[")
-			for name, ok := it.Next(); ok; name, ok = it.Next() {
-				if !first {
-					log.Print(",")
-				} else {
-					first = false
-				}
-				log.Print(name)
-			}
-			log.Print("]")
-		}
+		logCompactChargerBits(v.State, v.Status, v.Sys)
 		log.Println()
 
 	default:
@@ -726,7 +646,7 @@ func printCapStatus(m *bus.Message) {
 	if sVal, ok := m.Payload.(types.CapabilityStatus); ok {
 		log.Println(
 			"[link] ", dom, "/", kind, "/", name,
-			" | link=", string(sVal.Link),
+			"=", string(sVal.Link),
 			" ts=", strconvx.Itoa64(sVal.TS),
 		)
 	}
@@ -746,7 +666,7 @@ func printCapEvent(m *bus.Message) {
 		return
 	}
 
-	log.Println("[event] ", dom, "/", kind, "/", name, " | ", tag)
+	log.Println("ev ", kind, "/", name, " ", tag)
 }
 
 // Global logger instance
