@@ -52,20 +52,10 @@ func (s *Service) handleStage(msg *bus.Message) {
 			s.reply(msg, StageReply{OK: false, Err: err.Error()})
 			return
 		}
-		stageIdentity, _ := identityFromStageMeta(s.identity, payload.Meta)
-		if staged.Version != "" {
-			stageIdentity.Version = staged.Version
-		}
-		if staged.BuildID != "" {
-			stageIdentity.Build = staged.BuildID
-		}
-		if staged.ImageID != "" {
-			stageIdentity.ImageID = staged.ImageID
-		}
 		desc := StagedDescriptor{
-			Version:       stageIdentity.Version,
-			BuildID:       stageIdentity.Build,
-			ImageID:       stageIdentity.ImageID,
+			Version:       staged.Version,
+			BuildID:       staged.BuildID,
+			ImageID:       staged.ImageID,
 			Length:        staged.Length,
 			Slot:          0,
 			PayloadSHA256: staged.PayloadSHA256,
@@ -169,73 +159,4 @@ func (s *Service) failLateStage(payload StagePayload, err error) {
 		s.cancelStreamedStageLease(payload.XferID, payload.Generation, reason)
 	}
 	s.transitionTo(StateFailed, reason, "")
-}
-
-type stageMetadata struct {
-	Version         string `json:"version,omitempty"`
-	Build           string `json:"build,omitempty"`
-	BuildID         string `json:"build_id,omitempty"`
-	ImageID         string `json:"image_id,omitempty"`
-	ExpectedImageID string `json:"expected_image_id,omitempty"`
-}
-
-type stageMetadataEnvelope struct {
-	Metadata stageMetadata `json:"metadata,omitempty"`
-	Meta     stageMetadata `json:"meta,omitempty"`
-	Request  struct {
-		Metadata        stageMetadata `json:"metadata,omitempty"`
-		Meta            stageMetadata `json:"meta,omitempty"`
-		ExpectedImageID string        `json:"expected_image_id,omitempty"`
-	} `json:"request,omitempty"`
-}
-
-func applyStageMetadata(ident *Identity, md stageMetadata) bool {
-	applied := false
-	if md.Version != "" {
-		ident.Version = md.Version
-		applied = true
-	}
-	if md.BuildID != "" {
-		ident.Build = md.BuildID
-		applied = true
-	} else if md.Build != "" {
-		ident.Build = md.Build
-		applied = true
-	}
-	if md.ImageID != "" {
-		ident.ImageID = md.ImageID
-		applied = true
-	} else if md.ExpectedImageID != "" {
-		ident.ImageID = md.ExpectedImageID
-		applied = true
-	}
-	return applied
-}
-
-func identityFromStageMeta(defaults Identity, meta any) (Identity, bool) {
-	ident := defaults
-	applied := false
-	md, ok := jsonDecode[stageMetadata](meta)
-	if ok {
-		applied = applyStageMetadata(&ident, md) || applied
-	}
-
-	env, ok := jsonDecode[stageMetadataEnvelope](meta)
-	if !ok {
-		return ident, applied
-	}
-	applied = applyStageMetadata(&ident, env.Metadata) || applied
-	applied = applyStageMetadata(&ident, env.Meta) || applied
-	if env.Request.ExpectedImageID != "" && env.Request.Metadata.ExpectedImageID == "" {
-		env.Request.Metadata.ExpectedImageID = env.Request.ExpectedImageID
-	}
-	if env.Request.ExpectedImageID != "" && env.Request.Meta.ExpectedImageID == "" {
-		env.Request.Meta.ExpectedImageID = env.Request.ExpectedImageID
-	}
-	applied = applyStageMetadata(&ident, env.Request.Metadata) || applied
-	applied = applyStageMetadata(&ident, env.Request.Meta) || applied
-	if !applied {
-		return ident, false
-	}
-	return ident, true
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"devicecode-go/services/otadiag"
 	"devicecode-go/services/updater"
 	"devicecode-go/x/strconvx"
 	"devicecode-go/x/xxhash"
@@ -16,6 +17,7 @@ const transferTargetUpdaterMain = "updater/main"
 const transferIdleRetryLimit = 3
 const transferCorruptRetryLimit = 3
 const completedTransferCacheLimit = 4
+const transferMemSampleStride = 64 * 1024
 
 // transferMeta captures xfer_begin contents. The transfer target is explicit
 // on the wire; firmware update uses target="updater/main". meta remains opaque
@@ -161,6 +163,8 @@ func (s *session) abortTransfer(reason string) {
 	if cur == nil {
 		return
 	}
+	otadiag.Event("[fabric-xfer]", "abort_local", cur.meta.ID, otadiag.KV("reason", reason))
+	otadiag.StopUpdateWindow(reason)
 	if err := cur.sink.Abort(reason); err != nil {
 		s.logKV("transfer abort failed", "err", err.Error())
 	}
@@ -188,7 +192,8 @@ func (s *session) checkTransferTimeout(now time.Time) {
 	}
 	id := cur.meta.ID
 	s.abortTransfer("timeout")
-	s.sendTransferAbort(id, "timeout")
+	abortOK := s.sendTransferAbort(id, "timeout")
+	otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "timeout"), otadiag.KV("ok", abortOK))
 }
 
 func (s *session) retryCorruptTransferFrame(reason string) bool {
@@ -196,6 +201,7 @@ func (s *session) retryCorruptTransferFrame(reason string) bool {
 	if cur == nil {
 		return false
 	}
+	s.markRx()
 	if cur.corruptRetryOffset != cur.bytesWritten {
 		cur.corruptRetryOffset = cur.bytesWritten
 		cur.corruptRetriesAtOffset = 0
@@ -203,11 +209,19 @@ func (s *session) retryCorruptTransferFrame(reason string) bool {
 	if cur.corruptRetriesAtOffset >= transferCorruptRetryLimit {
 		id := cur.meta.ID
 		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return false
 	}
 	cur.corruptRetriesAtOffset++
-	s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	otadiag.Event(
+		"[fabric-xfer]", "need_tx", cur.meta.ID,
+		otadiag.KV("next", cur.bytesWritten),
+		otadiag.KV("ok", needOK),
+		otadiag.KV("retry", true),
+		otadiag.KV("reason", reason),
+	)
 	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
 	return true
 }
@@ -271,22 +285,50 @@ func validateTransferBegin(msg *protoXferBegin) (transferMeta, string) {
 
 func (s *session) onTransferBegin(msg *protoXferBegin) {
 	s.extendTransferQuiet("xfer_begin_rx", transferPrepareQuiet)
+	otadiag.SetActiveXfer(msg.XferID)
+	otadiag.Event(
+		"[fabric-xfer]", "begin_rx", msg.XferID,
+		otadiag.KV("target", msg.Target),
+		otadiag.KV("size", msg.Size),
+		otadiag.KV("digest_alg", msg.DigestAlg),
+		otadiag.KV("digest", msg.Digest),
+		otadiag.KV("meta_len", len(msg.Meta)),
+	)
 	meta, errStr := validateTransferBegin(msg)
 	if errStr != "" {
 		if msg.XferID != "" {
-			s.sendTransferAbort(msg.XferID, "bad_message: "+errStr)
+			abortOK := s.sendTransferAbort(msg.XferID, "bad_message: "+errStr)
+			otadiag.Event(
+				"[fabric-xfer]", "begin_reject", msg.XferID,
+				otadiag.KV("reason", "bad_message:"+errStr),
+				otadiag.KV("abort_tx", abortOK),
+			)
+		} else {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_reject", msg.XferID,
+				otadiag.KV("reason", "bad_message:"+errStr),
+				otadiag.KV("abort_tx", false),
+			)
 		}
+		otadiag.StopUpdateWindow("begin_reject")
 		s.logKV("xfer_begin dropped", "err", errStr)
 		return
 	}
+	otadiag.Event(
+		"[fabric-xfer]", "begin_validate_ok", meta.ID,
+		otadiag.KV("target", meta.Target),
+	)
 	s.markRx()
 	now := time.Now()
 	if s.incomingTransfer != nil {
 		cur := s.incomingTransfer
 		if sameTransferTuple(cur.meta, meta) {
 			s.logKV("xfer_begin duplicate", "id", meta.ID)
-			if s.sendTransferReady(meta.ID) {
-				s.sendTransferNeed(meta.ID, cur.bytesWritten)
+			readyOK := s.sendTransferReady(meta.ID)
+			otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK), otadiag.KV("duplicate", true))
+			if readyOK {
+				needOK := s.sendTransferNeed(meta.ID, cur.bytesWritten)
+				otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", cur.bytesWritten), otadiag.KV("ok", needOK), otadiag.KV("duplicate", true))
 			}
 			cur.deadline = now.Add(s.cfg.PhaseTimeout)
 			return
@@ -295,34 +337,67 @@ func (s *session) onTransferBegin(msg *protoXferBegin) {
 		if cur.meta.ID == meta.ID {
 			reason = "conflicting_transfer"
 		}
-		s.sendTransferAbort(meta.ID, reason)
+		abortOK := s.sendTransferAbort(meta.ID, reason)
+		otadiag.Event(
+			"[fabric-xfer]", "begin_reject", meta.ID,
+			otadiag.KV("reason", reason),
+			otadiag.KV("active_xfer", cur.meta.ID),
+			otadiag.KV("abort_tx", abortOK),
+		)
+		otadiag.StopUpdateWindow("begin_reject")
 		return
 	}
 	if done, ok := s.completedTransferFor(meta.ID); ok {
 		if sameTransferTuple(done, meta) {
-			s.sendTransferDone(meta.ID)
+			doneOK := s.sendTransferDone(meta.ID)
+			otadiag.Event("[fabric-xfer]", "begin_duplicate_done", meta.ID, otadiag.KV("done_tx", doneOK))
 			return
 		}
-		s.sendTransferAbort(meta.ID, "conflicting_transfer")
+		abortOK := s.sendTransferAbort(meta.ID, "conflicting_transfer")
+		otadiag.Event("[fabric-xfer]", "begin_reject", meta.ID, otadiag.KV("reason", "conflicting_transfer"), otadiag.KV("abort_tx", abortOK))
+		otadiag.StopUpdateWindow("begin_reject")
 		return
 	}
 	beginFn := s.beginTransfer
 	if beginFn == nil {
 		beginFn = beginTransfer
 	}
+	beginStart := time.Now()
+	otadiag.Event(
+		"[fabric-xfer]", "begin_transfer_start", meta.ID,
+		otadiag.KV("target", meta.Target),
+		otadiag.KV("size", meta.Size),
+	)
 	sink, err := beginFn(meta)
 	if err != nil {
-		s.sendTransferAbort(meta.ID, err.Error())
+		durMS := int(time.Since(beginStart) / time.Millisecond)
+		abortOK := s.sendTransferAbort(meta.ID, err.Error())
+		otadiag.Event(
+			"[fabric-xfer]", "begin_transfer_error", meta.ID,
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("dur_ms", durMS),
+			otadiag.KV("abort_tx", abortOK),
+		)
+		otadiag.StopUpdateWindow("begin_transfer_error")
 		return
 	}
+	otadiag.Event(
+		"[fabric-xfer]", "begin_transfer_done", meta.ID,
+		otadiag.KV("dur_ms", int(time.Since(beginStart)/time.Millisecond)),
+	)
 	s.incomingTransfer = &incomingTransfer{
 		meta:     meta,
 		sink:     sink,
 		hasher:   xxhash.New(0),
 		deadline: now.Add(s.cfg.PhaseTimeout),
 	}
-	if s.sendTransferReady(meta.ID) {
-		s.sendTransferNeed(meta.ID, 0)
+	readyOK := s.sendTransferReady(meta.ID)
+	otadiag.Event("[fabric-xfer]", "ready_tx", meta.ID, otadiag.KV("ok", readyOK))
+	if readyOK {
+		needOK := s.sendTransferNeed(meta.ID, 0)
+		otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", needOK))
+	} else {
+		otadiag.Event("[fabric-xfer]", "need_tx", meta.ID, otadiag.KV("next", 0), otadiag.KV("ok", false), otadiag.KV("skipped", "ready_failed"))
 	}
 }
 
@@ -333,32 +408,70 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 		return
 	}
 	id := cur.meta.ID
+	otadiag.Event(
+		"[fabric-xfer]", "chunk_rx", id,
+		otadiag.KV("offset", u32s(msg.Offset)),
+		otadiag.KV("expected", u32s(cur.bytesWritten)),
+		otadiag.KV("encoded_len", strconvx.Itoa(len(msg.Data))),
+	)
 	if msg.Offset < cur.bytesWritten {
 		s.markRx()
-		s.sendTransferNeed(id, cur.bytesWritten)
-		cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+		needOK := s.sendTransferNeed(id, cur.bytesWritten)
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_stale_offset", id,
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("expected", u32s(cur.bytesWritten)),
+			otadiag.KV("need_tx", needOK),
+		)
 		return
 	}
 	if msg.Offset > cur.bytesWritten {
 		s.markRx()
-		s.sendTransferNeed(id, cur.bytesWritten)
+		needOK := s.sendTransferNeed(id, cur.bytesWritten)
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_future_offset", id,
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("expected", u32s(cur.bytesWritten)),
+			otadiag.KV("need_tx", needOK),
+		)
 		return
 	}
+	decodeStart := time.Now()
 	raw, errStr := decodeChunkData(msg.Data)
 	if errStr != "" {
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_decode_done", id,
+			otadiag.KV("ok", false),
+			otadiag.KV("reason", errStr),
+			otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
+		)
 		s.logKV("xfer_chunk decode retry", "err", errStr)
 		s.retryCorruptTransferFrame(errStr)
 		return
 	}
+	otadiag.Event(
+		"[fabric-xfer]", "chunk_decode_done", id,
+		otadiag.KV("ok", true),
+		otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+		otadiag.KV("dur_ms", int(time.Since(decodeStart)/time.Millisecond)),
+	)
 	if len(raw) == 0 {
 		s.abortTransfer("empty_chunk")
-		s.sendTransferAbort(id, "empty_chunk")
+		abortOK := s.sendTransferAbort(id, "empty_chunk")
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "empty_chunk"), otadiag.KV("ok", abortOK))
 		return
 	}
 	if cur.bytesWritten+uint32(len(raw)) > cur.meta.Size {
 		reason := "size_too_large"
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_size_overflow", id,
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+			otadiag.KV("size", u32s(cur.meta.Size)),
+		)
 		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
 	// Per-chunk integrity is required by the current MCU contract.
@@ -366,22 +479,56 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	// base64url data string: the bytes still decode, just to the wrong
 	// values. On mismatch we ask the sender to resume at the current
 	// byte offset instead of clearing the transfer.
+	digestStart := time.Now()
 	want, ok := canonicalXXHash32Hex(msg.ChunkDigest)
 	if !ok {
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_digest_done", id,
+			otadiag.KV("ok", false),
+			otadiag.KV("reason", "bad_message"),
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("digest_len", strconvx.Itoa(len(msg.ChunkDigest))),
+			otadiag.KV("data_len", strconvx.Itoa(len(msg.Data))),
+			otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+		)
 		s.retryCorruptTransferFrame("bad_message")
 		return
 	}
 	got := xxhashHex(xxhash.Sum32(raw, 0))
 	if got != want {
+		otadiag.Event(
+			"[fabric-xfer]", "chunk_digest_done", id,
+			otadiag.KV("ok", false),
+			otadiag.KV("reason", "chunk_digest_mismatch"),
+			otadiag.KV("offset", u32s(msg.Offset)),
+			otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+		)
 		s.retryCorruptTransferFrame("chunk_digest_mismatch")
 		return
 	}
+	otadiag.Event(
+		"[fabric-xfer]", "chunk_digest_done", id,
+		otadiag.KV("ok", true),
+		otadiag.KV("dur_ms", int(time.Since(digestStart)/time.Millisecond)),
+	)
 	s.markRx()
+	writeStart := time.Now()
+	otadiag.Event(
+		"[fabric-xfer]", "sink_write_start", id,
+		otadiag.KV("offset", u32s(msg.Offset)),
+		otadiag.KV("raw_len", strconvx.Itoa(len(raw))),
+	)
 	if err := cur.sink.WriteChunk(msg.Offset, raw); err != nil {
 		reason := err.Error()
+		otadiag.Event(
+			"[fabric-xfer]", "sink_write_error", id,
+			otadiag.KV("reason", reason),
+			otadiag.KV("dur_ms", int(time.Since(writeStart)/time.Millisecond)),
+		)
 		s.logKV("transfer write failed", "err", reason)
 		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
 	_, _ = cur.hasher.Write(raw)
@@ -391,12 +538,40 @@ func (s *session) onTransferChunk(msg *protoXferChunk) {
 	cur.corruptRetryOffset = cur.bytesWritten
 	cur.corruptRetriesAtOffset = 0
 	cur.deadline = time.Now().Add(s.cfg.PhaseTimeout)
+	otadiag.Event(
+		"[fabric-xfer]", "sink_write_done", id,
+		otadiag.KV("dur_ms", int(time.Since(writeStart)/time.Millisecond)),
+		otadiag.KV("next", u32s(cur.bytesWritten)),
+	)
 	raw = nil
 	// Keep transfer memory bounded on TinyGo. The receiver allocates while
 	// unmarshalling JSON and decoding base64 chunks; without regular collection
 	// long updates can run out of heap before commit.
+	gcStart := time.Now()
+	otadiag.Event("[fabric-xfer]", "gc_start", id, otadiag.KV("next", u32s(cur.bytesWritten)))
 	runtime.GC()
-	s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	otadiag.Event(
+		"[fabric-xfer]", "gc_done", id,
+		otadiag.KV("dur_ms", int(time.Since(gcStart)/time.Millisecond)),
+		otadiag.KV("next", u32s(cur.bytesWritten)),
+	)
+	needOK := s.sendTransferNeed(cur.meta.ID, cur.bytesWritten)
+	otadiag.Event(
+		"[fabric-xfer]", "need_tx", cur.meta.ID,
+		otadiag.KV("next", cur.bytesWritten),
+		otadiag.KV("ok", needOK),
+		otadiag.KV("accepted", true),
+	)
+	if cur.bytesWritten != 0 && cur.bytesWritten%transferMemSampleStride == 0 {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		otadiag.Event(
+			"[fabric-xfer]", "transfer_mem_sample", cur.meta.ID,
+			otadiag.KV("next", cur.bytesWritten),
+			otadiag.KV("alloc", ms.Alloc),
+			otadiag.KV("heap", ms.HeapSys),
+		)
+	}
 }
 
 func (s *session) onTransferCommit(msg *protoXferCommit) {
@@ -409,24 +584,28 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 	if msg.Size != cur.meta.Size || cur.bytesWritten != cur.meta.Size {
 		reason := "short_transfer"
 		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
 	if msg.DigestAlg != digestAlg {
 		s.abortTransfer("unsupported_digest_alg")
-		s.sendTransferAbort(id, "unsupported_digest_alg")
+		abortOK := s.sendTransferAbort(id, "unsupported_digest_alg")
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "unsupported_digest_alg"), otadiag.KV("ok", abortOK))
 		return
 	}
 	commitDigest, ok := canonicalXXHash32Hex(msg.Digest)
 	if !ok {
 		s.abortTransfer("invalid_digest")
-		s.sendTransferAbort(id, "invalid_digest")
+		abortOK := s.sendTransferAbort(id, "invalid_digest")
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "invalid_digest"), otadiag.KV("ok", abortOK))
 		return
 	}
 	streamedHex := xxhashHex(cur.hasher.Sum32())
 	if commitDigest != cur.meta.Digest || streamedHex != cur.meta.Digest {
 		s.abortTransfer("digest_mismatch")
-		s.sendTransferAbort(id, "digest_mismatch")
+		abortOK := s.sendTransferAbort(id, "digest_mismatch")
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", "digest_mismatch"), otadiag.KV("ok", abortOK))
 		return
 	}
 	s.markRx()
@@ -435,7 +614,8 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 		s.logKV("transfer commit failed", "err", err.Error())
 		reason := err.Error()
 		s.abortTransfer(reason)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
 	sink := cur.sink
@@ -447,12 +627,15 @@ func (s *session) onTransferCommit(msg *protoXferCommit) {
 	ok, reason := s.invokeTransferTarget(meta, id, info, bytesPayload)
 	if !ok {
 		s.extendTransferQuiet("xfer_target_rejected", transferCompleteQuiet)
-		s.sendTransferAbort(id, reason)
+		abortOK := s.sendTransferAbort(id, reason)
+		otadiag.Event("[fabric-xfer]", "abort_tx", id, otadiag.KV("reason", reason), otadiag.KV("ok", abortOK))
 		return
 	}
 	s.extendTransferQuiet("xfer_done", transferCompleteQuiet)
 	s.recordCompletedTransfer(meta)
-	s.sendTransferDone(id)
+	doneOK := s.sendTransferDone(id)
+	otadiag.Event("[fabric-xfer]", "done_tx", id, otadiag.KV("ok", doneOK))
+	otadiag.StopUpdateWindow("transfer_done")
 }
 
 var targetCallTimeout = 5 * time.Second
@@ -564,6 +747,7 @@ func (s *session) onTransferAbort(msg *protoXferAbort) {
 	}
 	s.markRx()
 	s.abortTransfer(reason)
+	otadiag.StopUpdateWindow("remote_abort")
 }
 
 // xxhashHex formats a uint32 xxHash32 digest as 8 lower-case hex characters,

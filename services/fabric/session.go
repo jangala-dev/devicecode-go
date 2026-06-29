@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
 	"devicecode-go/types"
 	"devicecode-go/x/strconvx"
 )
@@ -87,6 +88,8 @@ const (
 type inboundCall struct {
 	id              string
 	topic           []string
+	localTopic      bus.Topic
+	payload         json.RawMessage
 	sub             *bus.Subscription
 	deadline        time.Time
 	transferPrepare bool
@@ -187,19 +190,47 @@ func (s *session) run(ctx context.Context) {
 
 	go func() {
 		defer close(lines)
+		lastLineAt := time.Now()
 		for {
+			started := time.Now()
 			line, err := s.tr.ReadLine()
+			now := time.Now()
+			readDur := now.Sub(started)
+			sinceLine := now.Sub(lastLineAt)
 			if err != nil {
 				if errors.Is(err, ErrLineTooLong) {
+					otadiag.Event(
+						"[fabric-rx]", "read_error", otadiag.XferNone,
+						otadiag.KV("reason", "line_too_long"),
+						otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+						otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+					)
 					s.log("oversized line dropped")
 					continue
 				}
+				otadiag.Event(
+					"[fabric-rx]", "read_error", otadiag.XferNone,
+					otadiag.KV("reason", err.Error()),
+					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+				)
 				select {
 				case lines <- readResult{err: err}:
 				case <-ctx.Done():
 				}
 				return
 			}
+			t := protoType(line)
+			if shouldLogFabricRead(t, readDur, sinceLine) {
+				otadiag.Event(
+					"[fabric-rx]", "read_line", protoXferID(line),
+					otadiag.KV("type", t),
+					otadiag.KV("line_len", len(line)),
+					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
+					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
+				)
+			}
+			lastLineAt = now
 			cp := make([]byte, len(line))
 			copy(cp, line)
 			select {
@@ -271,6 +302,14 @@ func (s *session) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func shouldLogFabricRead(msgType string, _, _ time.Duration) bool {
+	switch msgType {
+	case msgHello, msgHelloAck, msgCall, msgReply, msgXferBegin, msgXferCommit, msgXferAbort:
+		return true
+	}
+	return false
 }
 
 func resetTimer(t *time.Timer, d time.Duration) {
@@ -478,6 +517,10 @@ func (s *session) dispatch(line []byte) {
 	case msgReply:
 		typedDispatch(s, t, line, s.onReply)
 	case msgXferBegin:
+		otadiag.Event(
+			"[fabric-xfer]", "begin_route_start", protoXferID(line),
+			otadiag.KV("line_len", len(line)),
+		)
 		typedDispatch(s, t, line, s.onTransferBegin)
 	case msgXferChunk:
 		typedDispatch(s, t, line, s.onTransferChunk)
@@ -497,6 +540,14 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 	dec := json.NewDecoder(bytes.NewReader(line))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&msg); err != nil {
+		if msgType == msgXferBegin {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
+				otadiag.KV("err", err.Error()),
+				otadiag.KV("line_len", len(line)),
+			)
+			otadiag.StopUpdateWindow("begin_decode_error")
+		}
 		s.logMalformed(line, err)
 		s.retryMalformedTransferFrame(msgType, line)
 		return
@@ -506,11 +557,22 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 		if err == nil {
 			err = errors.New("trailing_json")
 		}
+		if msgType == msgXferBegin {
+			otadiag.Event(
+				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
+				otadiag.KV("err", err.Error()),
+				otadiag.KV("line_len", len(line)),
+			)
+			otadiag.StopUpdateWindow("begin_decode_error")
+		}
 		s.logMalformed(line, err)
 		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
 	handler(&msg)
+	if msgType == msgXferBegin {
+		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
+	}
 }
 
 func (s *session) retryMalformedTransferFrame(msgType string, line []byte) {
@@ -624,6 +686,111 @@ func wireTopicString(topic []string) string {
 		return ""
 	}
 	return strings.Join(topic, "/")
+}
+
+func busTopicPath(topic bus.Topic) string {
+	if topic == nil {
+		return ""
+	}
+	parts := make([]string, 0, topic.Len())
+	for i := 0; i < topic.Len(); i++ {
+		if s, ok := topic.At(i).(string); ok {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func traceRPCDiagTopic(topic []string) bool {
+	return wireTopicEquals(topic, wireUpdaterPrepare) || wireTopicEquals(topic, wireUpdaterCommit)
+}
+
+func rawJSONScalar(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var n float64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return strconvx.FormatFloat(n, 'f', -1, 64)
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		if b {
+			return "true"
+		}
+		return "false"
+	}
+	return ""
+}
+
+func rpcPayloadField(payload json.RawMessage, key string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return ""
+	}
+	return rawJSONScalar(obj[key])
+}
+
+func (s *session) rpcDiag(event string, msg *protoCall, localTopic bus.Topic, reason string, fields ...otadiag.Field) {
+	if msg == nil || !traceRPCDiagTopic(msg.Topic) {
+		return
+	}
+	base := []otadiag.Field{
+		otadiag.KV("call_id", msg.ID),
+		otadiag.KV("topic", wireTopicString(msg.Topic)),
+		otadiag.KV("local_sid", s.localSID),
+		otadiag.KV("peer_sid", s.peerSID),
+		otadiag.KV("payload_len", len(msg.Payload)),
+	}
+	if local := busTopicPath(localTopic); local != "" {
+		base = append(base, otadiag.KV("local_topic", local))
+	}
+	if jobID := rpcPayloadField(msg.Payload, "job_id"); jobID != "" {
+		base = append(base, otadiag.KV("job_id", jobID))
+	}
+	if imageID := rpcPayloadField(msg.Payload, "expected_image_id"); imageID != "" {
+		base = append(base, otadiag.KV("expected_image_id", imageID))
+	}
+	if reason != "" {
+		base = append(base, otadiag.KV("reason", reason))
+	}
+	base = append(base, fields...)
+	otadiag.Event("[fabric-rpc]", event, otadiag.XferNone, base...)
+}
+
+func (s *session) rpcDiagInbound(event string, call *inboundCall, ok bool, err string, fields ...otadiag.Field) {
+	if call == nil || !traceRPCDiagTopic(call.topic) {
+		return
+	}
+	base := []otadiag.Field{
+		otadiag.KV("call_id", call.id),
+		otadiag.KV("topic", wireTopicString(call.topic)),
+		otadiag.KV("local_sid", s.localSID),
+		otadiag.KV("peer_sid", s.peerSID),
+		otadiag.KV("payload_len", len(call.payload)),
+		otadiag.KV("ok", ok),
+	}
+	if local := busTopicPath(call.localTopic); local != "" {
+		base = append(base, otadiag.KV("local_topic", local))
+	}
+	if jobID := rpcPayloadField(call.payload, "job_id"); jobID != "" {
+		base = append(base, otadiag.KV("job_id", jobID))
+	}
+	if imageID := rpcPayloadField(call.payload, "expected_image_id"); imageID != "" {
+		base = append(base, otadiag.KV("expected_image_id", imageID))
+	}
+	if err != "" {
+		base = append(base, otadiag.KV("err", err))
+	}
+	base = append(base, fields...)
+	otadiag.Event("[fabric-rpc]", event, otadiag.XferNone, base...)
 }
 
 func validWireTopic(topic []string) bool {
@@ -821,22 +988,29 @@ func (s *session) onUnretain(msg *protoUnretain) {
 
 func (s *session) onCall(msg *protoCall) {
 	if msg.ID == "" {
+		s.rpcDiag("call_reject", msg, nil, "missing_id")
 		s.log("incoming call dropped: missing_id")
 		return
 	}
 	if !validWireTopic(msg.Topic) {
+		s.rpcDiag("call_reject", msg, nil, "bad_topic")
 		s.log("incoming call dropped: bad_topic")
 		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "bad_topic"}))
 		return
 	}
+	s.rpcDiag("call_rx", msg, nil, "",
+		otadiag.KV("timeout_ms", strconvx.Itoa(msg.TimeoutMs)),
+	)
 	for _, call := range s.inboundCalls {
 		if call.id == msg.ID {
+			s.rpcDiag("call_reject", msg, nil, "duplicate_call_id")
 			s.logKV("incoming call dropped", "err", "duplicate_call_id")
 			s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "duplicate_call_id"}))
 			return
 		}
 	}
 	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
+		s.rpcDiag("call_reject", msg, nil, reasonBusy)
 		s.log("incoming call dropped: busy")
 		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
 		return
@@ -844,10 +1018,12 @@ func (s *session) onCall(msg *protoCall) {
 
 	localTopic := importCallTopic(msg.Topic)
 	if localTopic == nil {
+		s.rpcDiag("call_reject", msg, nil, reasonNoRoute)
 		s.log("incoming call dropped: no_route")
 		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
 		return
 	}
+	s.rpcDiag("call_route_ok", msg, localTopic, "")
 
 	s.markRx()
 	isTransferPrepare := wireTopicEquals(msg.Topic, wireUpdaterPrepare)
@@ -860,11 +1036,16 @@ func (s *session) onCall(msg *protoCall) {
 		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
 	}
 	busMsg := s.conn.NewMessage(localTopic, msg.Payload, false)
+	s.rpcDiag("call_dispatch_start", msg, localTopic, "",
+		otadiag.KV("timeout_ms", strconvx.Itoa(int(timeout/time.Millisecond))),
+	)
 	sub := s.conn.Request(busMsg)
 	topicCopy := append([]string(nil), msg.Topic...)
 	s.inboundCalls = append(s.inboundCalls, &inboundCall{
 		id:              msg.ID,
 		topic:           topicCopy,
+		localTopic:      localTopic,
+		payload:         append(json.RawMessage(nil), msg.Payload...),
 		sub:             sub,
 		deadline:        time.Now().Add(timeout),
 		transferPrepare: isTransferPrepare,
@@ -1160,7 +1341,9 @@ func (s *session) drainInbound(now time.Time) {
 				if call.transferPrepare {
 					s.extendTransferQuiet("prepare_reply_timeout", transferPrepareQuiet)
 				}
-				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
+				s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
+				if !sent {
 					return
 				}
 				continue
@@ -1169,7 +1352,9 @@ func (s *session) drainInbound(now time.Time) {
 				if call.transferPrepare {
 					s.extendTransferQuiet("prepare_reply_error", transferPrepareQuiet)
 				}
-				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr})) {
+				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr}))
+				s.rpcDiagInbound("call_reply_tx", call, false, errStr, otadiag.KV("sent", sent))
+				if !sent {
 					return
 				}
 				continue
@@ -1179,7 +1364,9 @@ func (s *session) drainInbound(now time.Time) {
 				if call.transferPrepare {
 					s.extendTransferQuiet("prepare_reply_marshal_failed", transferPrepareQuiet)
 				}
-				if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal})) {
+				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal}))
+				s.rpcDiagInbound("call_reply_tx", call, false, errPayloadMarshal, otadiag.KV("sent", sent))
+				if !sent {
 					return
 				}
 				continue
@@ -1187,7 +1374,9 @@ func (s *session) drainInbound(now time.Time) {
 			if call.transferPrepare {
 				s.extendTransferQuiet("prepare_reply_ok", transferPrepareQuiet)
 			}
-			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload})) {
+			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload}))
+			s.rpcDiagInbound("call_reply_tx", call, true, "", otadiag.KV("sent", sent))
+			if !sent {
 				return
 			}
 			continue
@@ -1200,7 +1389,9 @@ func (s *session) drainInbound(now time.Time) {
 			if call.transferPrepare {
 				s.extendTransferQuiet("prepare_call_timeout", transferPrepareQuiet)
 			}
-			if !s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout})) {
+			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
+			s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
+			if !sent {
 				return
 			}
 			continue

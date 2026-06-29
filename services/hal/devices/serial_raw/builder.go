@@ -8,6 +8,7 @@ import (
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
+	"devicecode-go/services/otadiag"
 	"devicecode-go/types"
 	"devicecode-go/x/shmring"
 	"devicecode-go/x/strconvx"
@@ -27,6 +28,7 @@ type Params struct {
 const (
 	serialRawPumpRXBudget = 256
 	serialRawPumpTXBudget = 256
+	serialRawPumpGapWarn  = 20 * time.Millisecond
 )
 
 // ---- Device ----
@@ -58,11 +60,17 @@ type session struct {
 	txRing   *shmring.Ring
 
 	// Reactor-owned observability. Single writer only.
-	rxRingFull     uint32
-	rxLogAt        time.Time
-	rxLogHits      uint32
-	rxPressureAt   time.Time
-	rxPressureHits uint32
+	rxRingFull      uint32
+	rxLogAt         time.Time
+	rxLogHits       uint32
+	rxPressureAt    time.Time
+	rxPressureHits  uint32
+	rxPumpGapAt     time.Time
+	rxPumpGapHits   uint32
+	lastRXPumpAt    time.Time
+	lastRXPumpMoved int
+	lastRXPumpDurMS int
+	lastRXPumpGapMS int
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
@@ -73,6 +81,14 @@ type session struct {
 type serialRXDiagnostics interface {
 	RXBuffered() int
 	RXBufferCap() int
+}
+
+type serialRXErrorDiagnostics interface {
+	RXDropCount() uint32
+	RXOverrunCount() uint32
+	RXBreakCount() uint32
+	RXParityCount() uint32
+	RXFramingCount() uint32
 }
 
 // ---- Builder registration ----
@@ -365,6 +381,34 @@ func (d *Device) logRingFullChange(s *session, force bool) {
 	s.rxLogHits = hits
 }
 
+func (d *Device) appendRXPumpFields(s *session, fields []otadiag.Field, now time.Time) []otadiag.Field {
+	if !s.lastRXPumpAt.IsZero() {
+		fields = append(fields, otadiag.KV("since_rx_pump_ms", int(now.Sub(s.lastRXPumpAt)/time.Millisecond)))
+	}
+	fields = append(fields,
+		otadiag.KV("last_pump_moved", s.lastRXPumpMoved),
+		otadiag.KV("last_pump_dur_ms", s.lastRXPumpDurMS),
+	)
+	if s.lastRXPumpGapMS >= 0 {
+		fields = append(fields, otadiag.KV("last_pump_gap_ms", s.lastRXPumpGapMS))
+	}
+	return fields
+}
+
+func appendRXErrorFields(port core.SerialPort, fields []otadiag.Field) []otadiag.Field {
+	diag, ok := port.(serialRXErrorDiagnostics)
+	if !ok {
+		return fields
+	}
+	return append(fields,
+		otadiag.KV("rx_drops", diag.RXDropCount()),
+		otadiag.KV("rx_overrun", diag.RXOverrunCount()),
+		otadiag.KV("rx_break", diag.RXBreakCount()),
+		otadiag.KV("rx_parity", diag.RXParityCount()),
+		otadiag.KV("rx_framing", diag.RXFramingCount()),
+	)
+}
+
 func (d *Device) logDriverPressure(s *session, force bool) {
 	const minInterval = 1 * time.Second
 
@@ -386,27 +430,133 @@ func (d *Device) logDriverPressure(s *session, force bool) {
 	}
 
 	hits := s.rxPressureHits + 1
+	now := time.Now()
 	if !force {
-		now := time.Now()
 		if now.Sub(s.rxPressureAt) < minInterval {
 			return
 		}
-		s.rxPressureAt = now
 	} else {
-		s.rxPressureAt = time.Now()
+		now = time.Now()
 	}
+	s.rxPressureAt = now
 	s.rxPressureHits = hits
 
-	println(
-		"[serial-raw]", "rx_driver_pressure",
-		"uart", d.a.Name,
-		"hits", strconvx.Utoa64(uint64(hits)),
-		"driver_used", strconvx.Itoa(used),
-		"driver_cap", strconvx.Itoa(capacity),
-		"ring_avail", strconvx.Itoa(s.rxRing.Available()),
-		"ring_space", strconvx.Itoa(s.rxRing.Space()),
-		"ring_cap", strconvx.Itoa(s.rxRing.Cap()),
-	)
+	fields := []otadiag.Field{
+		otadiag.KV("uart", d.a.Name),
+		otadiag.KV("hits", strconvx.Utoa64(uint64(hits))),
+		otadiag.KV("driver_used", used),
+		otadiag.KV("driver_cap", capacity),
+		otadiag.KV("ring_avail", s.rxRing.Available()),
+		otadiag.KV("ring_space", s.rxRing.Space()),
+		otadiag.KV("ring_cap", s.rxRing.Cap()),
+	}
+	fields = d.appendRXPumpFields(s, fields, now)
+	fields = appendRXErrorFields(d.port, fields)
+	otadiag.Event("[serial-raw]", "rx_driver_pressure", otadiag.XferNone, fields...)
+
+	if !s.lastRXPumpAt.IsZero() && now.Sub(s.lastRXPumpAt) >= serialRawPumpGapWarn {
+		d.logRXPumpGap(s, used, capacity, now)
+	}
+}
+
+func (d *Device) logRXPumpGap(s *session, used, capacity int, now time.Time) {
+	const minInterval = 1 * time.Second
+
+	if now.Sub(s.rxPumpGapAt) < minInterval {
+		return
+	}
+	s.rxPumpGapAt = now
+	s.rxPumpGapHits++
+	fields := []otadiag.Field{
+		otadiag.KV("uart", d.a.Name),
+		otadiag.KV("hits", strconvx.Utoa64(uint64(s.rxPumpGapHits))),
+		otadiag.KV("driver_used", used),
+		otadiag.KV("driver_cap", capacity),
+		otadiag.KV("ring_avail", s.rxRing.Available()),
+		otadiag.KV("ring_space", s.rxRing.Space()),
+		otadiag.KV("ring_cap", s.rxRing.Cap()),
+		otadiag.KV("since_rx_pump_ms", int(now.Sub(s.lastRXPumpAt)/time.Millisecond)),
+		otadiag.KV("last_pump_moved", s.lastRXPumpMoved),
+		otadiag.KV("last_pump_dur_ms", s.lastRXPumpDurMS),
+		otadiag.KV("last_pump_gap_ms", s.lastRXPumpGapMS),
+	}
+	fields = appendRXErrorFields(d.port, fields)
+	otadiag.Event("[serial-raw]", "rx_pump_gap", otadiag.XferNone, fields...)
+}
+
+func (s *session) noteRXPump(moved int, started time.Time) {
+	if moved <= 0 {
+		return
+	}
+	now := time.Now()
+	gapMS := -1
+	if !s.lastRXPumpAt.IsZero() {
+		gapMS = int(started.Sub(s.lastRXPumpAt) / time.Millisecond)
+	}
+	s.lastRXPumpAt = now
+	s.lastRXPumpMoved = moved
+	s.lastRXPumpDurMS = int(now.Sub(started) / time.Millisecond)
+	s.lastRXPumpGapMS = gapMS
+	if s.lastRXPumpGapMS < 0 {
+		s.lastRXPumpGapMS = 0
+	}
+	if s.lastRXPumpDurMS >= 5 {
+		otadiag.Event(
+			"[serial-raw]", "rx_pump_slow", otadiag.XferNone,
+			otadiag.KV("moved", moved),
+			otadiag.KV("dur_ms", s.lastRXPumpDurMS),
+			otadiag.KV("gap_ms", s.lastRXPumpGapMS),
+		)
+	}
+}
+
+func (d *Device) pumpRX(s *session, u core.SerialPort, rxR *shmring.Ring, budget int) bool {
+	started := time.Now()
+	moved := 0
+
+	defer func() {
+		if moved > 0 {
+			s.noteRXPump(moved, started)
+		}
+	}()
+
+	for moved < budget {
+		d.logDriverPressure(s, false)
+		p1, p2 := rxR.WriteAcquire()
+		if len(p1) == 0 {
+			s.rxRingFull++
+			break
+		}
+
+		remaining := budget - moved
+		p1 = limitSpan(p1, remaining)
+		n1 := u.TryRead(p1)
+		if n1 == 0 {
+			break
+		}
+		n := n1
+		moved += n1
+		if n1 < len(p1) {
+			rxR.WriteCommit(n)
+			break
+		}
+
+		remaining = budget - moved
+		if remaining > 0 && len(p2) > 0 {
+			p2 = limitSpan(p2, remaining)
+			n2 := u.TryRead(p2)
+			n += n2
+			moved += n2
+			if n2 < len(p2) {
+				rxR.WriteCommit(n)
+				break
+			}
+		}
+
+		rxR.WriteCommit(n)
+	}
+
+	return moved > 0
 }
 
 func (d *Device) reactor(s *session) {
@@ -450,48 +600,6 @@ func (d *Device) reactor(s *session) {
 		case <-txR.Readable():
 		}
 	}
-}
-
-func (d *Device) pumpRX(s *session, u core.SerialPort, rxR *shmring.Ring, budget int) bool {
-	moved := 0
-
-	for moved < budget {
-		d.logDriverPressure(s, false)
-		p1, p2 := rxR.WriteAcquire()
-		if len(p1) == 0 {
-			s.rxRingFull++
-			break
-		}
-
-		remaining := budget - moved
-		p1 = limitSpan(p1, remaining)
-		n1 := u.TryRead(p1)
-		if n1 == 0 {
-			break
-		}
-		n := n1
-		moved += n1
-		if n1 < len(p1) {
-			rxR.WriteCommit(n)
-			break
-		}
-
-		remaining = budget - moved
-		if remaining > 0 && len(p2) > 0 {
-			p2 = limitSpan(p2, remaining)
-			n2 := u.TryRead(p2)
-			n += n2
-			moved += n2
-			if n2 < len(p2) {
-				rxR.WriteCommit(n)
-				break
-			}
-		}
-
-		rxR.WriteCommit(n)
-	}
-
-	return moved > 0
 }
 
 func (d *Device) pumpTX(u core.SerialPort, txR *shmring.Ring, budget int) bool {

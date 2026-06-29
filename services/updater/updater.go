@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
 )
 
 // Local-bus topics the updater binds to. Fabric routes wire
@@ -281,6 +282,7 @@ func (noopMetadataWriter) ClearStagedDescriptor() error {
 func (s *Service) Run(ctx context.Context) {
 	unregister := registerActiveService(s)
 	defer unregister()
+	defer otadiag.StopUpdateWindow("updater_stop")
 
 	prepareSub := s.conn.Subscribe(TopicPrepareRPC)
 	defer s.conn.Unsubscribe(prepareSub)
@@ -440,6 +442,23 @@ func (s *Service) transitionTo(next State, lastError, pendingVersion string) Sta
 	s.mu.Unlock()
 	s.PublishCriticalFacts()
 	return prev
+}
+
+func (s *Service) diagSnapshotLocked() otadiag.StageSnapshot {
+	xferID := s.streamXferID
+	if xferID == "" {
+		xferID = otadiag.XferNone
+	}
+	return otadiag.StageSnapshot{
+		State:       string(s.state),
+		Generation:  s.stageGeneration,
+		LeaseActive: s.streamLeaseActive,
+		XferID:      xferID,
+	}
+}
+
+func setDiagSnapshot(snap otadiag.StageSnapshot) {
+	otadiag.SetUpdaterSnapshot(snap)
 }
 
 func (s *Service) logRepublish(reason, linkID string, obs linkObservation) {

@@ -12,3 +12,5 @@ require (
 require github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 
 replace pico2-a-b => ../pico2-a-b
+
+replace github.com/jangala-dev/tinygo-uartx => ./third_party/tinygo-uartx

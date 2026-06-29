@@ -7,21 +7,22 @@ package types
 type Kind string
 
 const (
-	KindLED         Kind = "led"
-	KindSwitch      Kind = "switch"
-	KindPWM         Kind = "pwm"
-	KindTemperature Kind = "temperature"
-	KindHumidity    Kind = "humidity"
-	KindSerial      Kind = "serial"
-	KindButton      Kind = "button"
-	KindBattery     Kind = "battery"
-	KindCharger     Kind = "charger"
+	KindLED           Kind = "led"
+	KindSwitch        Kind = "switch"
+	KindPWM           Kind = "pwm"
+	KindTemperature   Kind = "temperature"
+	KindHumidity      Kind = "humidity"
+	KindSerial        Kind = "serial"
+	KindButton        Kind = "button"
+	KindBattery       Kind = "battery"
+	KindCharger       Kind = "charger"
+	KindChargerConfig Kind = "charger_config"
 )
 
 func (k Kind) Valid() bool {
 	switch k {
 	case KindLED, KindSwitch, KindPWM, KindTemperature, KindHumidity,
-		KindSerial, KindButton, KindBattery, KindCharger:
+		KindSerial, KindButton, KindBattery, KindCharger, KindChargerConfig:
 		return true
 	}
 	return false

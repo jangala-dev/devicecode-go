@@ -97,9 +97,7 @@ func TestPublishesChargerWithDecodedBooleans(t *testing.T) {
 		if fact.StateBits != uint16(types.AbsorbCharge|types.CCCVCharge) {
 			t.Fatalf("state_bits = 0x%x", fact.StateBits)
 		}
-		// Decoded booleans use the canonical names from
-		// docs/firmware-alignment-update.md §6.2 — these are the
-		// wire-frozen names the Lua side keys off.
+		// Decoded booleans use the canonical wire names the Lua side keys off.
 		if !fact.State["absorb_charge"] || !fact.State["cccv_charge"] {
 			t.Fatalf("decoded state booleans wrong: %+v", fact.State)
 		}
@@ -246,8 +244,8 @@ func TestChargerAlertFSMEdgeOnly(t *testing.T) {
 }
 
 func TestPublishesChargerConfigAtStartup(t *testing.T) {
-	// W7 finish: state/self/power/charger/config retains at startup
-	// with the conservative defaults from DefaultChargerConfig().
+	// state/self/power/charger/config retains at startup with the
+	// conservative defaults from DefaultChargerConfig().
 	b := newTestBus()
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(TopicChargerCfg)
@@ -262,7 +260,7 @@ func TestPublishesChargerConfigAtStartup(t *testing.T) {
 		if !ok {
 			t.Fatalf("payload type = %T", msg.Payload)
 		}
-		if fact.Schema != 1 || fact.Source != "ltc4015-default" {
+		if fact.Schema != "charger-config/1" || fact.Source != "ltc4015-default" {
 			t.Fatalf("schema/source wrong: %+v", fact)
 		}
 		if fact.Thresholds.VinLoMV == 0 || fact.Thresholds.VinHiMV == 0 || fact.Thresholds.BSRHighUohmPerCell == 0 {
@@ -273,10 +271,79 @@ func TestPublishesChargerConfigAtStartup(t *testing.T) {
 	}
 }
 
+func TestRepublishesChargerConfigOnLinkReadyAndSessionEdges(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicChargerCfg)
+	defer observer.Unsubscribe(sub)
+
+	_, cancel := runService(t, b)
+	defer cancel()
+
+	// Drain startup config retain.
+	waitForChargerConfig(t, sub)
+
+	publisher := b.NewConnection("test-fabric")
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "fabric", "link", "mcu-uart0"),
+		map[string]any{"ready": false, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
+		true,
+	))
+	time.Sleep(50 * time.Millisecond)
+	for len(sub.Channel()) > 0 {
+		<-sub.Channel()
+	}
+
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "fabric", "link", "mcu-uart0"),
+		map[string]any{"ready": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
+		true,
+	))
+	waitForChargerConfig(t, sub)
+
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "fabric", "link", "mcu-uart0"),
+		map[string]any{"ready": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
+		true,
+	))
+	assertNoChargerConfig(t, sub, 150*time.Millisecond)
+
+	publisher.Publish(publisher.NewMessage(
+		bus.T("state", "fabric", "link", "mcu-uart0"),
+		map[string]any{"ready": true, "peer_sid": "cm5-b", "local_sid": "mcu-a"},
+		true,
+	))
+	waitForChargerConfig(t, sub)
+}
+
+func waitForChargerConfig(t *testing.T, sub *bus.Subscription) {
+	t.Helper()
+	select {
+	case msg := <-sub.Channel():
+		if _, ok := msg.Payload.(ChargerConfigFact); !ok {
+			t.Fatalf("payload type = %T", msg.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for charger config fact")
+	}
+}
+
+func assertNoChargerConfig(t *testing.T, sub *bus.Subscription, d time.Duration) {
+	t.Helper()
+	settled := time.After(d)
+	for {
+		select {
+		case <-sub.Channel():
+			t.Fatal("unexpected charger config republish on unchanged Ready=true retain")
+		case <-settled:
+			return
+		}
+	}
+}
+
 func TestChargerAlertFSMVinLoEdge(t *testing.T) {
-	// W8 finish: vin_lo fires on ChargerValue.VIN_mV crossing below
-	// the configured threshold. Subsequent observations below the
-	// threshold do NOT re-fire.
+	// vin_lo fires on ChargerValue.VIN_mV crossing below the configured
+	// threshold. Subsequent observations below the threshold do NOT re-fire.
 	b := newTestBus()
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(TopicChargerAlert)
@@ -298,6 +365,9 @@ func TestChargerAlertFSMVinLoEdge(t *testing.T) {
 		ev, _ := msg.Payload.(AlertEvent)
 		if ev.Kind != AlertVinLo {
 			t.Fatalf("kind = %q, want vin_lo", ev.Kind)
+		}
+		if ev.Severity != "warning" {
+			t.Fatalf("severity = %q, want warning", ev.Severity)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for vin_lo alert")
@@ -333,6 +403,9 @@ func TestChargerAlertFSMVinHiEdge(t *testing.T) {
 		ev, _ := msg.Payload.(AlertEvent)
 		if ev.Kind != AlertVinHi {
 			t.Fatalf("kind = %q, want vin_hi", ev.Kind)
+		}
+		if ev.Severity != "warning" {
+			t.Fatalf("severity = %q, want warning", ev.Severity)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for vin_hi alert")

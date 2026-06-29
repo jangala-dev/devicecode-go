@@ -492,7 +492,7 @@ func (r *Reactor) Run(ctx context.Context) {
 	identity := firmwareIdentity()
 	updaterSvc := updater.New(updater.Options{
 		Conn:      updaterConn,
-		Verifier:  updater.PassthroughVerifier(identity),
+		Verifier:  updater.SignedImageVerifier(),
 		Applier:   updater.ProductionApplier(),
 		Identity:  identity,
 		BootBuyRC: r.bootBuyRC,

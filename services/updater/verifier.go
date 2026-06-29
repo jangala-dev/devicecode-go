@@ -5,10 +5,10 @@ import (
 	"io"
 )
 
-// Manifest is the small subset of image metadata that updater staging needs
-// after verification succeeds. fabric-update fills it from the bring-up
-// passthrough verifier; fabric-security fills the same interface from
-// pico2-a-b/imagev1.
+// Manifest is the small subset of the signed-image manifest that updater
+// staging needs after verification succeeds. The full canonical manifest lives
+// in pico2-a-b/imagev1; this type is the local interface carried across the
+// staging -> updater -> state/self/updater pipeline.
 type Manifest struct {
 	Version       string
 	BuildID       string
@@ -31,17 +31,18 @@ type SlotSink interface {
 	Abort() error
 }
 
-// Verifier is updater/main staging's verification hook. Tests may pass fakes,
-// production wiring supplies an explicit verifier, and nil Options.Verifier
-// falls back to the rejecting StubVerifier.
+// Verifier is updater/main staging's hook into signed-image verification.
+// Production wiring uses SignedImageVerifier; tests may pass fakes, and nil
+// Options.Verifier falls back to the rejecting StubVerifier.
 type Verifier interface {
 	// Verify reads the artefact bytes from r, validates the signed
 	// envelope (header + manifest + signature), and on success streams
 	// the verified payload into sink. Returns the trusted manifest the
 	// staging path propagates to the staged descriptor and software fact.
 	//
-	// On failure: sink.Abort is called by the verifier itself before
-	// returning so staging doesn't have to special-case it.
+	// On success, Verify owns sink.Commit before it returns the manifest. On
+	// failure, Verify owns sink.Abort before returning so staging does not
+	// have a second sink finalization path.
 	Verify(r io.Reader, sink SlotSink) (Manifest, error)
 }
 

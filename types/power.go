@@ -37,6 +37,15 @@ type ChargerValue struct {
 	Sys     uint16 `json:"sys"`    // raw SYSTEM_STATUS bits
 }
 
+// Retained value: hal/cap/power/charger_config/<name>/value
+type ChargerConfigValue struct {
+	Source              string `json:"source"`
+	VinLo_mV            int32  `json:"vin_lo_mV"`
+	VinHi_mV            int32  `json:"vin_hi_mV"`
+	BSRHigh_uOhmPerCell uint32 `json:"bsr_high_uohm_per_cell"`
+	AlertMaskBits       uint16 `json:"alert_mask_bits"`
+}
+
 // Controls
 type ChargerEnable struct{ On bool }           // verb: "enable"
 type SetInputLimit struct{ MilliA int32 }      // verb: "set_input_limit"
