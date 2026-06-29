@@ -725,6 +725,41 @@ func (p *rp2SerialPort) RXBufferCap() int {
 	return int(p.u.Buffer.Size())
 }
 
+func (p *rp2SerialPort) RXDropCount() uint32 {
+	if p.u == nil {
+		return 0
+	}
+	return p.u.RXDropCount()
+}
+
+func (p *rp2SerialPort) RXOverrunCount() uint32 {
+	if p.u == nil {
+		return 0
+	}
+	return p.u.RXOverrunCount()
+}
+
+func (p *rp2SerialPort) RXBreakCount() uint32 {
+	if p.u == nil {
+		return 0
+	}
+	return p.u.RXBreakCount()
+}
+
+func (p *rp2SerialPort) RXParityCount() uint32 {
+	if p.u == nil {
+		return 0
+	}
+	return p.u.RXParityCount()
+}
+
+func (p *rp2SerialPort) RXFramingCount() uint32 {
+	if p.u == nil {
+		return 0
+	}
+	return p.u.RXFramingCount()
+}
+
 func (p *rp2SerialPort) SetBaudRate(br uint32) error { p.u.SetBaudRate(br); return nil }
 
 // Parity strings: "none","even","odd"

@@ -3,6 +3,7 @@ package updater
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,11 +14,53 @@ import (
 	"time"
 
 	"devicecode-go/bus"
+	"devicecode-go/services/otadiag"
+	"pico2-a-b/imagev1"
 )
 
 // ---- helpers --------------------------------------------------------
 
 func newTestBus() *bus.Bus { return bus.NewBus(8, "+", "#") }
+
+type updaterDiagCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func captureUpdaterDiag(t *testing.T) *updaterDiagCapture {
+	t.Helper()
+	c := &updaterDiagCapture{}
+	restore := otadiag.SetSinkForTest(func(line string) {
+		c.mu.Lock()
+		c.lines = append(c.lines, line)
+		c.mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return c
+}
+
+func (c *updaterDiagCapture) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...)
+}
+
+func assertUpdaterDiagContains(t *testing.T, lines []string, want ...string) {
+	t.Helper()
+	for _, line := range lines {
+		ok := true
+		for _, part := range want {
+			if !strings.Contains(line, part) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+	}
+	t.Fatalf("diagnostics missing %v in:\n%s", want, strings.Join(lines, "\n"))
+}
 
 type fakeVerifierAccept struct {
 	manifest Manifest
@@ -474,6 +517,37 @@ func TestPrepareTransitionsToReady(t *testing.T) {
 	}
 }
 
+func TestPrepareEmitsGenerationBreadcrumbs(t *testing.T) {
+	diag := captureUpdaterDiag(t)
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+
+	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{
+		Target:          PrepareTargetMCU,
+		JobID:           "job-diag",
+		ExpectedImageID: "image-diag",
+	}, false)
+	replySub := caller.Request(req)
+	defer caller.Unsubscribe(replySub)
+	select {
+	case msg := <-replySub.Channel():
+		if _, ok := msg.Payload.(PrepareReply); !ok {
+			t.Fatalf("prepare reply = %#v, want PrepareReply", msg.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for prepare reply")
+	}
+
+	lines := diag.snapshot()
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_rx", "job_id job-diag", "expected_image_id image-diag")
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_generation", "generation 1")
+	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_done", "generation 1")
+}
+
 func prepareUpdaterForLease(t *testing.T, caller *bus.Connection) {
 	t.Helper()
 	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
@@ -590,6 +664,73 @@ func TestPrepareAndCommitRejectWhileStreamLeaseActive(t *testing.T) {
 	commitReply, ok := commitPayload.(Reply)
 	if !ok || commitReply.OK || commitReply.Error != ErrBusy {
 		t.Fatalf("commit while stream active = %#v, want busy", commitPayload)
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnBufferedCommit(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-commit", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	if err := CommitBufferedStage("xfer-hook-commit", gen); err != nil {
+		t.Fatalf("CommitBufferedStage: %v", err)
+	}
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after buffered commit")
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnAbort(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-abort", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	AbortStreamedStage("xfer-hook-abort", gen, "test_abort")
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after abort")
+	}
+}
+
+func TestStreamedStageDiagHookClearsOnCommitError(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	_, cancel := runService(t, b, Options{Conn: conn})
+	defer cancel()
+	prepareUpdaterForLease(t, caller)
+	gen, err := BeginStreamedStage("xfer-hook-commit-error", 4)
+	if err != nil {
+		t.Fatalf("BeginStreamedStage: %v", err)
+	}
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
+	}
+	if _, err := CommitStreamedStage("xfer-hook-commit-error", gen); err == nil {
+		t.Fatal("CommitStreamedStage returned nil error, want host streamed_stage_not_supported")
+	}
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("diagnostic hook still active after commit error")
 	}
 }
 
@@ -828,6 +969,50 @@ func TestCommitWithoutStagedStateRefusesEvenWithDescriptor(t *testing.T) {
 	}
 }
 
+func TestCommitUsesPreparedExpectedImageOverCommitPayload(t *testing.T) {
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+
+	memMD := NewMemoryMetadata()
+	if err := memMD.WriteStagedDescriptor(StagedDescriptor{
+		Version:       "9.9.9",
+		BuildID:       "build-b",
+		ImageID:       "image-B",
+		Length:        4096,
+		Slot:          1,
+		PayloadSHA256: strings.Repeat("b", 64),
+	}); err != nil {
+		t.Fatalf("write staged descriptor: %v", err)
+	}
+	app := &fakeApplier{rebootCh: make(chan StagedDescriptor, 1)}
+	svc, cancel := runService(t, b, Options{
+		Conn:          conn,
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+		Applier:       app,
+	})
+	defer cancel()
+
+	svc.setJobContext("job-image-a", "image-A")
+	svc.transitionTo(StateStaged, "", "9.9.9")
+
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{ExpectedImageID: "image-B"})
+	reply, ok := payload.(Reply)
+	if !ok || reply.OK || reply.Error != ErrTargetMismatch {
+		t.Fatalf("commit reply = %#v, want target mismatch", payload)
+	}
+	canCalls, rebootCalls := app.callCounts()
+	if canCalls != 0 || rebootCalls != 0 {
+		t.Fatalf("applier called despite target mismatch: can=%d reboot=%d", canCalls, rebootCalls)
+	}
+	select {
+	case d := <-app.rebootCh:
+		t.Fatalf("unexpected reboot descriptor: %+v", d)
+	default:
+	}
+}
+
 func TestCommitWithoutApplierReturnsApplyUnavailable(t *testing.T) {
 	// Spec safety: the commit RPC must not claim success when the MCU
 	// has no apply hook wired (the production default RefusingApplier
@@ -1058,6 +1243,81 @@ func TestStageStubVerifierPublishesFailed(t *testing.T) {
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
 	if !strings.Contains(strValue(up.LastError), "verifier_stub") {
 		t.Fatalf("last_error = %q, want stub sentinel", strValue(up.LastError))
+	}
+}
+
+func TestStageSignedImageVerifierWritesManifestDescriptor(t *testing.T) {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+	target := imagev1.Target{
+		ProductFamily:   "bigbox",
+		HardwareProfile: "bb-v1-cm5-2",
+		MCUBoardFamily:  "rp2354a",
+	}
+	artefact, _, err := imagev1.Pack([]byte("signed payload"), imagev1.PackOptions{
+		Target:  target,
+		Version: "13.0",
+		BuildID: "build-13.0",
+		ImageID: "mcu-dev-13.0",
+		KeyID:   "test-key",
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldProduct := SignedImageProductFamily
+	oldProfile := SignedImageHardwareProfile
+	oldBoard := SignedImageMCUBoardFamily
+	oldKeyID := SignedImageTrustedKeyID
+	oldKey := SignedImageTrustedPublicKey
+	defer func() {
+		SignedImageProductFamily = oldProduct
+		SignedImageHardwareProfile = oldProfile
+		SignedImageMCUBoardFamily = oldBoard
+		SignedImageTrustedKeyID = oldKeyID
+		SignedImageTrustedPublicKey = oldKey
+	}()
+	SignedImageProductFamily = target.ProductFamily
+	SignedImageHardwareProfile = target.HardwareProfile
+	SignedImageMCUBoardFamily = target.MCUBoardFamily
+	SignedImageTrustedKeyID = "test-key"
+	SignedImageTrustedPublicKey = hex.EncodeToString(pub)
+
+	b := newTestBus()
+	conn := b.NewConnection("updater")
+	caller := b.NewConnection("caller")
+	memMD := NewMemoryMetadata()
+	svc, cancel := runService(t, b, Options{
+		Conn:          conn,
+		Verifier:      SignedImageVerifier(),
+		Metadata:      memMD,
+		MetadataWrite: memMD,
+	})
+	defer cancel()
+
+	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "signed-xfer", artefact), false)
+	replySub := caller.Request(req)
+	defer caller.Unsubscribe(replySub)
+	select {
+	case msg := <-replySub.Channel():
+		reply, _ := msg.Payload.(StageReply)
+		if !reply.OK {
+			t.Fatalf("stage reply not ok: %+v", reply)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for stage reply")
+	}
+
+	desc, ok := memMD.StagedDescriptor()
+	if !ok {
+		t.Fatal("staged descriptor not persisted")
+	}
+	if desc.Version != "13.0" || desc.BuildID != "build-13.0" || desc.ImageID != "mcu-dev-13.0" {
+		t.Fatalf("descriptor wrong: %+v", desc)
+	}
+	if desc.Length != uint32(len("signed payload")) || len(desc.PayloadSHA256) != 64 {
+		t.Fatalf("descriptor payload metadata wrong: %+v", desc)
 	}
 }
 

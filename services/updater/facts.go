@@ -1,5 +1,11 @@
 package updater
 
+import (
+	"time"
+
+	"devicecode-go/services/otadiag"
+)
+
 // PublishSoftware emits the retained state/self/software fact with the
 // build identity + the per-boot RAM-only boot_id + the persisted
 // payload_sha256 (when abupdate has populated it). Callers don't pass
@@ -45,8 +51,29 @@ func (s *Service) PublishUpdater() {
 		JobID:          strPtrOrNil(s.jobID),
 		BootBuyRC:      int32PtrOrNil(s.bootBuyRC),
 	}
+	snap := s.diagSnapshotLocked()
 	s.mu.Unlock()
+	setDiagSnapshot(snap)
+	active := otadiag.WindowActive()
+	start := time.Now()
+	if active {
+		otadiag.Event(
+			"[updater-stream]", "publish_updater_start", snap.XferID,
+			otadiag.KV("state", snap.State),
+			otadiag.KV("generation", snap.Generation),
+			otadiag.KV("lease_active", snap.LeaseActive),
+		)
+	}
 	s.conn.Publish(s.conn.NewMessage(TopicUpdaterFact, fact, true))
+	if active {
+		otadiag.Event(
+			"[updater-stream]", "publish_updater_done", snap.XferID,
+			otadiag.KV("state", snap.State),
+			otadiag.KV("generation", snap.Generation),
+			otadiag.KV("lease_active", snap.LeaseActive),
+			otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
+		)
+	}
 }
 
 // PublishHealth emits the retained state/self/health fact. Reason is

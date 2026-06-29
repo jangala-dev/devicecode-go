@@ -2,12 +2,14 @@ package serial_raw
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"devicecode-go/services/hal/internal/core"
+	"devicecode-go/services/otadiag"
 	"devicecode-go/types"
 )
 
@@ -20,6 +22,13 @@ type fakeSerialPort struct {
 	readCalls    atomic.Int32
 	maxReadLen   atomic.Int32
 	maxWriteLen  atomic.Int32
+	rxBuffered   atomic.Int32
+	rxBufferCap  atomic.Int32
+	rxDrops      atomic.Uint32
+	rxOverrun    atomic.Uint32
+	rxBreak      atomic.Uint32
+	rxParity     atomic.Uint32
+	rxFraming    atomic.Uint32
 
 	mu      sync.Mutex
 	written []byte
@@ -34,6 +43,14 @@ func newFakeSerialPort() *fakeSerialPort {
 	p.signalWritable()
 	return p
 }
+
+func (p *fakeSerialPort) RXBuffered() int        { return int(p.rxBuffered.Load()) }
+func (p *fakeSerialPort) RXBufferCap() int       { return int(p.rxBufferCap.Load()) }
+func (p *fakeSerialPort) RXDropCount() uint32    { return p.rxDrops.Load() }
+func (p *fakeSerialPort) RXOverrunCount() uint32 { return p.rxOverrun.Load() }
+func (p *fakeSerialPort) RXBreakCount() uint32   { return p.rxBreak.Load() }
+func (p *fakeSerialPort) RXParityCount() uint32  { return p.rxParity.Load() }
+func (p *fakeSerialPort) RXFramingCount() uint32 { return p.rxFraming.Load() }
 
 func (p *fakeSerialPort) TryRead(dst []byte) int {
 	p.readCalls.Add(1)
@@ -131,6 +148,52 @@ func waitUntil(t *testing.T, timeout time.Duration, pred func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func TestDriverPressureLogIncludesPumpEvidence(t *testing.T) {
+	port := newFakeSerialPort()
+	port.rxBuffered.Store(128)
+	port.rxBufferCap.Store(128)
+	port.rxDrops.Store(3)
+	port.rxOverrun.Store(2)
+	port.rxFraming.Store(1)
+	dev := newTestDevice(port)
+	dev.startSession(512, 512)
+	defer dev.stopSession()
+
+	s := dev.sess
+	s.lastRXPumpAt = time.Now().Add(-50 * time.Millisecond)
+	s.lastRXPumpMoved = 0
+	s.lastRXPumpDurMS = 0
+	s.lastRXPumpGapMS = 50
+
+	var lines []string
+	restore := otadiag.SetSinkForTest(func(line string) {
+		lines = append(lines, line)
+	})
+	defer restore()
+
+	dev.logDriverPressure(s, true)
+
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"[serial-raw]",
+		"ev rx_driver_pressure",
+		"uart uart1",
+		"driver_used 128",
+		"driver_cap 128",
+		"ring_space 512",
+		"since_rx_pump_ms",
+		"last_pump_gap_ms 50",
+		"rx_drops 3",
+		"rx_overrun 2",
+		"rx_framing 1",
+		"ev rx_pump_gap",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("pressure log missing %q:\n%s", want, joined)
+		}
+	}
 }
 
 func TestReactorServicesTXWhileRXIsContinuous(t *testing.T) {

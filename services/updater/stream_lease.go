@@ -3,6 +3,9 @@ package updater
 import (
 	"errors"
 	"sync"
+	"time"
+
+	"devicecode-go/services/otadiag"
 )
 
 var (
@@ -33,23 +36,90 @@ func currentService() *Service {
 // last successful prepare-update call. Fabric calls this from xfer_begin before
 // any sink mutates flash or buffers transfer state.
 func BeginStreamedStage(xferID string, size uint32) (uint64, error) {
+	beginAt := time.Now()
+	otadiag.SetActiveXfer(xferID)
+	otadiag.Event("[updater-stream]", "begin_entry", xferID, otadiag.KV("size", size))
 	s := currentService()
 	if s == nil {
+		otadiag.Event(
+			"[updater-stream]", "begin_error", xferID,
+			otadiag.KV("err", "updater_not_running"),
+			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
+		)
+		otadiag.StopUpdateWindow("updater_not_running")
 		return 0, errors.New("updater_not_running")
 	}
 	gen, err := s.beginStreamedStageLease(xferID)
 	if err != nil {
+		otadiag.Event(
+			"[updater-stream]", "lease_error", xferID,
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
+		)
 		return 0, err
 	}
-	if err := startStreamedStage(size); err != nil {
+	otadiag.Event("[updater-stream]", "lease_ok", xferID, otadiag.KV("generation", gen))
+	installABUpdateDiagHook(xferID, gen)
+	startAt := time.Now()
+	otadiag.Event(
+		"[updater-stream]", "start_entry", xferID,
+		otadiag.KV("generation", gen),
+		otadiag.KV("size", size),
+	)
+	if err := startStreamedStage(xferID, gen, size); err != nil {
+		otadiag.Event(
+			"[updater-stream]", "start_error", xferID,
+			otadiag.KV("generation", gen),
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("dur_ms", int(time.Since(startAt)/time.Millisecond)),
+		)
+		clearABUpdateDiagHook()
 		s.cancelStreamedStageLease(xferID, gen, err.Error())
+		otadiag.Event(
+			"[updater-stream]", "begin_error", xferID,
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("generation", gen),
+			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
+		)
+		otadiag.StopUpdateWindow("start_streamed_stage_error")
 		return 0, err
 	}
+	otadiag.Event(
+		"[updater-stream]", "start_exit", xferID,
+		otadiag.KV("generation", gen),
+		otadiag.KV("dur_ms", int(time.Since(startAt)/time.Millisecond)),
+	)
+	markAt := time.Now()
+	otadiag.Event("[updater-stream]", "mark_receiving_entry", xferID, otadiag.KV("generation", gen))
 	if err := s.markStreamedStageReceiving(xferID, gen); err != nil {
+		otadiag.Event(
+			"[updater-stream]", "mark_receiving_error", xferID,
+			otadiag.KV("generation", gen),
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("dur_ms", int(time.Since(markAt)/time.Millisecond)),
+		)
 		abortStreamedStage()
+		clearABUpdateDiagHook()
 		s.cancelStreamedStageLease(xferID, gen, err.Error())
+		otadiag.Event(
+			"[updater-stream]", "begin_error", xferID,
+			otadiag.KV("err", err.Error()),
+			otadiag.KV("generation", gen),
+			otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
+		)
+		otadiag.StopUpdateWindow("mark_receiving_error")
 		return 0, err
 	}
+	otadiag.Event(
+		"[updater-stream]", "mark_receiving_exit", xferID,
+		otadiag.KV("generation", gen),
+		otadiag.KV("dur_ms", int(time.Since(markAt)/time.Millisecond)),
+	)
+	otadiag.Event(
+		"[updater-stream]", "begin_exit", xferID,
+		otadiag.KV("generation", gen),
+		otadiag.KV("dur_ms", int(time.Since(beginAt)/time.Millisecond)),
+	)
 	return gen, nil
 }
 
@@ -61,7 +131,7 @@ func WriteStreamedStage(xferID string, generation uint64, data []byte) error {
 	if err := s.checkStreamedStageLease(xferID, generation, false); err != nil {
 		return err
 	}
-	return writeStreamedStage(data)
+	return writeStreamedStage(xferID, generation, data)
 }
 
 func CommitStreamedStage(xferID string, generation uint64) (uint32, error) {
@@ -72,7 +142,8 @@ func CommitStreamedStage(xferID string, generation uint64) (uint32, error) {
 	if err := s.checkStreamedStageLease(xferID, generation, false); err != nil {
 		return 0, err
 	}
-	staged, err := commitStreamedStage()
+	staged, err := commitStreamedStage(xferID, generation)
+	clearABUpdateDiagHook()
 	if err != nil {
 		s.cancelStreamedStageLease(xferID, generation, err.Error())
 		return 0, err
@@ -89,11 +160,16 @@ func CommitBufferedStage(xferID string, generation uint64) error {
 	if s == nil {
 		return errors.New("updater_not_running")
 	}
-	return s.markStreamedStageCommitted(xferID, generation)
+	if err := s.markStreamedStageCommitted(xferID, generation); err != nil {
+		return err
+	}
+	clearABUpdateDiagHook()
+	return nil
 }
 
 func AbortStreamedStage(xferID string, generation uint64, reason string) {
 	abortStreamedStage()
+	clearABUpdateDiagHook()
 	if s := currentService(); s != nil {
 		s.cancelStreamedStageLease(xferID, generation, reason)
 	}
@@ -121,23 +197,28 @@ func (s *Service) beginStreamedStageLease(xferID string) (uint64, error) {
 		return 0, errors.New("bad_message:xfer_id")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.preparing ||
 		s.state == StatePreparing ||
 		s.state == StateCommitting ||
 		s.state == StateRebooting ||
 		s.state == StateReceiving ||
 		s.streamLeaseActive {
+		s.mu.Unlock()
 		return 0, errors.New(ErrBusy)
 	}
 	if s.state != StateReady || s.stageGeneration == 0 {
+		s.mu.Unlock()
 		return 0, errors.New("stage_not_prepared")
 	}
 	s.streamLeaseActive = true
 	s.streamXferID = xferID
 	s.streamCancelled = false
 	s.streamCommitted = false
-	return s.stageGeneration, nil
+	snap := s.diagSnapshotLocked()
+	gen := s.stageGeneration
+	s.mu.Unlock()
+	setDiagSnapshot(snap)
+	return gen, nil
 }
 
 func (s *Service) markStreamedStageReceiving(xferID string, generation uint64) error {
@@ -157,7 +238,7 @@ func (s *Service) markStreamedStageReceiving(xferID string, generation uint64) e
 	s.state = StateReceiving
 	s.lastError = ""
 	s.mu.Unlock()
-	s.PublishUpdater()
+	s.PublishCriticalFacts()
 	return nil
 }
 
@@ -215,10 +296,12 @@ func (s *Service) cancelStreamedStageLease(xferID string, generation uint64, rea
 			s.lastError = reason
 		}
 	}
+	snap := s.diagSnapshotLocked()
 	s.mu.Unlock()
+	setDiagSnapshot(snap)
 	if matches {
 		_ = s.metadataWrite.ClearStagedDescriptor()
-		s.PublishUpdater()
+		s.PublishCriticalFacts()
 	}
 	return matches
 }
