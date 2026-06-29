@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -14,53 +15,12 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/otadiag"
-	"pico2-a-b/imagev1"
+	"pico2-a-b/signedimage"
 )
 
 // ---- helpers --------------------------------------------------------
 
 func newTestBus() *bus.Bus { return bus.NewBus(8, "+", "#") }
-
-type updaterDiagCapture struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-func captureUpdaterDiag(t *testing.T) *updaterDiagCapture {
-	t.Helper()
-	c := &updaterDiagCapture{}
-	restore := otadiag.SetSinkForTest(func(line string) {
-		c.mu.Lock()
-		c.lines = append(c.lines, line)
-		c.mu.Unlock()
-	})
-	t.Cleanup(restore)
-	return c
-}
-
-func (c *updaterDiagCapture) snapshot() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]string(nil), c.lines...)
-}
-
-func assertUpdaterDiagContains(t *testing.T, lines []string, want ...string) {
-	t.Helper()
-	for _, line := range lines {
-		ok := true
-		for _, part := range want {
-			if !strings.Contains(line, part) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return
-		}
-	}
-	t.Fatalf("diagnostics missing %v in:\n%s", want, strings.Join(lines, "\n"))
-}
 
 type fakeVerifierAccept struct {
 	manifest Manifest
@@ -115,7 +75,7 @@ func (f *failingClearMetadata) ClearStagedDescriptor() error {
 // fakeApplier always succeeds — used by tests that need the commit RPC
 // to drive the state machine through committing/rebooting without
 // actually rebooting (production wiring uses RefusingApplier so the
-// commit RPC returns apply_unavailable until the real abupdate-backed
+// commit RPC returns commit_failed until the real abupdate-backed
 // implementation is supplied).
 //
 // canCalls and rebootCalls are kept separate so tests can verify the commit
@@ -220,8 +180,8 @@ func waitForFact[T any](t *testing.T, sub *bus.Subscription, want func(T) bool) 
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case msg := <-sub.Channel():
-			if msg == nil {
+		case msg, ok := <-sub.Channel():
+			if !ok {
 				continue
 			}
 			fact, ok := msg.Payload.(T)
@@ -255,25 +215,8 @@ func drainSubscription(sub *bus.Subscription) {
 	}
 }
 
-func publishTestLinkState(conn *bus.Connection, ready bool, peerSID, localSID string) {
-	conn.Publish(conn.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{
-			"ready":       ready,
-			"established": ready,
-			"peer_sid":    peerSID,
-			"local_sid":   localSID,
-		},
-		true,
-	))
-}
-
-func testCriticalRepublishConfig() CriticalRepublishConfig {
-	return CriticalRepublishConfig{
-		BurstInterval:  20 * time.Millisecond,
-		BurstDuration:  45 * time.Millisecond,
-		SteadyInterval: 30 * time.Millisecond,
-	}
+func testCriticalFactConfig() CriticalFactConfig {
+	return CriticalFactConfig{LivenessInterval: 30 * time.Millisecond}
 }
 
 func strValue(p *string) string {
@@ -298,42 +241,42 @@ func testStagePayload(id string, artefact []byte) StagePayload {
 		Size:      uint32(len(artefact)),
 		DigestAlg: DigestAlgXXHash32,
 		Digest:    "deadbeef",
-		Artefact:  artefact,
 	}
+}
+
+func preparedStreamedStageLease(t *testing.T, caller *bus.Connection, svc *Service, id string, artefact []byte) (StagePayload, uint64) {
+	t.Helper()
+	preparePayload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	switch reply := preparePayload.(type) {
+	case PrepareReply:
+		if !reply.Ready {
+			t.Fatalf("prepare reply not ready: %+v", reply)
+		}
+	case Reply:
+		t.Fatalf("prepare failed: %+v", reply)
+	default:
+		t.Fatalf("prepare payload type = %T", preparePayload)
+	}
+	generation, err := svc.BeginStreamedStage(id, uint32(len(artefact)))
+	if err != nil {
+		t.Fatalf("begin streamed stage: %v", err)
+	}
+	if len(artefact) > 0 {
+		if err := svc.WriteStreamedStage(id, generation, artefact); err != nil {
+			t.Fatalf("write streamed stage: %v", err)
+		}
+	}
+	payload := testStagePayload(id, artefact)
+	payload.Generation = generation
+	return payload, generation
 }
 
 func preparedStagePayload(t *testing.T, caller *bus.Connection, svc *Service, id string, artefact []byte) StagePayload {
 	t.Helper()
-	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	sub := caller.Request(req)
-	defer caller.Unsubscribe(sub)
-	select {
-	case msg := <-sub.Channel():
-		if msg == nil {
-			t.Fatal("nil prepare reply")
-		}
-		switch reply := msg.Payload.(type) {
-		case PrepareReply:
-			if !reply.Ready {
-				t.Fatalf("prepare reply not ready: %+v", reply)
-			}
-		case Reply:
-			t.Fatalf("prepare failed: %+v", reply)
-		default:
-			t.Fatalf("prepare payload type = %T", msg.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for prepare reply")
+	payload, generation := preparedStreamedStageLease(t, caller, svc, id, artefact)
+	if _, err := svc.CommitStreamedStage(id, generation); err != nil {
+		t.Fatalf("commit streamed stage: %v", err)
 	}
-	generation, err := svc.beginStreamedStageLease(id)
-	if err != nil {
-		t.Fatalf("begin stage lease: %v", err)
-	}
-	if err := svc.markStreamedStageCommitted(id, generation); err != nil {
-		t.Fatalf("commit stage lease: %v", err)
-	}
-	payload := testStagePayload(id, artefact)
-	payload.Generation = generation
 	return payload
 }
 
@@ -356,10 +299,7 @@ func runService(t *testing.T, b *bus.Bus, opts Options) (*Service, context.Cance
 	ctx, cancel := context.WithCancel(context.Background())
 	go svc.Run(ctx)
 	select {
-	case msg := <-probe.Channel():
-		if msg == nil {
-			t.Fatal("nil software fact at boot")
-		}
+	case <-probe.Channel():
 	case <-time.After(2 * time.Second):
 		cancel()
 		t.Fatal("updater service did not publish initial software fact")
@@ -426,7 +366,7 @@ func TestBootBuyFailurePublishesInitialUpdaterFailure(t *testing.T) {
 	}
 }
 
-func TestBootBuyFailureRepublishPreservesFields(t *testing.T) {
+func TestBootBuyFailureLivenessPreservesFields(t *testing.T) {
 	b := newTestBus()
 	conn := b.NewConnection("updater")
 	observer := b.NewConnection("observer")
@@ -436,23 +376,25 @@ func TestBootBuyFailureRepublishPreservesFields(t *testing.T) {
 	_, cancel := runService(t, b, Options{
 		Conn:      conn,
 		BootBuyRC: -7,
+		CriticalFacts: CriticalFactConfig{
+			LivenessInterval: 25 * time.Millisecond,
+		},
 	})
 	defer cancel()
 
-	_ = waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
-
-	publisher := b.NewConnection("fabric-test")
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
-		true,
-	))
+	initial := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
+	if strValue(initial.LastError) != ErrABUpdateBuyFailed {
+		t.Fatalf("initial last_error = %q, want %q", strValue(initial.LastError), ErrABUpdateBuyFailed)
+	}
+	if int32Value(initial.BootBuyRC) != -7 {
+		t.Fatalf("initial boot_buy_rc = %d, want -7", int32Value(initial.BootBuyRC))
+	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool {
 		return f.State == StateFailed && int32Value(f.BootBuyRC) == -7
 	})
 	if strValue(up.LastError) != ErrABUpdateBuyFailed {
-		t.Fatalf("last_error = %q, want %q", strValue(up.LastError), ErrABUpdateBuyFailed)
+		t.Fatalf("liveness last_error = %q, want %q", strValue(up.LastError), ErrABUpdateBuyFailed)
 	}
 }
 
@@ -494,21 +436,13 @@ func TestPrepareTransitionsToReady(t *testing.T) {
 	// drain initial running fact
 	_ = waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateRunning })
 
-	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-
-	select {
-	case msg := <-replySub.Channel():
-		reply, ok := msg.Payload.(PrepareReply)
-		if !ok {
-			t.Fatalf("reply payload type = %T", msg.Payload)
-		}
-		if !reply.Ready || reply.Target != TargetUpdaterMain || reply.MaxChunkSize != DefaultMaxChunkSize {
-			t.Fatalf("prepare reply = %+v, want ready target max_chunk_size", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for prepare reply")
+	payload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	reply, ok := payload.(PrepareReply)
+	if !ok {
+		t.Fatalf("reply payload type = %T", payload)
+	}
+	if !reply.Ready || reply.Target != TargetUpdaterMain || reply.MaxChunkSize != DefaultMaxChunkSize {
+		t.Fatalf("prepare reply = %+v, want ready target max_chunk_size", reply)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateReady })
@@ -517,81 +451,45 @@ func TestPrepareTransitionsToReady(t *testing.T) {
 	}
 }
 
-func TestPrepareEmitsGenerationBreadcrumbs(t *testing.T) {
-	diag := captureUpdaterDiag(t)
-	b := newTestBus()
-	conn := b.NewConnection("updater")
-	caller := b.NewConnection("caller")
-
-	_, cancel := runService(t, b, Options{Conn: conn})
-	defer cancel()
-
-	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{
-		Target:          PrepareTargetMCU,
-		JobID:           "job-diag",
-		ExpectedImageID: "image-diag",
-	}, false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-	select {
-	case msg := <-replySub.Channel():
-		if _, ok := msg.Payload.(PrepareReply); !ok {
-			t.Fatalf("prepare reply = %#v, want PrepareReply", msg.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for prepare reply")
-	}
-
-	lines := diag.snapshot()
-	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_rx", "job_id job-diag", "expected_image_id image-diag")
-	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_generation", "generation 1")
-	assertUpdaterDiagContains(t, lines, "[updater-stream]", "xfer_id -", "ev prepare_done", "generation 1")
-}
-
 func prepareUpdaterForLease(t *testing.T, caller *bus.Connection) {
 	t.Helper()
-	req := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	sub := caller.Request(req)
-	defer caller.Unsubscribe(sub)
-	select {
-	case msg := <-sub.Channel():
-		if msg == nil {
-			t.Fatal("nil prepare reply")
-		}
-		reply, ok := msg.Payload.(PrepareReply)
-		if !ok || !reply.Ready {
-			t.Fatalf("prepare reply = %#v, want ready", msg.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for prepare reply")
+	payload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	reply, ok := payload.(PrepareReply)
+	if !ok || !reply.Ready {
+		t.Fatalf("prepare reply = %#v, want ready", payload)
 	}
 }
 
 func requestUpdaterReply(t *testing.T, caller *bus.Connection, topic bus.Topic, payload any) any {
 	t.Helper()
-	msg := caller.NewMessage(topic, payload, false)
-	sub := caller.Request(msg)
-	defer caller.Unsubscribe(sub)
-	select {
-	case rep := <-sub.Channel():
-		if rep == nil {
-			t.Fatal("nil reply")
-		}
-		return rep.Payload
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for reply")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	reply, err := caller.Call(ctx, topic, payload)
+	if err != nil {
+		t.Fatalf("endpoint call %s failed: %v", topicString(topic), err)
 	}
-	return nil
+	return reply
+}
+
+func topicString(tp bus.Topic) string { return fmt.Sprint(tp) }
+
+func TestStreamedStageControllerRequiresUpdaterRun(t *testing.T) {
+	b := newTestBus()
+	svc := New(Options{Conn: b.NewConnection("updater")})
+
+	if gen, err := svc.BeginStreamedStage("xfer-not-running", 4); err == nil || err.Error() != "updater_not_running" || gen != 0 {
+		t.Fatalf("BeginStreamedStage before Run = gen=%d err=%v, want updater_not_running", gen, err)
+	}
 }
 
 func TestBeginStreamedStageBeforePrepareReturnsStageNotPrepared(t *testing.T) {
 	b := newTestBus()
 	conn := b.NewConnection("updater")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 
-	if gen, err := BeginStreamedStage("xfer-before-prepare", 4); err == nil || err.Error() != "stage_not_prepared" || gen != 0 {
+	if gen, err := svc.BeginStreamedStage("xfer-before-prepare", 4); err == nil || err.Error() != "stage_not_prepared" || gen != 0 {
 		t.Fatalf("BeginStreamedStage before prepare = gen=%d err=%v, want stage_not_prepared", gen, err)
 	}
 }
@@ -605,7 +503,7 @@ func TestPrepareOpensSingleReceivingStreamLeaseAndClearsStaleDescriptor(t *testi
 
 	memMD := NewMemoryMetadata()
 	_ = memMD.WriteStagedDescriptor(StagedDescriptor{Version: "old", ImageID: "old-image", PayloadSHA256: "old"})
-	_, cancel := runService(t, b, Options{Conn: conn, Metadata: memMD, MetadataWrite: memMD})
+	svc, cancel := runService(t, b, Options{Conn: conn, Metadata: memMD, MetadataWrite: memMD})
 	defer cancel()
 
 	prepareUpdaterForLease(t, caller)
@@ -613,30 +511,30 @@ func TestPrepareOpensSingleReceivingStreamLeaseAndClearsStaleDescriptor(t *testi
 		t.Fatal("prepare did not clear stale staged descriptor")
 	}
 
-	gen, err := BeginStreamedStage("xfer-lease", 4)
+	gen, err := svc.BeginStreamedStage("xfer-lease", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
 	if gen == 0 {
 		t.Fatal("BeginStreamedStage returned generation 0")
 	}
-	defer CancelStreamedStage("xfer-lease", gen, "test_done")
+	defer svc.CancelStreamedStage("xfer-lease", gen, "test_done")
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateReceiving })
 	if strValue(up.LastError) != "" {
 		t.Fatalf("receiving last_error = %q, want empty", strValue(up.LastError))
 	}
 
-	if _, err := BeginStreamedStage("xfer-second", 4); err == nil || err.Error() != ErrBusy {
+	if _, err := svc.BeginStreamedStage("xfer-second", 4); err == nil || err.Error() != ErrBusy {
 		t.Fatalf("second BeginStreamedStage err = %v, want busy", err)
 	}
-	if err := CommitBufferedStage("wrong-xfer", gen); err == nil || err.Error() != "stage_generation_mismatch" {
-		t.Fatalf("wrong xfer CommitBufferedStage err = %v, want generation mismatch", err)
+	if err := svc.markStreamedStageCommitted("wrong-xfer", gen); err == nil || err.Error() != "stage_generation_mismatch" {
+		t.Fatalf("wrong xfer markStreamedStageCommitted err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-lease", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
-		t.Fatalf("wrong generation CommitBufferedStage err = %v, want generation mismatch", err)
+	if err := svc.markStreamedStageCommitted("xfer-lease", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
+		t.Fatalf("wrong generation markStreamedStageCommitted err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-lease", gen); err != nil {
-		t.Fatalf("matching CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-lease", gen); err != nil {
+		t.Fatalf("matching markStreamedStageCommitted: %v", err)
 	}
 }
 
@@ -645,14 +543,14 @@ func TestPrepareAndCommitRejectWhileStreamLeaseActive(t *testing.T) {
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-active", 4)
+	gen, err := svc.BeginStreamedStage("xfer-active", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	defer CancelStreamedStage("xfer-active", gen, "test_done")
+	defer svc.CancelStreamedStage("xfer-active", gen, "test_done")
 
 	prepPayload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
 	prepReply, ok := prepPayload.(Reply)
@@ -667,26 +565,40 @@ func TestPrepareAndCommitRejectWhileStreamLeaseActive(t *testing.T) {
 	}
 }
 
-func TestStreamedStageDiagHookClearsOnBufferedCommit(t *testing.T) {
+func TestStreamedStageDiagHookClearsOnCommittedStage(t *testing.T) {
 	b := newTestBus()
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-hook-commit", 4)
+	gen, err := svc.BeginStreamedStage("xfer-hook-commit", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
 	if !abupdateDiagHookActiveForTest() {
 		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
 	}
-	if err := CommitBufferedStage("xfer-hook-commit", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-hook-commit", gen); err != nil {
+		t.Fatalf("markStreamedStageCommitted: %v", err)
 	}
+	clearABUpdateDiagHook()
 	if abupdateDiagHookActiveForTest() {
-		t.Fatal("diagnostic hook still active after buffered commit")
+		t.Fatal("diagnostic hook still active after committed stage")
+	}
+}
+
+func TestStreamedStageDiagHookClearIsLeaseScoped(t *testing.T) {
+	clearABUpdateDiagHook()
+	installABUpdateDiagHook("current-xfer", 2)
+	clearABUpdateDiagHookFor("stale-xfer", 1)
+	if !abupdateDiagHookActiveForTest() {
+		t.Fatal("stale generation cleared current diagnostic hook")
+	}
+	clearABUpdateDiagHookFor("current-xfer", 2)
+	if abupdateDiagHookActiveForTest() {
+		t.Fatal("matching generation did not clear diagnostic hook")
 	}
 }
 
@@ -695,17 +607,17 @@ func TestStreamedStageDiagHookClearsOnAbort(t *testing.T) {
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-hook-abort", 4)
+	gen, err := svc.BeginStreamedStage("xfer-hook-abort", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
 	if !abupdateDiagHookActiveForTest() {
 		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
 	}
-	AbortStreamedStage("xfer-hook-abort", gen, "test_abort")
+	svc.AbortStreamedStage("xfer-hook-abort", gen, "test_abort")
 	if abupdateDiagHookActiveForTest() {
 		t.Fatal("diagnostic hook still active after abort")
 	}
@@ -716,17 +628,17 @@ func TestStreamedStageDiagHookClearsOnCommitError(t *testing.T) {
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
 
-	_, cancel := runService(t, b, Options{Conn: conn})
+	svc, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-hook-commit-error", 4)
+	gen, err := svc.BeginStreamedStage("xfer-hook-commit-error", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
 	if !abupdateDiagHookActiveForTest() {
 		t.Fatal("diagnostic hook inactive after BeginStreamedStage")
 	}
-	if _, err := CommitStreamedStage("xfer-hook-commit-error", gen); err == nil {
+	if _, err := svc.CommitStreamedStage("xfer-hook-commit-error", gen); err == nil {
 		t.Fatal("CommitStreamedStage returned nil error, want host streamed_stage_not_supported")
 	}
 	if abupdateDiagHookActiveForTest() {
@@ -765,7 +677,7 @@ func TestCancelStreamedStagePreventsLateStageSuccess(t *testing.T) {
 		PayloadLength: 4,
 	}}
 
-	_, cancel := runService(t, b, Options{
+	svc, cancel := runService(t, b, Options{
 		Conn:          conn,
 		Verifier:      verif,
 		Metadata:      memMD,
@@ -773,14 +685,14 @@ func TestCancelStreamedStagePreventsLateStageSuccess(t *testing.T) {
 	})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-cancel", 4)
+	gen, err := svc.BeginStreamedStage("xfer-cancel", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	if err := CommitBufferedStage("xfer-cancel", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.markStreamedStageCommitted("xfer-cancel", gen); err != nil {
+		t.Fatalf("markStreamedStageCommitted: %v", err)
 	}
-	CancelStreamedStage("xfer-cancel", gen, "test_cancel")
+	svc.CancelStreamedStage("xfer-cancel", gen, "test_cancel")
 
 	stage := testStagePayload("xfer-cancel", []byte("blob"))
 	stage.Generation = gen
@@ -810,7 +722,7 @@ func TestReleasedStagedLeaseIgnoresLateCancel(t *testing.T) {
 		PayloadLength: 4,
 	}}
 
-	_, cancel := runService(t, b, Options{
+	svc, cancel := runService(t, b, Options{
 		Conn:          conn,
 		Verifier:      verif,
 		Applier:       app,
@@ -819,12 +731,15 @@ func TestReleasedStagedLeaseIgnoresLateCancel(t *testing.T) {
 	})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-released", 4)
+	gen, err := svc.BeginStreamedStage("xfer-released", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	if err := CommitBufferedStage("xfer-released", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.WriteStreamedStage("xfer-released", gen, []byte("blob")); err != nil {
+		t.Fatalf("WriteStreamedStage: %v", err)
+	}
+	if _, err := svc.CommitStreamedStage("xfer-released", gen); err != nil {
+		t.Fatalf("CommitStreamedStage: %v", err)
 	}
 
 	stage := testStagePayload("xfer-released", []byte("blob"))
@@ -839,7 +754,7 @@ func TestReleasedStagedLeaseIgnoresLateCancel(t *testing.T) {
 		t.Fatal("stage did not persist descriptor")
 	}
 
-	CancelStreamedStage("xfer-released", gen, "late_cancel")
+	svc.CancelStreamedStage("xfer-released", gen, "late_cancel")
 	if _, ok := memMD.StagedDescriptor(); !ok {
 		t.Fatal("late cancel cleared released staged descriptor")
 	}
@@ -863,7 +778,7 @@ func TestStaleGenerationAndWrongXferCannotMutateStreamedStage(t *testing.T) {
 		PayloadLength: 4,
 	}}
 
-	_, cancel := runService(t, b, Options{
+	svc, cancel := runService(t, b, Options{
 		Conn:          conn,
 		Verifier:      verif,
 		Metadata:      memMD,
@@ -871,20 +786,23 @@ func TestStaleGenerationAndWrongXferCannotMutateStreamedStage(t *testing.T) {
 	})
 	defer cancel()
 	prepareUpdaterForLease(t, caller)
-	gen, err := BeginStreamedStage("xfer-current", 4)
+	gen, err := svc.BeginStreamedStage("xfer-current", 4)
 	if err != nil {
 		t.Fatalf("BeginStreamedStage: %v", err)
 	}
-	defer CancelStreamedStage("xfer-current", gen, "test_done")
+	defer svc.CancelStreamedStage("xfer-current", gen, "test_done")
 
-	if err := WriteStreamedStage("wrong-xfer", gen, []byte("data")); err == nil || err.Error() != "stage_generation_mismatch" {
+	if err := svc.WriteStreamedStage("wrong-xfer", gen, []byte("data")); err == nil || err.Error() != "stage_generation_mismatch" {
 		t.Fatalf("wrong xfer WriteStreamedStage err = %v, want generation mismatch", err)
 	}
-	if _, err := CommitStreamedStage("xfer-current", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
+	if _, err := svc.CommitStreamedStage("xfer-current", gen+1); err == nil || err.Error() != "stage_generation_mismatch" {
 		t.Fatalf("stale generation CommitStreamedStage err = %v, want generation mismatch", err)
 	}
-	if err := CommitBufferedStage("xfer-current", gen); err != nil {
-		t.Fatalf("CommitBufferedStage: %v", err)
+	if err := svc.WriteStreamedStage("xfer-current", gen, []byte("data")); err != nil {
+		t.Fatalf("WriteStreamedStage: %v", err)
+	}
+	if _, err := svc.CommitStreamedStage("xfer-current", gen); err != nil {
+		t.Fatalf("CommitStreamedStage: %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -918,24 +836,16 @@ func TestCommitWithoutStagedReturnsNothingStaged(t *testing.T) {
 	_, cancel := runService(t, b, Options{Conn: conn})
 	defer cancel()
 
-	req := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-
-	select {
-	case msg := <-replySub.Channel():
-		reply, ok := msg.Payload.(Reply)
-		if !ok {
-			t.Fatalf("reply payload type = %T", msg.Payload)
-		}
-		if reply.OK {
-			t.Fatalf("commit unexpectedly OK without staged image: %+v", reply)
-		}
-		if reply.Error != ErrNothingStaged {
-			t.Fatalf("commit error = %q, want %q", reply.Error, ErrNothingStaged)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for commit reply")
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, ok := payload.(Reply)
+	if !ok {
+		t.Fatalf("reply payload type = %T", payload)
+	}
+	if reply.OK {
+		t.Fatalf("commit unexpectedly OK without staged image: %+v", reply)
+	}
+	if reply.Error != ErrNoStagedImage {
+		t.Fatalf("commit error = %q, want %q", reply.Error, ErrNoStagedImage)
 	}
 }
 
@@ -955,17 +865,10 @@ func TestCommitWithoutStagedStateRefusesEvenWithDescriptor(t *testing.T) {
 	_, cancel := runService(t, b, Options{Conn: conn, Metadata: md, Applier: &fakeApplier{}})
 	defer cancel()
 
-	req := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-	select {
-	case msg := <-replySub.Channel():
-		reply, _ := msg.Payload.(Reply)
-		if reply.OK || reply.Error != ErrNothingStaged {
-			t.Fatalf("commit reply = %+v, want refusal=nothing_staged", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for commit reply")
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, _ := payload.(Reply)
+	if reply.OK || reply.Error != ErrNoStagedImage {
+		t.Fatalf("commit reply = %+v, want refusal=no_staged_image", reply)
 	}
 }
 
@@ -999,8 +902,8 @@ func TestCommitUsesPreparedExpectedImageOverCommitPayload(t *testing.T) {
 
 	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{ExpectedImageID: "image-B"})
 	reply, ok := payload.(Reply)
-	if !ok || reply.OK || reply.Error != ErrTargetMismatch {
-		t.Fatalf("commit reply = %#v, want target mismatch", payload)
+	if !ok || reply.OK || reply.Error != ErrImageIDMismatch {
+		t.Fatalf("commit reply = %#v, want image id mismatch", payload)
 	}
 	canCalls, rebootCalls := app.callCounts()
 	if canCalls != 0 || rebootCalls != 0 {
@@ -1037,22 +940,12 @@ func TestCommitWithoutApplierReturnsApplyUnavailable(t *testing.T) {
 	defer cancel()
 
 	// Drive updater/main staging to staged state.
-	rreq := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-x", []byte("blob")), false)
-	rsub := caller.Request(rreq)
-	defer caller.Unsubscribe(rsub)
-	<-rsub.Channel()
+	_ = requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-x", []byte("blob")))
 
-	creq := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	csub := caller.Request(creq)
-	defer caller.Unsubscribe(csub)
-	select {
-	case msg := <-csub.Channel():
-		reply, _ := msg.Payload.(Reply)
-		if reply.OK || reply.Error != ErrApplyUnavailable {
-			t.Fatalf("commit reply = %+v, want refusal=apply_unavailable", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for commit reply")
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, _ := payload.(Reply)
+	if reply.OK || reply.Error != ErrApplyUnavailable {
+		t.Fatalf("commit reply = %+v, want refusal=commit_failed", reply)
 	}
 
 	// State must NOT have transitioned to committing/rebooting — that would lie.
@@ -1092,21 +985,13 @@ func TestCommitWithFakeApplierTransitionsToRebooting(t *testing.T) {
 	defer cancel()
 
 	// Stage via updater/main.
-	rreq := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "x", []byte("blob")), false)
-	<-caller.Request(rreq).Channel()
+	_ = requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "x", []byte("blob")))
 
 	// Commit.
-	creq := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	csub := caller.Request(creq)
-	defer caller.Unsubscribe(csub)
-	select {
-	case msg := <-csub.Channel():
-		reply, _ := msg.Payload.(CommitReply)
-		if !reply.Accepted || !reply.RebootRequired {
-			t.Fatalf("commit reply = %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, _ := payload.(CommitReply)
+	if !reply.Accepted || !reply.RebootRequired {
+		t.Fatalf("commit reply = %+v", reply)
 	}
 
 	select {
@@ -1154,20 +1039,12 @@ func TestCommitApplyRebootErrorPublishesFailedAfterAcceptedReply(t *testing.T) {
 	})
 	defer cancel()
 
-	rreq := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "x", []byte("blob")), false)
-	<-caller.Request(rreq).Channel()
+	_ = requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "x", []byte("blob")))
 
-	creq := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	csub := caller.Request(creq)
-	defer caller.Unsubscribe(csub)
-	select {
-	case msg := <-csub.Channel():
-		reply, _ := msg.Payload.(CommitReply)
-		if !reply.Accepted || !reply.RebootRequired {
-			t.Fatalf("commit reply = %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for commit reply")
+	payload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, _ := payload.(CommitReply)
+	if !reply.Accepted || !reply.RebootRequired {
+		t.Fatalf("commit reply = %+v", reply)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
@@ -1223,21 +1100,9 @@ func TestStageStubVerifierPublishesFailed(t *testing.T) {
 	svc, cancel := runService(t, b, Options{Conn: conn, Verifier: StubVerifier()})
 	defer cancel()
 
-	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-1", []byte("blob")), false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-
-	select {
-	case msg := <-replySub.Channel():
-		reply, ok := msg.Payload.(StageReply)
-		if !ok || reply.OK {
-			t.Fatalf("stage unexpectedly OK with stub: %+v", reply)
-		}
-		if !strings.Contains(reply.Err, "verifier_stub") {
-			t.Fatalf("stage err = %q, want stub sentinel", reply.Err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for stage reply")
+	_, generation := preparedStreamedStageLease(t, caller, svc, "xfer-1", []byte("blob"))
+	if _, err := svc.CommitStreamedStage("xfer-1", generation); err == nil || !strings.Contains(err.Error(), "verifier_stub") {
+		t.Fatalf("commit streamed stage err = %v, want stub sentinel", err)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
@@ -1250,12 +1115,12 @@ func TestStageSignedImageVerifierWritesManifestDescriptor(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
 	priv := ed25519.NewKeyFromSeed(seed)
 	pub := priv.Public().(ed25519.PublicKey)
-	target := imagev1.Target{
+	target := signedimage.Target{
 		ProductFamily:   "bigbox",
 		HardwareProfile: "bb-v1-cm5-2",
 		MCUBoardFamily:  "rp2354a",
 	}
-	artefact, _, err := imagev1.Pack([]byte("signed payload"), imagev1.PackOptions{
+	artefact, _, err := signedimage.Pack([]byte("signed payload"), signedimage.PackOptions{
 		Target:  target,
 		Version: "13.0",
 		BuildID: "build-13.0",
@@ -1296,17 +1161,10 @@ func TestStageSignedImageVerifierWritesManifestDescriptor(t *testing.T) {
 	})
 	defer cancel()
 
-	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "signed-xfer", artefact), false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-	select {
-	case msg := <-replySub.Channel():
-		reply, _ := msg.Payload.(StageReply)
-		if !reply.OK {
-			t.Fatalf("stage reply not ok: %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for stage reply")
+	payload := requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "signed-xfer", artefact))
+	reply, _ := payload.(StageReply)
+	if !reply.OK {
+		t.Fatalf("stage reply not ok: %+v", reply)
 	}
 
 	desc, ok := memMD.StagedDescriptor()
@@ -1350,17 +1208,10 @@ func TestStageFakeAcceptWritesStagedDescriptor(t *testing.T) {
 	defer cancel()
 
 	// Drive updater/main staging to verifier success.
-	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-w11", []byte("blob")), false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-	select {
-	case msg := <-replySub.Channel():
-		reply, _ := msg.Payload.(StageReply)
-		if !reply.OK {
-			t.Fatalf("stage reply not ok: %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for stage reply")
+	payload := requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-w11", []byte("blob")))
+	reply, _ := payload.(StageReply)
+	if !reply.OK {
+		t.Fatalf("stage reply not ok: %+v", reply)
 	}
 
 	// Reader sees the staged descriptor + its embedded payload hash.
@@ -1380,17 +1231,10 @@ func TestStageFakeAcceptWritesStagedDescriptor(t *testing.T) {
 
 	// Commit RPC now succeeds because the reader sees the descriptor
 	// AND state is staged AND a real Applier is wired.
-	creq := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	csub := caller.Request(creq)
-	defer caller.Unsubscribe(csub)
-	select {
-	case msg := <-csub.Channel():
-		reply, _ := msg.Payload.(CommitReply)
-		if !reply.Accepted {
-			t.Fatalf("commit reply not ok: %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for commit reply")
+	commitPayload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	commitReply, _ := commitPayload.(CommitReply)
+	if !commitReply.Accepted {
+		t.Fatalf("commit reply not ok: %+v", commitReply)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateRebooting })
@@ -1401,11 +1245,13 @@ func TestStageFakeAcceptWritesStagedDescriptor(t *testing.T) {
 
 func TestStageFailureClearsStaleStagedDescriptor(t *testing.T) {
 	// A (stage A) -> (prepare for B) -> (stage B fails) flow must not leave
-	// descriptor A persisted. The next commit should return nothing_staged
+	// descriptor A persisted. The next commit should return no_staged_image
 	// rather than committing stale firmware.
 	b := newTestBus()
 	conn := b.NewConnection("updater")
 	caller := b.NewConnection("caller")
+	upSub := caller.Subscribe(TopicUpdaterFact)
+	defer caller.Unsubscribe(upSub)
 
 	// Pre-stage: a real descriptor sitting in metadata from an earlier
 	// successful flow.
@@ -1423,34 +1269,24 @@ func TestStageFailureClearsStaleStagedDescriptor(t *testing.T) {
 	})
 	defer cancel()
 
-	// Drive updater/main staging to failure.
-	rreq := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "x", []byte("blob")), false)
-	rsub := caller.Request(rreq)
-	defer caller.Unsubscribe(rsub)
-	select {
-	case <-rsub.Channel():
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	// Drive updater/main streamed staging to verifier failure.
+	_, generation := preparedStreamedStageLease(t, caller, svc, "x", []byte("blob"))
+	if _, err := svc.CommitStreamedStage("x", generation); err == nil || err.Error() != "bad_signature" {
+		t.Fatalf("commit streamed stage err = %v, want bad_signature", err)
 	}
+	_ = waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
 
 	// The stale descriptor must have been cleared.
 	if _, ok := memMD.StagedDescriptor(); ok {
 		t.Fatalf("stale staged descriptor survived receiver failure")
 	}
 
-	// Commit must refuse with nothing_staged rather than commit the
+	// Commit must refuse with no_staged_image rather than commit the
 	// stale image.
-	creq := caller.NewMessage(TopicCommitRPC, CommitRequest{}, false)
-	csub := caller.Request(creq)
-	defer caller.Unsubscribe(csub)
-	select {
-	case msg := <-csub.Channel():
-		reply, _ := msg.Payload.(Reply)
-		if reply.OK || reply.Error != ErrNothingStaged {
-			t.Fatalf("commit reply = %+v, want refusal=nothing_staged", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	commitPayload := requestUpdaterReply(t, caller, TopicCommitRPC, CommitRequest{})
+	reply, _ := commitPayload.(Reply)
+	if reply.OK || reply.Error != ErrNoStagedImage {
+		t.Fatalf("commit reply = %+v, want refusal=no_staged_image", reply)
 	}
 }
 
@@ -1473,17 +1309,10 @@ func TestPrepareClearsStaleStagedDescriptor(t *testing.T) {
 	})
 	defer cancel()
 
-	preq := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	psub := caller.Request(preq)
-	defer caller.Unsubscribe(psub)
-	select {
-	case msg := <-psub.Channel():
-		reply, _ := msg.Payload.(PrepareReply)
-		if !reply.Ready {
-			t.Fatalf("prepare reply = %+v", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	payload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	reply, _ := payload.(PrepareReply)
+	if !reply.Ready {
+		t.Fatalf("prepare reply = %+v", reply)
 	}
 
 	if _, ok := memMD.StagedDescriptor(); ok {
@@ -1512,20 +1341,13 @@ func TestPrepareClearFailureTransitionsToFailedAndAllowsRetry(t *testing.T) {
 
 	_ = waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateRunning })
 
-	preq := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	psub := caller.Request(preq)
-	defer caller.Unsubscribe(psub)
-	select {
-	case msg := <-psub.Channel():
-		reply, ok := msg.Payload.(Reply)
-		if !ok {
-			t.Fatalf("reply payload type = %T", msg.Payload)
-		}
-		if reply.OK || reply.Error != "metadata_clear_failed:flash_busy" {
-			t.Fatalf("prepare reply = %+v, want metadata clear failure", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for failed prepare reply")
+	payload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	reply, ok := payload.(Reply)
+	if !ok {
+		t.Fatalf("reply payload type = %T", payload)
+	}
+	if reply.OK || reply.Error != "metadata_clear_failed:flash_busy" {
+		t.Fatalf("prepare reply = %+v, want metadata clear failure", reply)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
@@ -1534,20 +1356,13 @@ func TestPrepareClearFailureTransitionsToFailedAndAllowsRetry(t *testing.T) {
 	}
 
 	failMD.err = nil
-	retry := caller.NewMessage(TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU}, false)
-	retrySub := caller.Request(retry)
-	defer caller.Unsubscribe(retrySub)
-	select {
-	case msg := <-retrySub.Channel():
-		reply, ok := msg.Payload.(PrepareReply)
-		if !ok {
-			t.Fatalf("retry reply payload type = %T", msg.Payload)
-		}
-		if !reply.Ready {
-			t.Fatalf("retry prepare reply = %+v, want ready", reply)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for retry prepare reply")
+	retryPayload := requestUpdaterReply(t, caller, TopicPrepareRPC, PrepareRequest{Target: PrepareTargetMCU})
+	retryReply, ok := retryPayload.(PrepareReply)
+	if !ok {
+		t.Fatalf("retry reply payload type = %T", retryPayload)
+	}
+	if !retryReply.Ready {
+		t.Fatalf("retry prepare reply = %+v, want ready", retryReply)
 	}
 }
 
@@ -1564,18 +1379,10 @@ func TestStageFakeAcceptPublishesStaged(t *testing.T) {
 	svc, cancel := runService(t, b, Options{Conn: conn, Verifier: verif})
 	defer cancel()
 
-	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-2", []byte("blob")), false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-
-	select {
-	case msg := <-replySub.Channel():
-		reply, ok := msg.Payload.(StageReply)
-		if !ok || !reply.OK || reply.Stage != "staged" {
-			t.Fatalf("stage reply = %+v ok-type=%v", reply, ok)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for stage reply")
+	payload := requestUpdaterReply(t, caller, TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-2", []byte("blob")))
+	reply, ok := payload.(StageReply)
+	if !ok || !reply.OK || reply.Stage != "staged" {
+		t.Fatalf("stage reply = %+v ok-type=%v", reply, ok)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateStaged })
@@ -1595,21 +1402,9 @@ func TestStageFakeRejectPublishesFailed(t *testing.T) {
 	svc, cancel := runService(t, b, Options{Conn: conn, Verifier: verif})
 	defer cancel()
 
-	req := caller.NewMessage(TopicStageRPC, preparedStagePayload(t, caller, svc, "xfer-3", []byte("blob")), false)
-	replySub := caller.Request(req)
-	defer caller.Unsubscribe(replySub)
-
-	select {
-	case msg := <-replySub.Channel():
-		reply, ok := msg.Payload.(StageReply)
-		if !ok || reply.OK {
-			t.Fatalf("stage unexpectedly OK: %+v", reply)
-		}
-		if reply.Err != "manifest_check_failed" {
-			t.Fatalf("stage err = %q, want manifest_check_failed", reply.Err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for stage reply")
+	_, generation := preparedStreamedStageLease(t, caller, svc, "xfer-3", []byte("blob"))
+	if _, err := svc.CommitStreamedStage("xfer-3", generation); err == nil || err.Error() != "manifest_check_failed" {
+		t.Fatalf("commit streamed stage err = %v, want manifest_check_failed", err)
 	}
 
 	up := waitForFact[UpdaterFact](t, upSub, func(f UpdaterFact) bool { return f.State == StateFailed })
@@ -1618,125 +1413,7 @@ func TestStageFakeRejectPublishesFailed(t *testing.T) {
 	}
 }
 
-func TestRepublishReasonTracksReadyAndSessionEdges(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		hadPrev bool
-		prev    linkObservation
-		cur     linkObservation
-		want    string
-	}{
-		{
-			name: "first ready",
-			cur:  linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			want: "ready_edge",
-		},
-		{
-			name:    "false to true",
-			hadPrev: true,
-			prev:    linkObservation{Ready: false, PeerSID: "peer-1", LocalSID: "local-1"},
-			cur:     linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			want:    "ready_edge",
-		},
-		{
-			name:    "same ready identity",
-			hadPrev: true,
-			prev:    linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			cur:     linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-		},
-		{
-			name:    "peer sid changed",
-			hadPrev: true,
-			prev:    linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			cur:     linkObservation{Ready: true, PeerSID: "peer-2", LocalSID: "local-1"},
-			want:    "peer_sid_changed",
-		},
-		{
-			name:    "local sid changed",
-			hadPrev: true,
-			prev:    linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			cur:     linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-2"},
-			want:    "local_sid_changed",
-		},
-		{
-			name:    "not ready",
-			hadPrev: true,
-			prev:    linkObservation{Ready: true, PeerSID: "peer-1", LocalSID: "local-1"},
-			cur:     linkObservation{Ready: false, PeerSID: "peer-2", LocalSID: "local-2"},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := republishReason(tc.prev, tc.cur, tc.hadPrev); got != tc.want {
-				t.Fatalf("republishReason() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRepublishOnLinkReadyAndSessionEdges(t *testing.T) {
-	// The updater republishes its retained state/self/* surface on every
-	// !Ready -> Ready transition, and on SID changes while Ready remains true.
-	b := newTestBus()
-	conn := b.NewConnection("updater")
-	observer := b.NewConnection("observer")
-	swSub := observer.Subscribe(TopicSoftwareFact)
-	defer observer.Unsubscribe(swSub)
-
-	_, cancel := runService(t, b, Options{Conn: conn})
-	defer cancel()
-
-	// Drain the initial software fact emitted on Run start.
-	_ = waitForFact[SoftwareFact](t, swSub, nil)
-
-	// Publish a link-state retain with Ready=false first; should not
-	// trigger a republish.
-	publisher := b.NewConnection("test-fabric")
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": false, "established": false, "peer_sid": "cm5-x", "local_sid": "mcu-a"},
-		true,
-	))
-	// Brief wait then drop everything that's already in the channel.
-	time.Sleep(50 * time.Millisecond)
-	for len(swSub.Channel()) > 0 {
-		<-swSub.Channel()
-	}
-
-	// Now flip Ready to true: the !Ready -> Ready edge MUST trigger a
-	// software-fact republish.
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-x", "local_sid": "mcu-a"},
-		true,
-	))
-	_ = waitForFact[SoftwareFact](t, swSub, nil)
-
-	// Subsequent Ready=true retain (no edge) should NOT trigger another
-	// immediate edge republish. The default level-triggered cadence does
-	// not fire inside this short settle window.
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-x", "local_sid": "mcu-a", "last_rx_ms": int64(123)},
-		true,
-	))
-	assertNoSoftwareRepublish(t, swSub, 150*time.Millisecond)
-
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-y", "local_sid": "mcu-a"},
-		true,
-	))
-	_ = waitForFact[SoftwareFact](t, swSub, nil)
-
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-y", "local_sid": "mcu-b"},
-		true,
-	))
-	_ = waitForFact[SoftwareFact](t, swSub, nil)
-}
-
-func TestCriticalFactsRepublishOnUpdaterStateChange(t *testing.T) {
+func TestCriticalFactsDedupOnUpdaterStateChange(t *testing.T) {
 	b := bus.NewBus(32, "+", "#")
 	conn := b.NewConnection("updater")
 	observer := b.NewConnection("observer")
@@ -1752,16 +1429,51 @@ func TestCriticalFactsRepublishOnUpdaterStateChange(t *testing.T) {
 	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
 
 	svc.transitionTo(StateReady, "", "")
-	_, up, h := waitForCriticalFactSet(t, swSub, upSub, hSub)
+	up := waitForFact[UpdaterFact](t, upSub, nil)
 	if up.State != StateReady {
 		t.Fatalf("updater state = %q, want %q", up.State, StateReady)
 	}
-	if h.State != "ok" {
-		t.Fatalf("health state = %q, want ok", h.State)
-	}
+	assertNoFact(t, swSub, 20*time.Millisecond, "software")
+	assertNoFact(t, hSub, 20*time.Millisecond, "health")
 }
 
-func TestCriticalRepublishCadenceWhileReady(t *testing.T) {
+func TestCriticalFactsDedupUntilLiveness(t *testing.T) {
+	b := bus.NewBus(32, "+", "#")
+	conn := b.NewConnection("updater")
+	observer := b.NewConnection("observer")
+	swSub := observer.Subscribe(TopicSoftwareFact)
+	defer observer.Unsubscribe(swSub)
+	upSub := observer.Subscribe(TopicUpdaterFact)
+	defer observer.Unsubscribe(upSub)
+	hSub := observer.Subscribe(TopicHealthFact)
+	defer observer.Unsubscribe(hSub)
+
+	svc := New(Options{
+		Conn: conn,
+		Identity: Identity{
+			Version: "0.0.0-test",
+			Build:   "build-test",
+			ImageID: "img-test",
+		},
+		CriticalFacts: CriticalFactConfig{
+			LivenessInterval: 25 * time.Millisecond,
+		},
+	})
+
+	svc.PublishCriticalFacts()
+	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
+
+	svc.PublishCriticalFacts()
+	assertNoFact(t, swSub, 10*time.Millisecond, "software")
+	assertNoFact(t, upSub, 10*time.Millisecond, "updater")
+	assertNoFact(t, hSub, 10*time.Millisecond, "health")
+
+	time.Sleep(30 * time.Millisecond)
+	svc.PublishCriticalFacts()
+	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
+}
+
+func TestCriticalFactLivenessCadence(t *testing.T) {
 	b := bus.NewBus(64, "+", "#")
 	conn := b.NewConnection("updater")
 	observer := b.NewConnection("observer")
@@ -1773,61 +1485,57 @@ func TestCriticalRepublishCadenceWhileReady(t *testing.T) {
 	defer observer.Unsubscribe(hSub)
 
 	_, cancel := runService(t, b, Options{
-		Conn:              conn,
-		CriticalRepublish: testCriticalRepublishConfig(),
+		Conn:          conn,
+		CriticalFacts: testCriticalFactConfig(),
 	})
 	defer cancel()
 	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
 
-	publisher := b.NewConnection("fabric-test")
-	publishTestLinkState(publisher, true, "cm5-a", "mcu-a")
-
-	// Ready edge publishes immediately, then the level-triggered cadence
-	// keeps publishing the three critical facts while the link remains ready.
-	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
-	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
+	assertNoFact(t, swSub, 15*time.Millisecond, "software")
 	_, _, _ = waitForCriticalFactSet(t, swSub, upSub, hSub)
 }
 
-func TestCriticalRepublishCadenceStopsWhenLinkNotReady(t *testing.T) {
-	b := bus.NewBus(32, "+", "#")
+func TestFabricLinkStateDoesNotTriggerUpdaterFacts(t *testing.T) {
+	b := bus.NewBus(64, "+", "#")
 	conn := b.NewConnection("updater")
 	observer := b.NewConnection("observer")
 	swSub := observer.Subscribe(TopicSoftwareFact)
 	defer observer.Unsubscribe(swSub)
 
 	_, cancel := runService(t, b, Options{
-		Conn: conn,
-		CriticalRepublish: CriticalRepublishConfig{
-			BurstInterval:  100 * time.Millisecond,
-			BurstDuration:  200 * time.Millisecond,
-			SteadyInterval: 100 * time.Millisecond,
-		},
+		Conn:          conn,
+		CriticalFacts: CriticalFactConfig{LivenessInterval: 100 * time.Millisecond},
 	})
 	defer cancel()
 	_ = waitForFact[SoftwareFact](t, swSub, nil)
-
-	publisher := b.NewConnection("fabric-test")
-	publishTestLinkState(publisher, true, "cm5-a", "mcu-a")
-	_ = waitForFact[SoftwareFact](t, swSub, nil)
-
-	publishTestLinkState(publisher, false, "cm5-a", "mcu-a")
-	time.Sleep(20 * time.Millisecond)
 	drainSubscription(swSub)
-	assertNoSoftwareRepublish(t, swSub, 150*time.Millisecond)
+
+	fabric := b.NewConnection("fabric-test")
+	fabric.Publish(fabric.NewMessage(
+		bus.T("state", "fabric", "link", "mcu-uart0"),
+		map[string]any{"ready": true, "established": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
+		true,
+	))
+
+	assertNoSoftwareRepublish(t, swSub, 40*time.Millisecond)
 }
 
-func assertNoSoftwareRepublish(t *testing.T, sub *bus.Subscription, d time.Duration) {
+func assertNoFact(t *testing.T, sub *bus.Subscription, d time.Duration, label string) {
 	t.Helper()
 	settled := time.After(d)
 	for {
 		select {
 		case <-sub.Channel():
-			t.Fatal("unexpected software fact republish")
+			t.Fatalf("unexpected %s fact republish", label)
 		case <-settled:
 			return
 		}
 	}
+}
+
+func assertNoSoftwareRepublish(t *testing.T, sub *bus.Subscription, d time.Duration) {
+	t.Helper()
+	assertNoFact(t, sub, d, "software")
 }
 
 // ---- jsonDecode robustness ------------------------------------------
@@ -1883,3 +1591,27 @@ func (e errString) Error() string { return string(e) }
 
 // Compile-time assert that bytes.NewReader satisfies the verifier API.
 var _ io.Reader = bytes.NewReader(nil)
+
+func TestDuplicateAcceptedCommitRequiresMatchingNonEmptyToken(t *testing.T) {
+	svc := &Service{
+		state:                     StateRebooting,
+		lastCommitJobID:           "job-1",
+		lastCommitExpectedImageID: "mcu-dev-1",
+		lastCommitImageID:         "mcu-dev-1",
+	}
+
+	if svc.duplicateAcceptedCommitLocked(CommitRequest{JobID: "job-1", ExpectedImageID: "mcu-dev-1"}) {
+		t.Fatal("duplicate commit without remembered token was accepted")
+	}
+
+	svc.lastCommitToken = "commit-token-1"
+	if svc.duplicateAcceptedCommitLocked(CommitRequest{JobID: "job-1", ExpectedImageID: "mcu-dev-1"}) {
+		t.Fatal("duplicate commit without request token was accepted")
+	}
+	if svc.duplicateAcceptedCommitLocked(CommitRequest{JobID: "job-1", ExpectedImageID: "mcu-dev-1", CommitToken: "other-token"}) {
+		t.Fatal("duplicate commit with mismatched token was accepted")
+	}
+	if !svc.duplicateAcceptedCommitLocked(CommitRequest{JobID: "job-1", ExpectedImageID: "mcu-dev-1", CommitToken: "commit-token-1"}) {
+		t.Fatal("duplicate commit with matching token was not accepted")
+	}
+}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -12,33 +11,54 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/otadiag"
 	"devicecode-go/services/updater"
 	"devicecode-go/x/xxhash"
 )
 
 type fakeTransferSink struct {
-	offs         []uint32
-	writes       [][]byte
-	writeErr     error
-	commitErr    error
-	applyErr     error
-	commitInfo   transferInfo
-	committed    bool
-	applied      bool
-	abortReasons []string
+	offs                []uint32
+	writes              [][]byte
+	writeErr            error
+	writeEntered        chan struct{}
+	writeEnterOnce      sync.Once
+	writeRelease        chan struct{}
+	commitErr           error
+	commitEntered       chan struct{}
+	commitEnterOnce     sync.Once
+	commitRelease       chan struct{}
+	applyErr            error
+	commitInfo          transferInfo
+	mutateDataAfterCopy bool
+	committed           bool
+	applied             bool
+	abortReasons        []string
 }
 
 func (s *fakeTransferSink) WriteChunk(off uint32, data []byte) error {
+	if s.writeEntered != nil {
+		s.writeEnterOnce.Do(func() { close(s.writeEntered) })
+	}
+	if s.writeRelease != nil {
+		<-s.writeRelease
+	}
 	if s.writeErr != nil {
 		return s.writeErr
 	}
 	s.offs = append(s.offs, off)
 	s.writes = append(s.writes, append([]byte(nil), data...))
+	if s.mutateDataAfterCopy && len(data) > 0 {
+		data[0] ^= 0xff
+	}
 	return nil
 }
 
 func (s *fakeTransferSink) Commit() (transferInfo, error) {
+	if s.commitEntered != nil {
+		s.commitEnterOnce.Do(func() { close(s.commitEntered) })
+	}
+	if s.commitRelease != nil {
+		<-s.commitRelease
+	}
 	if s.commitErr != nil {
 		return transferInfo{}, s.commitErr
 	}
@@ -56,141 +76,20 @@ func (s *fakeTransferSink) Abort(reason string) error {
 	return nil
 }
 
-// Bytes returns nil because the test fake doesn't retain a RAM copy
-// of the transferred bytes — it tracks per-chunk writes instead.
-func (s *fakeTransferSink) Bytes() []byte { return nil }
-
-type diagCapture struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-func captureOTADiag(t *testing.T) *diagCapture {
-	t.Helper()
-	c := &diagCapture{}
-	restore := otadiag.SetSinkForTest(func(line string) {
-		c.mu.Lock()
-		c.lines = append(c.lines, line)
-		c.mu.Unlock()
-	})
-	t.Cleanup(restore)
-	return c
-}
-
-func (c *diagCapture) snapshot() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]string(nil), c.lines...)
-}
-
-func assertDiagContains(t *testing.T, lines []string, want ...string) {
-	t.Helper()
-	for _, line := range lines {
-		matched := true
-		for _, part := range want {
-			if !strings.Contains(line, part) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return
-		}
-	}
-	t.Fatalf("diagnostics missing %v in:\n%s", want, strings.Join(lines, "\n"))
-}
-
-func waitDiagContains(t *testing.T, c *diagCapture, want ...string) {
+func waitAbortReason(t *testing.T, sink *fakeTransferSink, want string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
-		lines := c.snapshot()
-		for _, line := range lines {
-			matched := true
-			for _, part := range want {
-				if !strings.Contains(line, part) {
-					matched = false
-					break
-				}
+		if len(sink.abortReasons) > 0 {
+			if want != "" && sink.abortReasons[0] != want {
+				t.Fatalf("sink.Abort reasons = %v, want %q", sink.abortReasons, want)
 			}
-			if matched {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			assertDiagContains(t, lines, want...)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func assertDiagNotContains(t *testing.T, lines []string, want ...string) {
-	t.Helper()
-	for _, line := range lines {
-		matched := true
-		for _, part := range want {
-			if !strings.Contains(line, part) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			t.Fatalf("diagnostics unexpectedly contained %v in:\n%s", want, strings.Join(lines, "\n"))
-		}
-	}
-}
-
-func assertDiagOrder(t *testing.T, lines []string, wants ...[]string) {
-	t.Helper()
-	next := 0
-	for _, line := range lines {
-		if next >= len(wants) {
-			return
-		}
-		matched := true
-		for _, part := range wants[next] {
-			if !strings.Contains(line, part) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			next++
-		}
-	}
-	if next < len(wants) {
-		t.Fatalf("diagnostics missing ordered item %d %v in:\n%s", next, wants[next], strings.Join(lines, "\n"))
-	}
-}
-
-func waitDiagOrder(t *testing.T, c *diagCapture, wants ...[]string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for {
-		lines := c.snapshot()
-		next := 0
-		for _, line := range lines {
-			if next >= len(wants) {
-				return
-			}
-			matched := true
-			for _, part := range wants[next] {
-				if !strings.Contains(line, part) {
-					matched = false
-					break
-				}
-			}
-			if matched {
-				next++
-			}
-		}
-		if next >= len(wants) {
 			return
 		}
 		if time.Now().After(deadline) {
-			assertDiagOrder(t, lines, wants...)
+			t.Fatalf("timed out waiting for sink.Abort(%q); reasons=%v", want, sink.abortReasons)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -276,23 +175,17 @@ func xferCommit(id string, payload []byte) protoXferCommit {
 func installStageResponder(t *testing.T, b *bus.Bus, reply updater.StageReply) <-chan updater.StagePayload {
 	t.Helper()
 	conn := b.NewConnection("test-stage")
-	sub := conn.Subscribe(updater.TopicStageRPC)
-	t.Cleanup(func() { conn.Unsubscribe(sub) })
 	got := make(chan updater.StagePayload, 4)
-	go func() {
-		for msg := range sub.Channel() {
-			if msg == nil {
-				continue
+	binding := conn.Bind(updater.TopicStageRPC, func(ctx context.Context, payload any) (any, error) {
+		if p, ok := payload.(updater.StagePayload); ok {
+			select {
+			case got <- p:
+			default:
 			}
-			if payload, ok := msg.Payload.(updater.StagePayload); ok {
-				select {
-				case got <- payload:
-				default:
-				}
-			}
-			conn.Reply(msg, reply, false)
 		}
-	}()
+		return reply, nil
+	})
+	t.Cleanup(binding.Close)
 	return got
 }
 
@@ -311,11 +204,7 @@ func runUpdaterForFabricTest(t *testing.T, b *bus.Bus, opts updater.Options) (co
 	ctx, cancel := context.WithCancel(context.Background())
 	go svc.Run(ctx)
 	select {
-	case msg := <-probe.Channel():
-		if msg == nil {
-			cancel()
-			t.Fatal("nil initial updater software fact")
-		}
+	case <-probe.Channel():
 	case <-time.After(2 * time.Second):
 		cancel()
 		t.Fatal("timeout waiting for updater service start")
@@ -325,20 +214,13 @@ func runUpdaterForFabricTest(t *testing.T, b *bus.Bus, opts updater.Options) (co
 
 func prepareUpdaterForFabricTest(t *testing.T, conn *bus.Connection) {
 	t.Helper()
-	msg := conn.NewMessage(updater.TopicPrepareRPC, updater.PrepareRequest{Target: updater.PrepareTargetMCU}, false)
-	sub := conn.Request(msg)
-	defer conn.Unsubscribe(sub)
-	select {
-	case rep := <-sub.Channel():
-		if rep == nil {
-			t.Fatal("nil prepare reply")
-		}
-		reply, ok := rep.Payload.(updater.PrepareReply)
-		if !ok || !reply.Ready {
-			t.Fatalf("prepare reply = %#v, want ready", rep.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for prepare reply")
+	rep, err := conn.Call(context.Background(), updater.TopicPrepareRPC, updater.PrepareRequest{Target: updater.PrepareTargetMCU})
+	if err != nil {
+		t.Fatalf("prepare call failed: %v", err)
+	}
+	reply, ok := rep.(updater.PrepareReply)
+	if !ok || !reply.Ready {
+		t.Fatalf("prepare reply = %#v, want ready", rep)
 	}
 }
 
@@ -348,7 +230,7 @@ func waitUpdaterFactForFabricTest(t *testing.T, sub *bus.Subscription, want func
 	for {
 		select {
 		case msg := <-sub.Channel():
-			if msg == nil {
+			if false {
 				continue
 			}
 			fact, ok := msg.Payload.(updater.UpdaterFact)
@@ -363,19 +245,11 @@ func waitUpdaterFactForFabricTest(t *testing.T, sub *bus.Subscription, want func
 
 func requestUpdaterForFabricTest(t *testing.T, conn *bus.Connection, topic bus.Topic, payload any) any {
 	t.Helper()
-	msg := conn.NewMessage(topic, payload, false)
-	sub := conn.Request(msg)
-	defer conn.Unsubscribe(sub)
-	select {
-	case rep := <-sub.Channel():
-		if rep == nil {
-			t.Fatal("nil updater reply")
-		}
-		return rep.Payload
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for updater reply")
+	rep, err := conn.Call(context.Background(), topic, payload)
+	if err != nil {
+		t.Fatalf("updater call failed: %v", err)
 	}
-	return nil
+	return rep
 }
 
 func readTransferReady(t *testing.T, tr Transport, id string, next uint32) {
@@ -398,6 +272,49 @@ func readTransferNeed(t *testing.T, tr Transport, id string, next uint32) {
 	}
 }
 
+func readUntilTransferAbort(t *testing.T, tr Transport, id, reason string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for xfer_abort id=%s err=%s", id, reason)
+		}
+		lineCh := make(chan []byte, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			line, err := tr.ReadLine()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			lineCh <- append([]byte(nil), line...)
+		}()
+		var line []byte
+		select {
+		case line = <-lineCh:
+		case err := <-errCh:
+			t.Fatalf("ReadLine: %v", err)
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("timed out waiting for xfer_abort id=%s err=%s", id, reason)
+		}
+		var probe struct {
+			Type   string `json:"type"`
+			XferID string `json:"xfer_id"`
+			Err    string `json:"err"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			t.Fatalf("Unmarshal %q: %v", line, err)
+		}
+		if probe.Type != msgXferAbort {
+			continue
+		}
+		if probe.XferID != id || probe.Err != reason {
+			t.Fatalf("bad xfer_abort: %+v, want id=%s err=%s", probe, id, reason)
+		}
+		return
+	}
+}
+
 func readTransferAbort(t *testing.T, tr Transport, id, reason string) {
 	t.Helper()
 	abort := readMsg[protoXferAbort](t, tr)
@@ -413,11 +330,8 @@ func writeRawLine(t *testing.T, tr Transport, line string) {
 	}
 }
 
-func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
-	diag := captureOTADiag(t)
+func TestTransferBeginWithoutStageControllerAbortsNoReady(t *testing.T) {
 	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
-	defer cancelUpdater()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -426,93 +340,13 @@ func TestTransferBeginWithoutPrepareAbortsNoReady(t *testing.T) {
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-no-prepare", payload, nil))
-	abort := readMsg[protoXferAbort](t, cm5)
-	if abort.Type != msgXferAbort || abort.XferID != "xfer-no-prepare" || abort.Err != "stage_not_prepared" {
-		t.Fatalf("xfer_begin without prepare frame = %+v, want stage_not_prepared abort", abort)
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-no-prepare", "ev begin_transfer_error", "err stage_not_prepared", "abort_tx true")
-	waitDiagContains(t, diag, "[updater-stream]", "xfer_id xfer-no-prepare", "ev lease_error", "err stage_not_prepared")
-}
-
-func TestPreparedTransferBeginSendsReadyThenNeedZero(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
-	defer cancelUpdater()
-	caller := b.NewConnection("caller")
-	observer := b.NewConnection("observer")
-	upSub := observer.Subscribe(updater.TopicUpdaterFact)
-	defer observer.Unsubscribe(upSub)
-	prepareUpdaterForFabricTest(t, caller)
-
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
-	bringUp(t, cm5)
-
-	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-prepared", payload, nil))
-	readTransferReady(t, cm5, "xfer-prepared", 0)
-	waitUpdaterFactForFabricTest(t, upSub, func(f updater.UpdaterFact) bool {
-		return f.State == updater.StateReceiving
-	})
-	waitDiagOrder(t, diag,
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_route_start"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_rx"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_validate_ok", "target updater/main"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_transfer_start"},
-		[]string{"[updater-stream]", "xfer_id xfer-prepared", "ev begin_entry"},
-		[]string{"[updater-stream]", "xfer_id xfer-prepared", "ev begin_exit"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev begin_transfer_done"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev ready_tx", "ok true"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-prepared", "ev need_tx", "next 0", "ok true"},
-	)
-}
-
-func TestInvalidTransferBeginEmitsRejectDiagnosticNoActiveTransfer(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	beginCount := 0
-	s := session{
-		linkID:   defaultLinkID,
-		nodeID:   "mcu",
-		peerID:   "bigbox-cm5",
-		localSID: "mcu-sid-test",
-		tr:       mcu,
-		conn:     b.NewConnection("fabric"),
-		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			beginCount++
-			return &fakeTransferSink{}, nil
-		},
-	}
-	go s.run(ctx)
-	bringUp(t, cm5)
-
-	payload := []byte("abcd")
-	sendMsg(t, cm5, protoXferBegin{
-		Type:      msgXferBegin,
-		XferID:    "xfer-invalid",
-		Target:    "other/target",
-		Size:      uint32(len(payload)),
-		DigestAlg: updater.DigestAlgXXHash32,
-		Digest:    xxhashStr(payload),
-	})
-	readTransferAbort(t, cm5, "xfer-invalid", "bad_message: unsupported_target")
-	if beginCount != 0 {
-		t.Fatalf("beginTransfer called %d times for invalid begin, want 0", beginCount)
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-invalid", "ev begin_reject", "reason bad_message:unsupported_target", "abort_tx true")
+	sendMsg(t, cm5, xferBegin("xfer-no-controller", payload, nil))
+	readTransferAbort(t, cm5, "xfer-no-controller", "updater_stage_controller_missing")
 }
 
 func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 	b := newBus()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{})
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{})
 	defer cancelUpdater()
 	caller := b.NewConnection("caller")
 	observer := b.NewConnection("observer")
@@ -523,7 +357,7 @@ func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -542,7 +376,7 @@ func TestTransferAbortCancelsUpdaterLease(t *testing.T) {
 func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 	b := newBus()
 	memMD := updater.NewMemoryMetadata()
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{
 		Verifier:      updater.StubVerifier(),
 		Metadata:      memMD,
 		MetadataWrite: memMD,
@@ -554,7 +388,7 @@ func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig(), RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
@@ -574,8 +408,8 @@ func TestTransferTargetRejectCancelsLeaseAndPreventsCommit(t *testing.T) {
 
 	replyPayload := requestUpdaterForFabricTest(t, caller, updater.TopicCommitRPC, updater.CommitRequest{})
 	reply, ok := replyPayload.(updater.Reply)
-	if !ok || reply.OK || reply.Error != updater.ErrNothingStaged {
-		t.Fatalf("commit after rejected transfer = %#v, want nothing_staged", replyPayload)
+	if !ok || reply.OK || reply.Error != updater.ErrNoStagedImage {
+		t.Fatalf("commit after rejected transfer = %#v, want no_staged_image", replyPayload)
 	}
 }
 
@@ -701,172 +535,165 @@ func TestTransferReceiveSuccess(t *testing.T) {
 	}
 }
 
-func TestTransferAcceptedChunkEmitsProcessingDiagnostics(t *testing.T) {
-	diag := captureOTADiag(t)
+func TestTransferChunkWriteIsSynchronousBeforeNeed(t *testing.T) {
+	tr := &captureTransport{}
+	writeEntered := make(chan struct{})
+	writeRelease := make(chan struct{})
+	sink := &fakeTransferSink{writeEntered: writeEntered, writeRelease: writeRelease}
+	s := &session{
+		tr:  tr,
+		cfg: LinkConfig{PhaseTimeout: time.Second},
+		incomingTransfer: &incomingTransfer{
+			meta:     transferMeta{ID: "xfer-sync-write", Size: 8},
+			sink:     sink,
+			hasher:   xxhash.New(0),
+			deadline: time.Now().Add(time.Second),
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		s.onTransferChunk(&protoXferChunk{
+			Type:        msgXferChunk,
+			XferID:      "xfer-sync-write",
+			Offset:      0,
+			Data:        rawURL([]byte("abcd")),
+			ChunkDigest: xxhashStr([]byte("abcd")),
+		})
+		close(done)
+	}()
+
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("WriteChunk was not entered")
+	}
+	if len(tr.writes) != 0 {
+		t.Fatalf("xfer_need sent before WriteChunk returned: %d writes", len(tr.writes))
+	}
+	close(writeRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("onTransferChunk did not return after WriteChunk release")
+	}
+	if len(tr.writes) != 1 {
+		t.Fatalf("writes after accepted chunk = %d, want one xfer_need", len(tr.writes))
+	}
+	var need protoXferNeed
+	if err := json.Unmarshal(tr.writes[0], &need); err != nil {
+		t.Fatalf("decode xfer_need: %v", err)
+	}
+	if need.Type != msgXferNeed || need.XferID != "xfer-sync-write" || need.Next != 4 {
+		t.Fatalf("xfer_need = %+v, want next=4", need)
+	}
+	if len(sink.writes) != 1 || string(sink.writes[0]) != "abcd" {
+		t.Fatalf("sink writes = %q, want abcd", sink.writes)
+	}
+}
+
+func TestTransferCommitReturnsBeforeAsyncStageResult(t *testing.T) {
 	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{}
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
+	tr := &captureTransport{}
+	commitEntered := make(chan struct{})
+	commitRelease := make(chan struct{})
+	sink := &fakeTransferSink{
+		commitEntered: commitEntered,
+		commitRelease: commitRelease,
+		commitInfo:    transferInfo{BytesWritten: 4, Generation: 11},
+	}
+	gotStage := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
 	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-chunk-diag", payload, nil))
-	readTransferReady(t, cm5, "xfer-chunk-diag", 0)
-
-	sendMsg(t, cm5, xferChunk("xfer-chunk-diag", 0, payload))
-	need := readMsg[protoXferNeed](t, cm5)
-	if need.Next != uint32(len(payload)) {
-		t.Fatalf("xfer_need.next = %d, want %d", need.Next, len(payload))
+	s := &session{
+		linkID: defaultLinkID,
+		tr:     tr,
+		conn:   b.NewConnection("fabric"),
+		cfg:    LinkConfig{TargetCallTimeout: time.Second},
+		incomingTransfer: &incomingTransfer{
+			meta:         transferMeta{ID: "xfer-sync-commit", Target: updater.TargetUpdaterMain, Size: 4, DigestAlg: updater.DigestAlgXXHash32, Digest: xxhashStr(payload)},
+			sink:         sink,
+			bytesWritten: 4,
+			hasher:       xxhash.New(0),
+			deadline:     time.Now().Add(time.Second),
+		},
 	}
-	waitDiagOrder(t, diag,
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_rx", "offset 0", "expected 0"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_decode_done", "ok true", "raw_len 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev chunk_digest_done", "ok true"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_start", "offset 0", "raw_len 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev sink_write_done", "next 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_start", "next 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev gc_done", "next 4"},
-		[]string{"[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev need_tx", "next 4", "ok true", "accepted true"},
-	)
-	assertDiagNotContains(t, diag.snapshot(), "[fabric-xfer]", "xfer_id xfer-chunk-diag", "ev transfer_mem_sample")
+	_, _ = s.incomingTransfer.hasher.Write(payload)
+	done := make(chan struct{})
+	go func() {
+		s.onTransferCommit(&protoXferCommit{Type: msgXferCommit, XferID: "xfer-sync-commit", Size: 4, DigestAlg: updater.DigestAlgXXHash32, Digest: xxhashStr(payload)})
+		close(done)
+	}()
+
+	select {
+	case <-commitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Commit was not entered")
+	}
+	if s.pendingTargetCall != nil {
+		t.Fatal("stage call started before Commit returned")
+	}
+	if s.incomingTransfer == nil {
+		t.Fatal("active transfer cleared before Commit returned")
+	}
+	close(commitRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("onTransferCommit did not return after Commit release")
+	}
+	if !sink.committed {
+		t.Fatal("sink.Commit did not complete")
+	}
+	if s.incomingTransfer != nil {
+		t.Fatal("incoming transfer not cleared after successful Commit")
+	}
+	if s.pendingTargetCall == nil {
+		t.Fatal("pending target call missing before async stage result is handled")
+	}
+	select {
+	case p := <-gotStage:
+		if p.XferID != "xfer-sync-commit" {
+			t.Fatalf("stage xfer_id = %q, want xfer-sync-commit", p.XferID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for async stage call")
+	}
+	select {
+	case result := <-s.targetCallResults:
+		s.handleTargetCallResult(result)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for async stage result")
+	}
+	if s.pendingTargetCall != nil {
+		t.Fatalf("pending target call = %+v, want nil after async result", s.pendingTargetCall)
+	}
 }
 
-func TestTransferAcceptedChunkEmitsSparseMemorySample(t *testing.T) {
-	diag := captureOTADiag(t)
+func TestTransferCommitDigestUnaffectedBySinkMutatingWriteBuffer(t *testing.T) {
 	b := newBus()
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sink := &fakeTransferSink{}
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
-	payload := make([]byte, transferMemSampleStride)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	sendMsg(t, cm5, xferBegin("xfer-mem-diag", payload, nil))
-	readTransferReady(t, cm5, "xfer-mem-diag", 0)
-
-	const chunkSize = 2048
-	for off := 0; off < len(payload); off += chunkSize {
-		end := off + chunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		sendMsg(t, cm5, xferChunk("xfer-mem-diag", uint32(off), payload[off:end]))
-		need := readMsg[protoXferNeed](t, cm5)
-		if need.Next != uint32(end) {
-			t.Fatalf("xfer_need.next = %d, want %d", need.Next, end)
-		}
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-mem-diag", "ev transfer_mem_sample", "next 65536", "alloc", "heap")
-}
-
-func TestTransferChunkFutureOffsetRequestsCurrentAndCompletes(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{}
+	sink := &fakeTransferSink{mutateDataAfterCopy: true, commitInfo: transferInfo{BytesWritten: 4, Generation: 7}}
 	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
 	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
 	bringUp(t, cm5)
 
 	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-future-offset", payload, nil))
-	readTransferReady(t, cm5, "xfer-future-offset", 0)
-
-	sendMsg(t, cm5, xferChunk("xfer-future-offset", 7, payload))
-
-	need := readMsg[protoXferNeed](t, cm5)
-	if need.Type != msgXferNeed || need.XferID != "xfer-future-offset" || need.Next != 0 {
-		t.Fatalf("future offset retry xfer_need = %+v, want next=0", need)
+	sendMsg(t, cm5, xferBegin("xfer-mutating-sink", payload, nil))
+	readTransferReady(t, cm5, "xfer-mutating-sink", 0)
+	sendMsg(t, cm5, xferChunk("xfer-mutating-sink", 0, payload))
+	readTransferNeed(t, cm5, "xfer-mutating-sink", uint32(len(payload)))
+	sendMsg(t, cm5, xferCommit("xfer-mutating-sink", payload))
+	done := readMsg[protoXferDone](t, cm5)
+	if done.Type != msgXferDone || done.XferID != "xfer-mutating-sink" {
+		t.Fatalf("bad xfer_done after mutating sink: %+v", done)
 	}
-	if len(sink.writes) != 0 {
-		t.Fatalf("sink received %d writes, want 0", len(sink.writes))
+	if len(sink.writes) != 1 || string(sink.writes[0]) != string(payload) {
+		t.Fatalf("sink wrote %q, want %q", sink.writes, payload)
 	}
 	if len(sink.abortReasons) != 0 {
-		t.Fatalf("sink.Abort called on recoverable future offset: %v", sink.abortReasons)
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-future-offset", "ev chunk_future_offset", "offset 7", "expected 0")
-
-	sendMsg(t, cm5, xferChunk("xfer-future-offset", 0, payload))
-	need = readMsg[protoXferNeed](t, cm5)
-	if need.Next != uint32(len(payload)) {
-		t.Fatalf("xfer_need.next after recovery = %d, want %d", need.Next, len(payload))
-	}
-
-	sendMsg(t, cm5, xferCommit("xfer-future-offset", payload))
-	done := readMsg[protoXferDone](t, cm5)
-	if done.Type != msgXferDone || done.XferID != "xfer-future-offset" {
-		t.Fatalf("bad xfer_done: %+v", done)
-	}
-	if got := string(sink.writes[0]); got != string(payload) {
-		t.Fatalf("sink writes = %q, want %q", got, payload)
-	}
-	if !sink.committed {
-		t.Fatal("sink.Commit was not called")
-	}
-}
-
-func TestTransferChunkStaleOffsetRequestsCurrentAndCompletes(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{}
-	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
-	payload := []byte("abcdef")
-	sendMsg(t, cm5, xferBegin("xfer-stale-offset", payload, nil))
-	readTransferReady(t, cm5, "xfer-stale-offset", 0)
-
-	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 0, []byte("abc")))
-	need := readMsg[protoXferNeed](t, cm5)
-	if need.Next != 3 {
-		t.Fatalf("xfer_need.next after first chunk = %d, want 3", need.Next)
-	}
-
-	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 0, []byte("abc")))
-	need = readMsg[protoXferNeed](t, cm5)
-	if need.Type != msgXferNeed || need.XferID != "xfer-stale-offset" || need.Next != 3 {
-		t.Fatalf("stale offset retry xfer_need = %+v, want next=3", need)
-	}
-	if len(sink.writes) != 1 {
-		t.Fatalf("sink received %d writes after stale duplicate, want 1", len(sink.writes))
-	}
-	if len(sink.abortReasons) != 0 {
-		t.Fatalf("sink.Abort called on recoverable stale offset: %v", sink.abortReasons)
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-stale-offset", "ev chunk_stale_offset", "offset 0", "expected 3")
-
-	sendMsg(t, cm5, xferChunk("xfer-stale-offset", 3, []byte("def")))
-	need = readMsg[protoXferNeed](t, cm5)
-	if need.Next != uint32(len(payload)) {
-		t.Fatalf("xfer_need.next after recovery = %d, want %d", need.Next, len(payload))
-	}
-
-	sendMsg(t, cm5, xferCommit("xfer-stale-offset", payload))
-	done := readMsg[protoXferDone](t, cm5)
-	if done.Type != msgXferDone || done.XferID != "xfer-stale-offset" {
-		t.Fatalf("bad xfer_done: %+v", done)
-	}
-	if got := string(sink.writes[0]) + string(sink.writes[1]); got != string(payload) {
-		t.Fatalf("sink writes = %q, want %q", got, payload)
-	}
-	if !sink.committed {
-		t.Fatal("sink.Commit was not called")
+		t.Fatalf("sink aborted after mutating write buffer: %v", sink.abortReasons)
 	}
 }
 
@@ -930,11 +757,47 @@ func TestTransferCurrentCorruptChunkRefreshesLinkLiveness(t *testing.T) {
 	if !s.lastRxAt.After(oldRx) {
 		t.Fatalf("current corrupt chunk did not refresh liveness: got %v old %v", s.lastRxAt, oldRx)
 	}
-	if got := s.incomingTransfer.corruptRetriesAtOffset; got != 1 {
+	if got := s.incomingTransfer.retriesAtOffset; got != 1 {
 		t.Fatalf("corrupt retries = %d, want 1", got)
 	}
 	if len(tr.writes) != 1 {
 		t.Fatalf("current corrupt chunk wrote %d frames, want one retry xfer_need", len(tr.writes))
+	}
+}
+
+func TestTransferCorruptChunkDoesNotWriteOrAdvance(t *testing.T) {
+	tr := &captureTransport{}
+	sink := &fakeTransferSink{}
+	s := &session{
+		tr:  tr,
+		cfg: LinkConfig{PhaseTimeout: time.Second},
+		incomingTransfer: &incomingTransfer{
+			meta:     transferMeta{ID: "xfer-corrupt-no-advance", Size: 4},
+			sink:     sink,
+			hasher:   xxhash.New(0),
+			deadline: time.Now().Add(time.Second),
+		},
+	}
+
+	s.onTransferChunk(&protoXferChunk{
+		Type:        msgXferChunk,
+		XferID:      "xfer-corrupt-no-advance",
+		Offset:      0,
+		Data:        rawURL([]byte("abcd")),
+		ChunkDigest: "00000000",
+	})
+
+	if s.incomingTransfer == nil {
+		t.Fatal("corrupt chunk cleared active transfer before retry budget was exhausted")
+	}
+	if s.incomingTransfer.bytesWritten != 0 {
+		t.Fatalf("corrupt chunk advanced bytesWritten = %d, want 0", s.incomingTransfer.bytesWritten)
+	}
+	if len(sink.writes) != 0 {
+		t.Fatalf("corrupt chunk called WriteChunk %d times, want 0", len(sink.writes))
+	}
+	if len(tr.writes) != 1 {
+		t.Fatalf("corrupt chunk emitted %d frames, want one retry xfer_need", len(tr.writes))
 	}
 }
 
@@ -1009,9 +872,7 @@ func TestTransferChunkMissingDigestRetriesThenAborts(t *testing.T) {
 		Data:   rawURL(payload),
 	})
 	readTransferAbort(t, cm5, "xfer-missing-digest", "bad_message")
-	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink.Abort on missing chunk digest")
-	}
+	waitAbortReason(t, sink, "bad_message")
 }
 
 func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
@@ -1046,72 +907,7 @@ func TestTransferChunkInvalidBase64RetriesThenAborts(t *testing.T) {
 		ChunkDigest: xxhashStr(payload),
 	})
 	readTransferAbort(t, cm5, "xfer-bad-b64", "invalid_chunk_encoding")
-	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "invalid_chunk_encoding" {
-		t.Fatalf("sink.Abort reasons = %v, want invalid_chunk_encoding", sink.abortReasons)
-	}
-}
-
-func TestTransferChunkDigestMismatchRequestsSameOffset(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{}
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
-	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-bad-chunk-digest", payload, nil))
-	readTransferReady(t, cm5, "xfer-bad-chunk-digest", 0)
-
-	sendMsg(t, cm5, protoXferChunk{
-		Type:        msgXferChunk,
-		XferID:      "xfer-bad-chunk-digest",
-		Offset:      0,
-		Data:        rawURL(payload),
-		ChunkDigest: "00000000",
-	})
-	need := readMsg[protoXferNeed](t, cm5)
-	if need.Next != 0 {
-		t.Fatalf("retry xfer_need.next = %d, want 0", need.Next)
-	}
-	if len(sink.writes) != 0 {
-		t.Fatalf("sink received %d writes before digest passed", len(sink.writes))
-	}
-	lines := diag.snapshot()
-	assertDiagContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev chunk_digest_done", "ok false", "reason chunk_digest_mismatch")
-	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev sink_write_start")
-	assertDiagNotContains(t, lines, "[fabric-xfer]", "xfer_id xfer-bad-chunk-digest", "ev gc_start")
-
-	sendMsg(t, cm5, xferChunk("xfer-bad-chunk-digest", 0, payload))
-	need = readMsg[protoXferNeed](t, cm5)
-	if need.Next != uint32(len(payload)) {
-		t.Fatalf("xfer_need.next after retry = %d, want %d", need.Next, len(payload))
-	}
-}
-
-func TestTransferChunkWriteErrorEmitsAbortDiagnostic(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sink := &fakeTransferSink{writeErr: errors.New("write_boom")}
-	go runSessionWithSink(ctx, mcu, b.NewConnection("fabric"), sink)
-	bringUp(t, cm5)
-
-	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin("xfer-write-error", payload, nil))
-	readTransferReady(t, cm5, "xfer-write-error", 0)
-
-	sendMsg(t, cm5, xferChunk("xfer-write-error", 0, payload))
-	readTransferAbort(t, cm5, "xfer-write-error", "write_boom")
-
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-write-error", "ev sink_write_error", "reason write_boom")
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-write-error", "ev abort_tx", "reason write_boom", "ok true")
+	waitAbortReason(t, sink, "invalid_chunk_encoding")
 }
 
 func TestTransferChunkDigestMismatchRetriesThenAborts(t *testing.T) {
@@ -1216,7 +1012,7 @@ func TestTransferMalformedWrongXferIDDoesNotChargeActiveTransfer(t *testing.T) {
 			if s.incomingTransfer == nil {
 				t.Fatal("malformed non-current xfer_chunk cleared active transfer")
 			}
-			if got := s.incomingTransfer.corruptRetriesAtOffset; got != 0 {
+			if got := s.incomingTransfer.retriesAtOffset; got != 0 {
 				t.Fatalf("corrupt retries at offset = %d, want 0", got)
 			}
 			if len(sink.abortReasons) != 0 {
@@ -1422,21 +1218,7 @@ func TestTransferCommitDigestMismatchAborts(t *testing.T) {
 	if abort.Type != msgXferAbort || abort.Err != "digest_mismatch" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
-	if len(sink.abortReasons) == 0 {
-		t.Fatal("expected sink abort on digest mismatch")
-	}
-}
-
-// bufferingSinkAdapter wraps the production bufferSink so transfer tests
-// can assert the bytes passed to updater/main staging.
-type bufferingSinkAdapter struct {
-	*bufferSink
-	abortReasons []string
-}
-
-func (b *bufferingSinkAdapter) Abort(reason string) error {
-	b.abortReasons = append(b.abortReasons, reason)
-	return b.bufferSink.Abort(reason)
+	waitAbortReason(t, sink, "digest_mismatch")
 }
 
 func TestTransferTargetInvokedAfterCommit(t *testing.T) {
@@ -1450,7 +1232,7 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 
 	gotPayload := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
 
-	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	sink := &fakeTransferSink{commitInfo: transferInfo{BytesWritten: 4, Generation: 7}}
 	s := session{
 		linkID:   defaultLinkID,
 		nodeID:   "mcu",
@@ -1459,7 +1241,6 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
 		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			sink.bufferSink.meta = meta
 			return sink, nil
 		},
 	}
@@ -1488,8 +1269,8 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 		if p.Target != updater.TargetUpdaterMain || p.DigestAlg != updater.DigestAlgXXHash32 || p.Digest != xxhashStr(payload) {
 			t.Fatalf("stage contract fields wrong: %+v", p)
 		}
-		if string(p.Artefact) != string(payload) {
-			t.Fatalf("stage artefact = %v, want %q", p.Artefact, payload)
+		if p.Size != uint32(len(payload)) || p.Generation != 7 {
+			t.Fatalf("stage size/generation wrong: %+v", p)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for stage call")
@@ -1499,115 +1280,6 @@ func TestTransferTargetInvokedAfterCommit(t *testing.T) {
 	if done.XferID != "xfer-stage" {
 		t.Fatalf("xfer_done xfer_id = %q, want xfer-stage", done.XferID)
 	}
-}
-
-func TestCompletedTransferDuplicateBeginSameTupleReplaysDone(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	stageCalls := installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
-	sink := &fakeTransferSink{}
-	beginCount := 0
-	s := session{
-		linkID:   defaultLinkID,
-		nodeID:   "mcu",
-		peerID:   "bigbox-cm5",
-		localSID: "mcu-sid-test",
-		tr:       mcu,
-		conn:     b.NewConnection("fabric"),
-		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			beginCount++
-			return sink, nil
-		},
-	}
-	go s.run(ctx)
-	bringUp(t, cm5)
-
-	id := "xfer-completed-replay"
-	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin(id, payload, nil))
-	readTransferReady(t, cm5, id, 0)
-	sendMsg(t, cm5, xferChunk(id, 0, payload))
-	readTransferNeed(t, cm5, id, uint32(len(payload)))
-	sendMsg(t, cm5, xferCommit(id, payload))
-	select {
-	case p := <-stageCalls:
-		if p.XferID != id {
-			t.Fatalf("stage xfer_id = %q, want %q", p.XferID, id)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for first stage call")
-	}
-	done := readMsg[protoXferDone](t, cm5)
-	if done.Type != msgXferDone || done.XferID != id {
-		t.Fatalf("bad xfer_done: %+v", done)
-	}
-	if beginCount != 1 {
-		t.Fatalf("beginTransfer calls after first completion = %d, want 1", beginCount)
-	}
-
-	sendMsg(t, cm5, xferBegin(id, payload, nil))
-	done = readMsg[protoXferDone](t, cm5)
-	if done.Type != msgXferDone || done.XferID != id {
-		t.Fatalf("duplicate begin response = %+v, want xfer_done", done)
-	}
-	if beginCount != 1 {
-		t.Fatalf("duplicate completed begin reopened sink: beginCount=%d", beginCount)
-	}
-	select {
-	case p := <-stageCalls:
-		t.Fatalf("duplicate completed begin restaged transfer: %+v", p)
-	default:
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-completed-replay", "ev begin_duplicate_done", "done_tx true")
-}
-
-func TestCompletedTransferDuplicateBeginConflictingTupleAborts(t *testing.T) {
-	diag := captureOTADiag(t)
-	b := newBus()
-	cm5, mcu := pipePair()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	installStageResponder(t, b, updater.StageReply{OK: true, Stage: "staged"})
-	sink := &fakeTransferSink{}
-	beginCount := 0
-	s := session{
-		linkID:   defaultLinkID,
-		nodeID:   "mcu",
-		peerID:   "bigbox-cm5",
-		localSID: "mcu-sid-test",
-		tr:       mcu,
-		conn:     b.NewConnection("fabric"),
-		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			beginCount++
-			return sink, nil
-		},
-	}
-	go s.run(ctx)
-	bringUp(t, cm5)
-
-	id := "xfer-completed-conflict"
-	payload := []byte("abcd")
-	sendMsg(t, cm5, xferBegin(id, payload, nil))
-	readTransferReady(t, cm5, id, 0)
-	sendMsg(t, cm5, xferChunk(id, 0, payload))
-	readTransferNeed(t, cm5, id, uint32(len(payload)))
-	sendMsg(t, cm5, xferCommit(id, payload))
-	done := readMsg[protoXferDone](t, cm5)
-	if done.Type != msgXferDone || done.XferID != id {
-		t.Fatalf("bad xfer_done: %+v", done)
-	}
-
-	sendMsg(t, cm5, xferBegin(id, []byte("abcde"), nil))
-	readTransferAbort(t, cm5, id, "conflicting_transfer")
-	if beginCount != 1 {
-		t.Fatalf("conflicting completed begin reopened sink: beginCount=%d", beginCount)
-	}
-	waitDiagContains(t, diag, "[fabric-xfer]", "xfer_id xfer-completed-conflict", "ev begin_reject", "reason conflicting_transfer", "abort_tx true")
 }
 
 func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
@@ -1620,7 +1292,7 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 
 	_ = installStageResponder(t, b, updater.StageReply{OK: false, Err: "manifest_check_failed"})
 
-	sink := &bufferingSinkAdapter{bufferSink: &bufferSink{meta: transferMeta{Size: 4}, buf: make([]byte, 0, 4)}}
+	sink := &fakeTransferSink{commitInfo: transferInfo{BytesWritten: 4, Generation: 7}}
 	s := session{
 		linkID:   defaultLinkID,
 		nodeID:   "mcu",
@@ -1629,7 +1301,6 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 		tr:       mcu,
 		conn:     b.NewConnection("fabric"),
 		beginTransfer: func(meta transferMeta) (transferSink, error) {
-			sink.bufferSink.meta = meta
 			return sink, nil
 		},
 	}
@@ -1652,7 +1323,7 @@ func TestTransferTargetRejectAbortsTransfer(t *testing.T) {
 	}
 }
 
-func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing.T) {
+func TestTransferCommitTimeoutCancelsLeaseAndPreventsLateStagePersist(t *testing.T) {
 	b := newBus()
 	memMD := updater.NewMemoryMetadata()
 	verif := &blockingVerifier{
@@ -1666,7 +1337,7 @@ func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *te
 			PayloadLength: 4,
 		},
 	}
-	cancelUpdater, _ := runUpdaterForFabricTest(t, b, updater.Options{
+	cancelUpdater, updaterSvc := runUpdaterForFabricTest(t, b, updater.Options{
 		Verifier:      verif,
 		Metadata:      memMD,
 		MetadataWrite: memMD,
@@ -1675,14 +1346,13 @@ func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *te
 	caller := b.NewConnection("caller")
 	prepareUpdaterForFabricTest(t, caller)
 
-	oldTimeout := targetCallTimeout
-	targetCallTimeout = 20 * time.Millisecond
-	defer func() { targetCallTimeout = oldTimeout }()
+	cfg := DefaultLinkConfig()
+	cfg.TargetCallTimeout = 20 * time.Millisecond
 
 	cm5, mcu := pipePair()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Run(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", DefaultLinkConfig())
+	go RunWithOptions(ctx, mcu, b.NewConnection("fabric"), "mcu", "bigbox-cm5", cfg, RunOptions{StageController: updaterSvc})
 	bringUp(t, cm5)
 
 	id := "xfer-stage-timeout"
@@ -1695,17 +1365,22 @@ func TestTransferTargetStageTimeoutCancelsLeaseAndPreventsLateStagePersist(t *te
 	select {
 	case <-verif.entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("verifier did not start before stage timeout")
+		t.Fatal("verifier did not start before commit timeout")
 	}
-	readTransferAbort(t, cm5, id, "stage_timeout")
-	if _, ok := memMD.StagedDescriptor(); ok {
-		t.Fatal("stage timeout persisted descriptor before verifier returned")
-	}
-
-	close(verif.release)
+	// Let the configured commit deadline pass while the verifier/flash operation
+	// remains blocked. The worker observes that deadline at the next safe point.
 	time.Sleep(50 * time.Millisecond)
 	if _, ok := memMD.StagedDescriptor(); ok {
-		t.Fatal("late verifier completion after stage timeout persisted descriptor")
+		t.Fatal("descriptor persisted while verifier was still blocked")
+	}
+
+	// The stage worker now owns the verifier/flash call directly rather than
+	// spawning a nested goroutine.  The timeout is therefore observed at the
+	// next safe point: after the bounded verifier operation returns.
+	close(verif.release)
+	readUntilTransferAbort(t, cm5, id, "transfer_commit_timeout")
+	if _, ok := memMD.StagedDescriptor(); ok {
+		t.Fatal("late verifier completion after commit timeout persisted descriptor")
 	}
 }
 
@@ -1752,9 +1427,7 @@ func TestTransferIdleChunkWatchdog(t *testing.T) {
 	if abort.Type != msgXferAbort || abort.XferID != "xfer-wd" || abort.Err != "timeout" {
 		t.Fatalf("bad xfer_abort: %+v", abort)
 	}
-	if len(sink.abortReasons) == 0 || sink.abortReasons[0] != "timeout" {
-		t.Fatalf("sink.Abort reasons = %v, want [\"timeout\"]", sink.abortReasons)
-	}
+	waitAbortReason(t, sink, "timeout")
 }
 
 func TestTransferCommitDigestMismatchOnCommitFrameAborts(t *testing.T) {

@@ -4,15 +4,21 @@ import (
 	"errors"
 	"io"
 
-	"pico2-a-b/imagev1"
+	"pico2-a-b/signedimage"
 )
 
 var (
-	SignedImageProductFamily    = "bigbox"
-	SignedImageHardwareProfile  = "bb-v1-cm5-2"
-	SignedImageMCUBoardFamily   = "rp2354a"
-	SignedImageTrustedKeyID     = ""
-	SignedImageTrustedPublicKey = ""
+	SignedImageProductFamily    string
+	SignedImageHardwareProfile  string
+	SignedImageMCUBoardFamily   string
+	SignedImageTrustedKeyID     string
+	SignedImageTrustedPublicKey string
+)
+
+const (
+	defaultSignedImageProductFamily   = "bigbox"
+	defaultSignedImageHardwareProfile = "bb-v1-cm5-2"
+	defaultSignedImageMCUBoardFamily  = "rp2354a"
 )
 
 type signedImageVerifier struct{}
@@ -21,32 +27,39 @@ func SignedImageVerifier() Verifier {
 	return signedImageVerifier{}
 }
 
-func SignedImagePolicy() imagev1.Policy {
-	var keys []imagev1.TrustedKey
+func SignedImagePolicy() signedimage.Policy {
+	var keys []signedimage.TrustedKey
 	if SignedImageTrustedKeyID != "" && SignedImageTrustedPublicKey != "" {
-		pub, err := imagev1.ParsePublicKeyHex(SignedImageTrustedPublicKey)
+		pub, err := signedimage.ParsePublicKeyHex(SignedImageTrustedPublicKey)
 		if err == nil {
-			keys = append(keys, imagev1.TrustedKey{
+			keys = append(keys, signedimage.TrustedKey{
 				KeyID:     SignedImageTrustedKeyID,
 				PublicKey: pub,
 			})
 		}
 	}
-	return imagev1.Policy{
-		Target: imagev1.Target{
-			ProductFamily:   SignedImageProductFamily,
-			HardwareProfile: SignedImageHardwareProfile,
-			MCUBoardFamily:  SignedImageMCUBoardFamily,
+	return signedimage.Policy{
+		Target: signedimage.Target{
+			ProductFamily:   signedImageStringOr(SignedImageProductFamily, defaultSignedImageProductFamily),
+			HardwareProfile: signedImageStringOr(SignedImageHardwareProfile, defaultSignedImageHardwareProfile),
+			MCUBoardFamily:  signedImageStringOr(SignedImageMCUBoardFamily, defaultSignedImageMCUBoardFamily),
 		},
 		Keys: keys,
 	}
+}
+
+func signedImageStringOr(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
 
 func (signedImageVerifier) Verify(r io.Reader, sink SlotSink) (Manifest, error) {
 	if sink == nil {
 		return Manifest{}, errors.New("signed_image: nil sink")
 	}
-	res, err := imagev1.Verify(r, SignedImagePolicy(), func(uint32) (imagev1.PayloadSink, error) {
+	res, err := signedimage.Verify(r, SignedImagePolicy(), func(uint32) (signedimage.PayloadSink, error) {
 		return sink, nil
 	})
 	if err != nil {

@@ -72,7 +72,8 @@ type Device struct {
 	addrTemp core.CapAddr
 	addrHum  core.CapAddr
 
-	reading atomic.Uint32
+	reading    atomic.Uint32
+	configured atomic.Uint32
 }
 
 func (d *Device) ID() string { return d.id }
@@ -133,13 +134,17 @@ func (d *Device) Control(_ core.CapAddr, method string, payload any) (core.Enque
 }
 
 func (d *Device) readOnce() {
-	// Configure (idempotent) and read.
-	d.drv.Configure(aht20.Config{
-		Address:        d.addr,
-		PollInterval:   15 * time.Millisecond,
-		CollectTimeout: 250 * time.Millisecond,
-		TriggerHint:    80 * time.Millisecond,
-	})
+	// Configure once. Configure() performs an I2C status probe, so repeating it
+	// on every poll adds bus traffic without changing the steady-state sensor
+	// configuration.
+	if d.configured.Swap(1) == 0 {
+		d.drv.Configure(aht20.Config{
+			Address:        d.addr,
+			PollInterval:   25 * time.Millisecond,
+			CollectTimeout: 250 * time.Millisecond,
+			TriggerHint:    80 * time.Millisecond,
+		})
+	}
 
 	if err := d.drv.Read(); err != nil {
 		d.emitErr(string(errcode.MapDriverErr(err)))

@@ -1,14 +1,12 @@
-//go:build tinygo && rp2350
+//go:build tinygo && rp2350 && !fabric_uart_hwtest
 
 package updater
 
 import (
 	"errors"
-	"time"
 
-	"devicecode-go/services/otadiag"
 	"pico2-a-b/abupdate"
-	"pico2-a-b/imagev1"
+	"pico2-a-b/signedimage"
 )
 
 // streamedStage tracks a signed transfer that verified successfully while
@@ -25,7 +23,7 @@ type streamedStage struct {
 var (
 	streamedStageDesc streamedStage
 	streamedStageOK   bool
-	streamedVerifier  *imagev1.StreamVerifier
+	streamedVerifier  *signedimage.StreamVerifier
 )
 
 func startStreamedStage(xferID string, generation uint64, size uint32) error {
@@ -38,28 +36,11 @@ func startStreamedStage(xferID string, generation uint64, size uint32) error {
 	_ = size
 	streamedStageDesc = streamedStage{}
 	streamedStageOK = false
-	streamedVerifier = imagev1.NewStreamVerifier(SignedImagePolicy(), func(payloadLen uint32) (imagev1.PayloadSink, error) {
-		start := time.Now()
-		otadiag.Event(
-			"[updater-stream]", "slot_sink_create_start", xferID,
-			otadiag.KV("generation", generation),
-			otadiag.KV("payload_len", payloadLen),
-		)
+	streamedVerifier = signedimage.NewStreamVerifier(SignedImagePolicy(), func(payloadLen uint32) (signedimage.PayloadSink, error) {
 		sink, err := newSlotSink(payloadLen)
 		if err != nil {
-			otadiag.Event(
-				"[updater-stream]", "slot_sink_create_error", xferID,
-				otadiag.KV("generation", generation),
-				otadiag.KV("err", err.Error()),
-				otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
-			)
 			return nil, err
 		}
-		otadiag.Event(
-			"[updater-stream]", "slot_sink_create_done", xferID,
-			otadiag.KV("generation", generation),
-			otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
-		)
 		return sink, nil
 	})
 	return nil
@@ -72,32 +53,15 @@ func writeStreamedStage(xferID string, generation uint64, data []byte) error {
 	if streamedVerifier == nil {
 		return errors.New("streamed_stage_not_started")
 	}
-	start := time.Now()
-	otadiag.Event(
-		"[updater-stream]", "stream_write_start", xferID,
-		otadiag.KV("generation", generation),
-		otadiag.KV("len", len(data)),
-	)
 	_, err := streamedVerifier.Write(data)
 	if err != nil {
-		otadiag.Event(
-			"[updater-stream]", "stream_write_error", xferID,
-			otadiag.KV("generation", generation),
-			otadiag.KV("err", err.Error()),
-			otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
-		)
 		return err
 	}
-	otadiag.Event(
-		"[updater-stream]", "stream_write_done", xferID,
-		otadiag.KV("generation", generation),
-		otadiag.KV("dur_ms", int(time.Since(start)/time.Millisecond)),
-	)
 	return err
 }
 
-func commitStreamedStage(xferID string, generation uint64) (streamedStage, error) {
-	_, _ = xferID, generation
+func commitStreamedStage(svc *Service, xferID string, generation uint64) (streamedStage, error) {
+	_, _, _ = svc, xferID, generation
 	if streamedVerifier == nil {
 		return streamedStage{}, errors.New("streamed_stage_not_started")
 	}

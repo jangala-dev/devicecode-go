@@ -11,7 +11,7 @@ import "devicecode-go/bus"
 //
 // The legacy MCU surface (config/device -> config/hal import, rpc/hal/dump
 // inline handler, hal/cap/env/* and hal/cap/power/* exports, hal/state ->
-// state/hal export, fabric/out/rpc/hal/dump call export) has been removed. The
+// state/hal export) has been removed. The
 // canonical surface is now:
 //
 // CM5 -> MCU wire call:
@@ -43,12 +43,6 @@ var (
 	wireUpdaterPrepare = []string{"cap", "self", "updater", "main", "rpc", "prepare-update"}
 	wireUpdaterCommit  = []string{"cap", "self", "updater", "main", "rpc", "commit-update"}
 )
-
-var criticalExportTopics = []bus.Topic{
-	bus.T("state", "self", "software"),
-	bus.T("state", "self", "updater"),
-	bus.T("state", "self", "health"),
-}
 
 // cap/self/updater/main/rpc/{prepare-update,commit-update} land here from
 // the wire and are routed to local rpc/updater/{prepare,commit} where the
@@ -82,10 +76,6 @@ var exportPublishRules = []busExportRule{
 	},
 }
 
-// exportCallRules is empty. The MCU does not originate outbound RPC calls for
-// the current Fabric/update contract.
-var exportCallRules = []busExportRule{}
-
 func importPublishTopic(wire []string) bus.Topic {
 	return importMatch(wire, importPublishRules)
 }
@@ -98,28 +88,68 @@ func exportTopic(t bus.Topic) []string {
 	return busExport(t, exportPublishRules)
 }
 
+func appendExportTopicJSON(dst []byte, t bus.Topic) ([]byte, bool) {
+	for _, rule := range exportPublishRules {
+		out, ok := appendBusExportRuleJSON(dst, t, rule)
+		if ok {
+			return out, true
+		}
+	}
+	return dst, false
+}
+
+func appendBusExportRuleJSON(dst []byte, t bus.Topic, rule busExportRule) ([]byte, bool) {
+	if t == nil || t.Len() < len(rule.localPrefix) {
+		return dst, false
+	}
+	for i, want := range rule.localPrefix {
+		if str(t, i) != want {
+			return dst, false
+		}
+	}
+	if !rule.suffix && t.Len() != len(rule.localPrefix) {
+		return dst, false
+	}
+	dst = append(dst, '[')
+	first := true
+	for _, part := range rule.remotePrefix {
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = append(dst, '"')
+		dst = appendJSONString(dst, part)
+		dst = append(dst, '"')
+	}
+	if rule.suffix {
+		for i := len(rule.localPrefix); i < t.Len(); i++ {
+			s := str(t, i)
+			if s == "" {
+				return dst, false
+			}
+			if !first {
+				dst = append(dst, ',')
+			}
+			first = false
+			dst = append(dst, '"')
+			dst = appendJSONString(dst, s)
+			dst = append(dst, '"')
+		}
+	}
+	dst = append(dst, ']')
+	return dst, true
+}
+
 func exportPatterns() []bus.Topic {
 	return exportPatternsFor(exportPublishRules)
 }
 
-func isCriticalExportTopic(t bus.Topic) bool {
-	if t == nil {
-		return false
-	}
-	for _, want := range criticalExportTopics {
-		if topicEquals(t, want) {
-			return true
-		}
-	}
-	return false
+func exportRetainedPatterns() []bus.Topic {
+	return []bus.Topic{bus.T("state", "self", "#")}
 }
 
-func exportCallTopic(t bus.Topic) []string {
-	return busExport(t, exportCallRules)
-}
-
-func exportCallPatterns() []bus.Topic {
-	return exportPatternsFor(exportCallRules)
+func exportEventPatterns() []bus.Topic {
+	return []bus.Topic{bus.T("event", "self", "#")}
 }
 
 func importMatch(wire []string, rules []importRule) bus.Topic {

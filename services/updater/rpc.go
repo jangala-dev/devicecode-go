@@ -1,34 +1,19 @@
 package updater
 
-import (
-	"time"
-
-	"devicecode-go/bus"
-	"devicecode-go/services/otadiag"
-)
-
-// handlePrepare processes cap/self/updater/main/rpc/prepare-update after
-// Fabric remaps it to the local bus. Success returns the current contract's
-// prepare acknowledgement, including the required transfer target and maximum
-// raw chunk size.
-func (s *Service) handlePrepare(msg *bus.Message) {
-	prepareAt := time.Now()
-	req, ok := jsonDecode[PrepareRequest](msg.Payload)
+// prepare processes cap/self/updater/main/rpc/prepare-update after Fabric remaps
+// it to the local endpoint. Success returns the current contract's prepare
+// acknowledgement, including the required transfer target and maximum raw chunk
+// size.
+func (s *Service) prepare(payload any) any {
+	req, ok := jsonDecode[PrepareRequest](payload)
 	if !ok {
-		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", "bad_request"))
-		s.reply(msg, Reply{OK: false, Error: "bad_request"})
-		return
+		logUpdaterPrepareResult(false, ErrInvalidRequest, 0)
+		logUpdaterCommitReject(ErrInvalidRequest)
+		return Reply{OK: false, Error: ErrInvalidRequest}
 	}
-	otadiag.Event(
-		"[updater-stream]", "prepare_rx", otadiag.XferNone,
-		otadiag.KV("target", req.Target),
-		otadiag.KV("job_id", req.JobID),
-		otadiag.KV("expected_image_id", req.ExpectedImageID),
-	)
 	if req.Target != "" && req.Target != PrepareTargetMCU {
-		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrTargetMismatch))
-		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
-		return
+		logUpdaterPrepareResult(false, ErrUnsupportedTarget, 0)
+		return Reply{OK: false, Error: ErrUnsupportedTarget}
 	}
 
 	s.mu.Lock()
@@ -38,14 +23,12 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 		s.state == StateCommitting ||
 		s.state == StateRebooting {
 		s.mu.Unlock()
-		otadiag.Event("[updater-stream]", "prepare_reject", otadiag.XferNone, otadiag.KV("reason", ErrBusy))
-		s.reply(msg, Reply{OK: false, Error: ErrBusy})
-		return
+		logUpdaterPrepareResult(false, ErrBusy, 0)
+		logUpdaterCommitReject(ErrBusy)
+		return Reply{OK: false, Error: ErrBusy}
 	}
 	s.preparing = true
 	s.mu.Unlock()
-	otadiag.StartUpdateWindow("prepare", otadiag.XferNone)
-	otadiag.Event("[updater-stream]", "prepare_start", otadiag.XferNone)
 	prepareActive := true
 	finishPrepare := func() {
 		if prepareActive {
@@ -57,55 +40,65 @@ func (s *Service) handlePrepare(msg *bus.Message) {
 	s.setJobContext(req.JobID, req.ExpectedImageID)
 	s.transitionTo(StatePreparing, "", "")
 
-	// Clear any persisted staged descriptor from a previous successful
-	// stage. Without this, a flow of (stage A) -> (prepare for B) ->
-	// (stage B fails) leaves descriptor A persisted and committable —
-	// which would be a real safety bug since the user-intent on
-	// prepare(B) is "I want to stage B, throw away A".
+	// Clear any persisted staged descriptor from a previous successful stage.
 	if err := s.metadataWrite.ClearStagedDescriptor(); err != nil {
 		errMsg := "metadata_clear_failed:" + err.Error()
 		s.transitionTo(StateFailed, errMsg, "")
 		finishPrepare()
-		otadiag.Event(
-			"[updater-stream]", "prepare_error", otadiag.XferNone,
-			otadiag.KV("err", errMsg),
-			otadiag.KV("dur_ms", int(time.Since(prepareAt)/time.Millisecond)),
-		)
-		otadiag.StopUpdateWindow("prepare_error")
-		s.reply(msg, Reply{OK: false, Error: errMsg})
-		return
+		logUpdaterPrepareResult(false, errMsg, 0)
+		return Reply{OK: false, Error: errMsg}
 	}
 
 	s.mu.Lock()
 	gen := s.openStageGenerationLocked()
-	snap := s.diagSnapshotLocked()
 	s.mu.Unlock()
-	setDiagSnapshot(snap)
-	otadiag.Event("[updater-stream]", "prepare_generation", otadiag.XferNone, otadiag.KV("generation", gen))
 
 	s.transitionTo(StateReady, "", "")
 	finishPrepare()
-	otadiag.Event(
-		"[updater-stream]", "prepare_done", otadiag.XferNone,
-		otadiag.KV("generation", gen),
-		otadiag.KV("dur_ms", int(time.Since(prepareAt)/time.Millisecond)),
-	)
-	s.reply(msg, PrepareReply{
-		Ready:        true,
-		Target:       TargetUpdaterMain,
-		MaxChunkSize: DefaultMaxChunkSize,
-	})
+	logUpdaterPrepareResult(true, "", gen)
+	return PrepareReply{Ready: true, Target: TargetUpdaterMain, MaxChunkSize: DefaultMaxChunkSize}
 }
 
-// handleCommit processes cap/self/updater/main/rpc/commit-update after Fabric
-// remaps it to the local bus. It only accepts a valid staged descriptor
-// matching the requested/remembered expected image.
-func (s *Service) handleCommit(msg *bus.Message) {
-	req, ok := jsonDecode[CommitRequest](msg.Payload)
-	if !ok {
-		s.reply(msg, Reply{OK: false, Error: "bad_request"})
-		return
+func (s *Service) rememberAcceptedCommit(req CommitRequest, expectedImageID string, desc StagedDescriptor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastCommitJobID = req.JobID
+	s.lastCommitExpectedImageID = expectedImageID
+	s.lastCommitImageID = desc.ImageID
+	s.lastCommitToken = req.CommitToken
+}
+
+func (s *Service) duplicateAcceptedCommitLocked(req CommitRequest) bool {
+	if s.state != StateCommitting && s.state != StateRebooting {
+		return false
 	}
+	if s.lastCommitJobID == "" || req.JobID != s.lastCommitJobID {
+		return false
+	}
+	if s.lastCommitToken == "" || req.CommitToken != s.lastCommitToken {
+		return false
+	}
+	if req.ExpectedImageID != "" {
+		return req.ExpectedImageID == s.lastCommitExpectedImageID || req.ExpectedImageID == s.lastCommitImageID
+	}
+	return true
+}
+
+// commit processes cap/self/updater/main/rpc/commit-update after Fabric remaps
+// it to the local endpoint. It only accepts a valid staged descriptor matching
+// the requested/remembered expected image.
+func (s *Service) commit(payload any) any {
+	req, ok := jsonDecode[CommitRequest](payload)
+	if !ok {
+		return Reply{OK: false, Error: ErrInvalidRequest}
+	}
+
+	s.mu.Lock()
+	if s.duplicateAcceptedCommitLocked(req) {
+		s.mu.Unlock()
+		return CommitReply{Accepted: true, RebootRequired: true}
+	}
+	s.mu.Unlock()
 
 	desc, present := s.metadata.StagedDescriptor()
 	s.mu.Lock()
@@ -115,32 +108,31 @@ func (s *Service) handleCommit(msg *bus.Message) {
 	s.mu.Unlock()
 
 	if streamActive {
-		s.reply(msg, Reply{OK: false, Error: ErrBusy})
-		return
+		logUpdaterCommitReject(ErrBusy)
+		return Reply{OK: false, Error: ErrBusy}
 	}
 	if !present || !stagedInState {
-		s.reply(msg, Reply{OK: false, Error: ErrNothingStaged})
-		return
+		logUpdaterCommitReject(ErrNoStagedImage)
+		return Reply{OK: false, Error: ErrNoStagedImage}
 	}
 	expectedImageID := pendingImageID
 	if expectedImageID == "" {
 		expectedImageID = req.ExpectedImageID
 	}
 	if expectedImageID != "" && desc.ImageID != expectedImageID {
-		s.reply(msg, Reply{OK: false, Error: ErrTargetMismatch})
-		return
+		logUpdaterCommitReject(ErrImageIDMismatch)
+		return Reply{OK: false, Error: ErrImageIDMismatch}
 	}
-
-	// Validate the apply path before publishing committing/rebooting or
-	// replying accepted. The default Applier refuses in non-hardware tests.
 	if err := s.applier.CanApply(desc); err != nil {
-		s.reply(msg, Reply{OK: false, Error: err.Error()})
-		return
+		logUpdaterCommitReject(ErrApplyUnavailable)
+		return Reply{OK: false, Error: ErrApplyUnavailable}
 	}
 
+	s.rememberAcceptedCommit(req, expectedImageID, desc)
+	logUpdaterCommitAccepted(req.JobID, desc.ImageID, desc.Version, desc.Length, int(desc.Slot))
 	s.transitionTo(StateCommitting, "", desc.Version)
-	s.reply(msg, CommitReply{Accepted: true, RebootRequired: true})
+	reply := CommitReply{Accepted: true, RebootRequired: true}
 	s.transitionTo(StateRebooting, "", desc.Version)
-
 	scheduleArmReboot(s.applier, desc, s.applyResults)
+	return reply
 }

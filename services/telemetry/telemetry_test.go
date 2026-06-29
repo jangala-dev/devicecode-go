@@ -2,6 +2,8 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,8 +19,13 @@ func newTestBus() *bus.Bus { return bus.NewBus(8, "+", "#") }
 // the goroutine's Subscribe calls.
 func runService(t *testing.T, b *bus.Bus) (*bus.Connection, context.CancelFunc) {
 	t.Helper()
+	return runServiceWithPolicy(t, b, DefaultPolicy)
+}
+
+func runServiceWithPolicy(t *testing.T, b *bus.Bus, policy Policy) (*bus.Connection, context.CancelFunc) {
+	t.Helper()
 	conn := b.NewConnection("telemetry")
-	svc := New(conn)
+	svc := NewWithPolicy(conn, policy)
 	ctx, cancel := context.WithCancel(context.Background())
 	go svc.Run(ctx)
 	// Telemetry only emits in response to incoming HAL data, so we
@@ -26,6 +33,13 @@ func runService(t *testing.T, b *bus.Bus) (*bus.Connection, context.CancelFunc) 
 	// below uses a settle delay.
 	time.Sleep(10 * time.Millisecond)
 	return conn, cancel
+}
+
+func publishChargerPresent(hal *bus.Connection) {
+	hal.Publish(hal.NewMessage(halPwrAny, types.ChargerValue{
+		State: 0,
+		Sys:   uint16(types.OkToCharge),
+	}, true))
 }
 
 func TestPublishesBatteryFact(t *testing.T) {
@@ -38,6 +52,7 @@ func TestPublishesBatteryFact(t *testing.T) {
 	defer cancel()
 
 	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
 	hal.Publish(hal.NewMessage(halPwrAny, types.BatteryValue{
 		PackMilliV:      12000,
 		PerCellMilliV:   3000,
@@ -46,27 +61,22 @@ func TestPublishesBatteryFact(t *testing.T) {
 		BSR_uOhmPerCell: 1200,
 	}, true))
 
-	select {
-	case msg := <-sub.Channel():
-		fact, ok := msg.Payload.(BatteryFact)
-		if !ok {
-			t.Fatalf("payload type = %T", msg.Payload)
-		}
-		if fact.PackMV != 12000 || fact.IBatMA != -500 || fact.BSRUOhmPerCell != 1200 {
-			t.Fatalf("battery fact wrong: %+v", fact)
-		}
-		if fact.Seq != 1 {
-			t.Fatalf("seq = %d, want 1", fact.Seq)
-		}
-		if fact.UptimeMs < 0 {
-			t.Fatalf("uptime_ms = %d, want >= 0", fact.UptimeMs)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for battery fact")
+	fact := waitForMeasuredBatteryFact(t, sub)
+	if fact.Presence != "present" || !fact.MeasurementsValid {
+		t.Fatalf("battery presence wrong: %+v", fact)
+	}
+	if fact.PackMV != 12000 || fact.IBatMA != -500 || fact.BSRUOhmPerCell != 1200 {
+		t.Fatalf("battery fact wrong: %+v", fact)
+	}
+	if fact.Seq == 0 {
+		t.Fatalf("seq = %d, want > 0", fact.Seq)
+	}
+	if fact.UptimeMs < 0 {
+		t.Fatalf("uptime_ms = %d, want >= 0", fact.UptimeMs)
 	}
 }
 
-func TestPublishesChargerWithDecodedBooleans(t *testing.T) {
+func TestPublishesChargerWithBitfieldsOnly(t *testing.T) {
 	b := newTestBus()
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(TopicCharger)
@@ -97,28 +107,11 @@ func TestPublishesChargerWithDecodedBooleans(t *testing.T) {
 		if fact.StateBits != uint16(types.AbsorbCharge|types.CCCVCharge) {
 			t.Fatalf("state_bits = 0x%x", fact.StateBits)
 		}
-		// Decoded booleans use the canonical wire names the Lua side keys off.
-		if !fact.State["absorb_charge"] || !fact.State["cccv_charge"] {
-			t.Fatalf("decoded state booleans wrong: %+v", fact.State)
+		if fact.StatusBits != uint16(types.IinLimitActive) {
+			t.Fatalf("status_bits = 0x%x", fact.StatusBits)
 		}
-		if fact.State["bat_short_fault"] || fact.State["bat_missing_fault"] {
-			t.Fatalf("unset state bits decoded as true: %+v", fact.State)
-		}
-		if !fact.Status["iin_limit_active"] {
-			t.Fatalf("status iin_limit_active not decoded: %+v", fact.Status)
-		}
-		if !fact.System["charger_enabled"] || !fact.System["ok_to_charge"] {
-			t.Fatalf("system booleans wrong: %+v", fact.System)
-		}
-		// All three maps must be exactly the spec sizes.
-		if got := len(fact.State); got != 11 {
-			t.Fatalf("state map size = %d, want 11", got)
-		}
-		if got := len(fact.Status); got != 4 {
-			t.Fatalf("status map size = %d, want 4", got)
-		}
-		if got := len(fact.System); got != 12 {
-			t.Fatalf("system map size = %d, want 12", got)
+		if fact.SystemBits != uint16(types.ChargerEnabled|types.OkToCharge) {
+			t.Fatalf("system_bits = 0x%x", fact.SystemBits)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for charger fact")
@@ -157,6 +150,297 @@ func TestPublishesEnvironmentFacts(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for env hum fact")
+	}
+}
+
+func TestSuppressesInsignificantBatteryChanges(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
+	baseline := types.BatteryValue{
+		PackMilliV:      12000,
+		PerCellMilliV:   3000,
+		IBatMilliA:      -500,
+		TempMilliC:      24500,
+		BSR_uOhmPerCell: 1200,
+	}
+	hal.Publish(hal.NewMessage(halPwrAny, baseline, true))
+	first := waitForMeasuredBatteryFact(t, sub)
+	if first.Seq == 0 {
+		t.Fatalf("first seq = %d, want > 0", first.Seq)
+	}
+
+	// All fields move less than their configured absolute/percentage
+	// thresholds, so the retained state should not be republished.
+	noisy := baseline
+	noisy.PackMilliV += 50
+	noisy.PerCellMilliV += 10
+	noisy.IBatMilliA -= 25
+	noisy.TempMilliC += 100
+	noisy.BSR_uOhmPerCell += 100
+	hal.Publish(hal.NewMessage(halPwrAny, noisy, true))
+	assertNoMessage(t, sub, 150*time.Millisecond, "insignificant battery change")
+
+	// A meaningful pack-voltage movement crosses the configured 100 mV
+	// threshold and should publish with the next sequence number.
+	changed := baseline
+	changed.PackMilliV += 100
+	hal.Publish(hal.NewMessage(halPwrAny, changed, true))
+	second := waitForBatteryFact(t, sub)
+	if second.Seq != first.Seq+1 || second.PackMV != changed.PackMilliV {
+		t.Fatalf("second battery fact = %+v, want seq=%d pack=%d", second, first.Seq+1, changed.PackMilliV)
+	}
+}
+
+func TestSuppressesNearZeroBatteryCurrentJitter(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
+	baseline := types.BatteryValue{
+		PackMilliV:    13188,
+		PerCellMilliV: 2198,
+		IBatMilliA:    7,
+		TempMilliC:    38881,
+	}
+	hal.Publish(hal.NewMessage(halPwrAny, baseline, true))
+	first := waitForMeasuredBatteryFact(t, sub)
+	if first.Seq == 0 {
+		t.Fatalf("first seq = %d, want > 0", first.Seq)
+	}
+
+	// Around zero, a 1mA change is a large percentage but not a useful
+	// telemetry change. Battery current uses an absolute threshold only.
+	jitter := baseline
+	jitter.IBatMilliA = 6
+	hal.Publish(hal.NewMessage(halPwrAny, jitter, true))
+	assertNoMessage(t, sub, 150*time.Millisecond, "near-zero battery current jitter")
+}
+
+func TestBatteryKeepaliveRepublishesUnchangedValue(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = 50 * time.Millisecond
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
+	v := types.BatteryValue{PackMilliV: 12000, PerCellMilliV: 3000}
+	hal.Publish(hal.NewMessage(halPwrAny, v, true))
+	first := waitForMeasuredBatteryFact(t, sub)
+	if first.Seq == 0 {
+		t.Fatalf("first seq = %d, want > 0", first.Seq)
+	}
+
+	time.Sleep(75 * time.Millisecond)
+	hal.Publish(hal.NewMessage(halPwrAny, v, true))
+	second := waitForBatteryFact(t, sub)
+	if second.Seq != first.Seq+1 || second.PackMV != v.PackMilliV {
+		t.Fatalf("keepalive battery fact = %+v, want seq=%d pack=%d", second, first.Seq+1, v.PackMilliV)
+	}
+}
+
+func TestChargerPresentPublishesBatteryPresenceBeforeMeasurement(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
+
+	fact := waitForBatteryFact(t, sub)
+	if fact.Presence != "present" || fact.MeasurementsValid || fact.Reason != "battery_measurement_unavailable" {
+		t.Fatalf("battery present-before-measurement fact = %+v", fact)
+	}
+	v := types.BatteryValue{PackMilliV: 13008, PerCellMilliV: 2168, IBatMilliA: 7, TempMilliC: 37763}
+	hal.Publish(hal.NewMessage(halPwrAny, v, true))
+	present := waitForBatteryFact(t, sub)
+	if present.Presence != "present" || !present.MeasurementsValid || present.Reason != "" {
+		t.Fatalf("battery present-after-measurement fact = %+v", present)
+	}
+	if present.PackMV != v.PackMilliV {
+		t.Fatalf("present battery pack_mV = %+v, want %d", present, v.PackMilliV)
+	}
+}
+
+func TestBatteryMissingFaultPublishesAbsenceWithoutMeasurements(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	hal.Publish(hal.NewMessage(halPwrAny, types.ChargerValue{
+		State: uint16(types.BatMissingFault),
+	}, true))
+
+	fact := waitForBatteryFact(t, sub)
+	if fact.Presence != "absent" || fact.MeasurementsValid || fact.Reason != "bat_missing_fault" {
+		t.Fatalf("battery absence fact = %+v", fact)
+	}
+	wire, err := json.Marshal(fact)
+	if err != nil {
+		t.Fatalf("marshal absent battery fact: %v", err)
+	}
+	if strings.Contains(string(wire), "pack_mV") || strings.Contains(string(wire), "ibat_mA") {
+		t.Fatalf("absent battery wire payload included analogue fields: %s", string(wire))
+	}
+
+	// Large floating-sense readings while bat_missing_fault remains set are
+	// not meaningful battery telemetry and should not republish the retained
+	// battery fact before the liveness interval.
+	hal.Publish(hal.NewMessage(halPwrAny, types.BatteryValue{
+		PackMilliV:    6,
+		PerCellMilliV: 1,
+		IBatMilliA:    -6,
+		TempMilliC:    37960,
+	}, true))
+	hal.Publish(hal.NewMessage(halPwrAny, types.BatteryValue{
+		PackMilliV:    13008,
+		PerCellMilliV: 2168,
+		IBatMilliA:    7,
+		TempMilliC:    38815,
+	}, true))
+	assertNoMessage(t, sub, 150*time.Millisecond, "noisy absent battery measurements")
+}
+
+func TestBatteryPresenceReturningPublishesMeasurements(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	hal.Publish(hal.NewMessage(halPwrAny, types.ChargerValue{
+		State: uint16(types.BatMissingFault),
+	}, true))
+	absent := waitForBatteryFact(t, sub)
+	if absent.Presence != "absent" {
+		t.Fatalf("initial presence = %+v, want absent", absent)
+	}
+
+	v := types.BatteryValue{PackMilliV: 13008, PerCellMilliV: 2168, IBatMilliA: 7, TempMilliC: 37763}
+	hal.Publish(hal.NewMessage(halPwrAny, v, true))
+	assertNoMessage(t, sub, 150*time.Millisecond, "battery measurement while absent")
+
+	publishChargerPresent(hal)
+	present := waitForBatteryFact(t, sub)
+	if present.Presence != "present" || !present.MeasurementsValid {
+		t.Fatalf("presence after charger clears fault = %+v", present)
+	}
+	if present.PackMV != v.PackMilliV {
+		t.Fatalf("present battery pack_mV = %+v, want %d", present, v.PackMilliV)
+	}
+}
+
+func TestChargerBitfieldChangePublishesDespiteSmallAnalogueDrift(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	sub := observer.Subscribe(TopicCharger)
+	defer observer.Unsubscribe(sub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	baseline := types.ChargerValue{VIN_mV: 12000, VSYS_mV: 12100, IIn_mA: 300}
+	hal.Publish(hal.NewMessage(halPwrAny, baseline, true))
+	first := waitForChargerFact(t, sub)
+	if first.Seq != 1 {
+		t.Fatalf("first seq = %d, want 1", first.Seq)
+	}
+
+	changed := baseline
+	changed.VIN_mV += 25
+	changed.Status = uint16(types.IinLimitActive)
+	hal.Publish(hal.NewMessage(halPwrAny, changed, true))
+	second := waitForChargerFact(t, sub)
+	if second.Seq != 2 || second.StatusBits != uint16(types.IinLimitActive) {
+		t.Fatalf("charger bitfield fact = %+v", second)
+	}
+}
+
+func TestAlertFSMStillRunsWhenRetainedBatteryFactSuppressed(t *testing.T) {
+	b := newTestBus()
+	observer := b.NewConnection("observer")
+	alertSub := observer.Subscribe(TopicChargerAlert)
+	defer observer.Unsubscribe(alertSub)
+	batterySub := observer.Subscribe(TopicBattery)
+	defer observer.Unsubscribe(batterySub)
+
+	policy := DefaultPolicy
+	policy.KeepaliveInterval = time.Hour
+	policy.BatteryBSRMinDeltaUOhmPerCell = 1000
+	policy.BatteryBSRMinDeltaPct = 0
+
+	_, cancel := runServiceWithPolicy(t, b, policy)
+	defer cancel()
+
+	hal := b.NewConnection("hal")
+	publishChargerPresent(hal)
+	hal.Publish(hal.NewMessage(halPwrAny, types.BatteryValue{BSR_uOhmPerCell: 4999}, true))
+	_ = waitForMeasuredBatteryFact(t, batterySub)
+
+	// Crosses the alert threshold, but not the retained telemetry delta
+	// threshold. The sparse event must still fire.
+	hal.Publish(hal.NewMessage(halPwrAny, types.BatteryValue{BSR_uOhmPerCell: 5001}, true))
+	assertNoMessage(t, batterySub, 150*time.Millisecond, "suppressed BSR retained fact")
+
+	select {
+	case msg := <-alertSub.Channel():
+		ev, ok := msg.Payload.(AlertEvent)
+		if !ok || ev.Kind != AlertBsrHigh {
+			t.Fatalf("alert = %+v ok=%v, want bsr_high", msg.Payload, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for bsr_high alert")
 	}
 }
 
@@ -271,7 +555,7 @@ func TestPublishesChargerConfigAtStartup(t *testing.T) {
 	}
 }
 
-func TestRepublishesChargerConfigOnLinkReadyAndSessionEdges(t *testing.T) {
+func TestFabricLinkStateDoesNotRepublishChargerConfig(t *testing.T) {
 	b := newTestBus()
 	observer := b.NewConnection("observer")
 	sub := observer.Subscribe(TopicChargerCfg)
@@ -280,27 +564,11 @@ func TestRepublishesChargerConfigOnLinkReadyAndSessionEdges(t *testing.T) {
 	_, cancel := runService(t, b)
 	defer cancel()
 
-	// Drain startup config retain.
+	// Drain startup config retain. Fabric, not telemetry, owns retained-state
+	// replay when a CM5 link becomes ready.
 	waitForChargerConfig(t, sub)
 
 	publisher := b.NewConnection("test-fabric")
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": false, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
-		true,
-	))
-	time.Sleep(50 * time.Millisecond)
-	for len(sub.Channel()) > 0 {
-		<-sub.Channel()
-	}
-
-	publisher.Publish(publisher.NewMessage(
-		bus.T("state", "fabric", "link", "mcu-uart0"),
-		map[string]any{"ready": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
-		true,
-	))
-	waitForChargerConfig(t, sub)
-
 	publisher.Publish(publisher.NewMessage(
 		bus.T("state", "fabric", "link", "mcu-uart0"),
 		map[string]any{"ready": true, "peer_sid": "cm5-a", "local_sid": "mcu-a"},
@@ -313,7 +581,69 @@ func TestRepublishesChargerConfigOnLinkReadyAndSessionEdges(t *testing.T) {
 		map[string]any{"ready": true, "peer_sid": "cm5-b", "local_sid": "mcu-a"},
 		true,
 	))
-	waitForChargerConfig(t, sub)
+	assertNoChargerConfig(t, sub, 150*time.Millisecond)
+}
+
+func waitForBatteryFact(t *testing.T, sub *bus.Subscription) BatteryFact {
+	t.Helper()
+	select {
+	case msg := <-sub.Channel():
+		fact, ok := msg.Payload.(BatteryFact)
+		if !ok {
+			t.Fatalf("payload type = %T", msg.Payload)
+		}
+		return fact
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for battery fact")
+	}
+	return BatteryFact{}
+}
+
+func waitForMeasuredBatteryFact(t *testing.T, sub *bus.Subscription) BatteryFact {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case msg := <-sub.Channel():
+			fact, ok := msg.Payload.(BatteryFact)
+			if !ok {
+				t.Fatalf("payload type = %T", msg.Payload)
+			}
+			if fact.MeasurementsValid {
+				return fact
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for measured battery fact")
+		}
+	}
+}
+
+func waitForChargerFact(t *testing.T, sub *bus.Subscription) ChargerFact {
+	t.Helper()
+	select {
+	case msg := <-sub.Channel():
+		fact, ok := msg.Payload.(ChargerFact)
+		if !ok {
+			t.Fatalf("payload type = %T", msg.Payload)
+		}
+		return fact
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for charger fact")
+	}
+	return ChargerFact{}
+}
+
+func assertNoMessage(t *testing.T, sub *bus.Subscription, d time.Duration, context string) {
+	t.Helper()
+	settled := time.After(d)
+	for {
+		select {
+		case msg := <-sub.Channel():
+			t.Fatalf("unexpected publish for %s: %+v", context, msg.Payload)
+		case <-settled:
+			return
+		}
+	}
 }
 
 func waitForChargerConfig(t *testing.T, sub *bus.Subscription) {

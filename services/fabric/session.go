@@ -3,6 +3,7 @@ package fabric
 import (
 	"bytes"
 	"context"
+	"devicecode-go/utilities/diag"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,8 +11,6 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"devicecode-go/services/otadiag"
-	"devicecode-go/types"
 	"devicecode-go/x/strconvx"
 )
 
@@ -30,7 +29,12 @@ const (
 	statusReady   = "ready"
 	statusOpening = "opening"
 	statusDown    = "down"
-	lineQueueSize = 32
+	// lineQueueSize is deliberately tiny on MCU builds. The UART RX ring is
+	// already the byte-level shock absorber; keeping only two fully decoded
+	// JSONL frames avoids reserving 32 * maxLineLen bytes of static RAM. This
+	// preserves allocation discipline without starving the reactor behind a
+	// large preallocated line queue.
+	lineQueueSize = 2
 )
 
 // ---- timeouts (local policy) ----
@@ -49,23 +53,9 @@ const (
 	// exportMaxPerTick caps the total export messages sent per drain
 	// cycle across all subscriptions, keeping UART throughput within
 	// the 115200-baud link capacity.
-	exportMaxPerTick   = 1
-	exportTickInterval = 50 * time.Millisecond
-	errPayloadMarshal  = "payload_marshal_failed"
-
-	// Temporary transport recovery policy: the USB/UART path used during OTA
-	// can echo MCU-originated JSONL back into the MCU receiver. If exported
-	// retained state is in flight while CM5 starts an OTA transfer, the echoed
-	// line can contain CM5's xfer_begin spliced into the middle of the state pub.
-	// Hold exports quiet from prepare until either xfer_begin arrives or this
-	// window expires. Revisit after CM5 update-admission hardening so this does
-	// not become OTA semantics.
-	transferPrepareQuiet = 10 * time.Second
-	// Temporary transport recovery policy: keep telemetry/state exports quiet
-	// long enough for the host to send the follow-up updater commit call after
-	// xfer_done. On echo-prone UART links, retained export backlog can otherwise
-	// splice into the commit JSONL frame.
-	transferCompleteQuiet = 10 * time.Second
+	exportMaxPerTick  = 1
+	maxPendingExports = 32
+	errPayloadMarshal = "payload_marshal_failed"
 )
 
 // ---- link reasons and error strings ----
@@ -85,44 +75,35 @@ const (
 
 // ---- types ----
 
-type inboundCall struct {
-	id              string
-	topic           []string
-	localTopic      bus.Topic
-	payload         json.RawMessage
-	sub             *bus.Subscription
-	deadline        time.Time
-	transferPrepare bool
-}
-
-type outboundCall struct {
-	id       string
-	req      *bus.Message
-	deadline time.Time
-}
-
 type readResult struct {
 	line []byte
+	slot int
 	err  error
 }
 
+type exportItem struct {
+	topic    bus.Topic
+	payload  any
+	retained bool
+	unset    bool
+}
+
 type linkStatePayload struct {
-	LinkID            string `json:"link_id"`
-	Status            string `json:"status"`
-	Ready             bool   `json:"ready"`
-	Established       bool   `json:"established"`
-	PeerID            string `json:"peer_id"`
-	LocalSID          string `json:"local_sid"`
-	PeerSID           string `json:"peer_sid,omitempty"`
-	PeerNode          string `json:"peer_node,omitempty"`
-	PeerProto         string `json:"peer_proto,omitempty"`
-	LastRxUnixMilli   int64  `json:"last_rx_unix_ms,omitempty"`
-	LastTxUnixMilli   int64  `json:"last_tx_unix_ms,omitempty"`
-	LastPongUnixMilli int64  `json:"last_pong_unix_ms,omitempty"`
-	InboundCalls      int    `json:"inbound_calls"`
-	OutboundCalls     int    `json:"outbound_calls"`
-	Reason            string `json:"reason,omitempty"`
-	Err               string `json:"err,omitempty"`
+	LinkID            string         `json:"link_id"`
+	Status            string         `json:"status"`
+	Ready             bool           `json:"ready"`
+	Established       bool           `json:"established"`
+	PeerID            string         `json:"peer_id"`
+	LocalSID          string         `json:"local_sid"`
+	PeerSID           string         `json:"peer_sid,omitempty"`
+	PeerNode          string         `json:"peer_node,omitempty"`
+	PeerProto         string         `json:"peer_proto,omitempty"`
+	LastRxUnixMilli   int64          `json:"last_rx_unix_ms,omitempty"`
+	LastTxUnixMilli   int64          `json:"last_tx_unix_ms,omitempty"`
+	LastPongUnixMilli int64          `json:"last_pong_unix_ms,omitempty"`
+	Reason            string         `json:"reason,omitempty"`
+	Err               string         `json:"err,omitempty"`
+	Counters          FabricCounters `json:"counters"`
 }
 
 // session manages the fabric link state machine over a Transport.
@@ -147,104 +128,68 @@ type session struct {
 	lastTxAt       time.Time
 	lastPongAt     time.Time
 	exportReadyAt  time.Time
+	exportDrainAt  time.Time
 	exportsEnabled bool
 
-	criticalExportSubs          []*bus.Subscription
-	criticalExportReplayPending []bool
-	exportSubs                  []*bus.Subscription
-	exportCallSubs              []*bus.Subscription
-	inboundCalls                []*inboundCall
-	outboundCalls               []*outboundCall
-	nextOutboundID              uint64
-	nextPingAt                  time.Time
-	txControl                   txLane
-	txRPC                       txLane
-	txBulk                      txLane
-	importedRetained            []bus.Topic // local topics currently retained on the bus due to wire imports
-	rpcReady                    bool        // bridge replay complete; gates linkStatePayload.Ready
-	incomingTransfer            *incomingTransfer
-	completedTransfers          []completedTransfer
-	transferQuietUntil          time.Time
-	transferQuietReason         string
-	beginTransfer               func(transferMeta) (transferSink, error)
+	exportPendingItems    [maxPendingExports]exportItem
+	exportPendingHead     int
+	exportPendingLen      int
+	exportRetainedWatches []*bus.RetainedWatch
+	exportEventSubs       []*bus.Subscription
+	nextPingAt            time.Time
+	txControl             txLane
+	txRPC                 txLane
+	txBulk                txLane
+	importedRetained      []bus.Topic // local topics currently retained on the bus due to wire imports
+	rpcReady              bool        // bridge replay complete; gates linkStatePayload.Ready
+	incomingTransfer      *incomingTransfer
+	completedTransfers    []completedTransfer
+	pendingTargetCall     *pendingTargetCall
+	targetCallResults     chan targetCallResult
+	beginTransfer         func(transferMeta) (transferSink, error)
+	stageController       StageController
+	buffers               *FabricBuffers
+	counters              FabricCounters
+	busSubs               *bus.SubscriptionSet
+	linkStateTopic        bus.Topic
+	fastFrameBuf          []byte
+	ctx                   context.Context
 }
 
 func (s *session) log(msg string) {
-	if !fabricTraceEnabled {
-		return
-	}
-	println("[fabric]", "sid", s.localSID, msg)
+	diag.Println("[fabric]", "sid", s.localSID, msg)
 }
 
 func (s *session) logKV(msg, key, value string) {
-	if !fabricTraceEnabled {
-		return
-	}
-	println("[fabric]", "sid", s.localSID, msg, key, value)
+	diag.Println("[fabric]", "sid", s.localSID, msg, key, value)
 }
 
 // run is the main loop. Blocks until ctx is cancelled.
 func (s *session) run(ctx context.Context) {
 	s.cfg.applyDefaults()
+	s.buffers = ensureFabricBuffers(s.buffers)
+	s.linkStateTopic = bus.T("state", "fabric", "link", s.linkID)
+	s.ctx = ctx
+	if s.targetCallResults == nil {
+		s.targetCallResults = make(chan targetCallResult, 1)
+	}
+	s.busSubs = s.conn.NewSubscriptionSet()
 	lines := make(chan readResult, lineQueueSize)
+	freeSlots := make(chan int, lineQueueSize)
+	for i := 0; i < lineQueueSize; i++ {
+		freeSlots <- i
+	}
 
-	go func() {
-		defer close(lines)
-		lastLineAt := time.Now()
-		for {
-			started := time.Now()
-			line, err := s.tr.ReadLine()
-			now := time.Now()
-			readDur := now.Sub(started)
-			sinceLine := now.Sub(lastLineAt)
-			if err != nil {
-				if errors.Is(err, ErrLineTooLong) {
-					otadiag.Event(
-						"[fabric-rx]", "read_error", otadiag.XferNone,
-						otadiag.KV("reason", "line_too_long"),
-						otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-						otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-					)
-					s.log("oversized line dropped")
-					continue
-				}
-				otadiag.Event(
-					"[fabric-rx]", "read_error", otadiag.XferNone,
-					otadiag.KV("reason", err.Error()),
-					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-				)
-				select {
-				case lines <- readResult{err: err}:
-				case <-ctx.Done():
-				}
-				return
-			}
-			t := protoType(line)
-			if shouldLogFabricRead(t, readDur, sinceLine) {
-				otadiag.Event(
-					"[fabric-rx]", "read_line", protoXferID(line),
-					otadiag.KV("type", t),
-					otadiag.KV("line_len", len(line)),
-					otadiag.KV("read_ms", int(readDur/time.Millisecond)),
-					otadiag.KV("since_line_ms", int(sinceLine/time.Millisecond)),
-				)
-			}
-			lastLineAt = now
-			cp := make([]byte, len(line))
-			copy(cp, line)
-			select {
-			case lines <- readResult{line: cp}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	go s.readLoop(ctx, lines, freeSlots)
 
 	defer s.tr.Close()
+	defer func() {
+		if s.busSubs != nil {
+			s.busSubs.Close()
+		}
+	}()
 	defer s.teardownExports()
-	defer s.teardownInbound()
-	defer s.teardownOutbound(reasonLinkDown)
+	defer s.cancelTargetCall(reasonLinkDown)
 	defer s.abortTransfer(reasonLinkDown)
 	defer s.log("run stop")
 
@@ -254,16 +199,21 @@ func (s *session) run(ctx context.Context) {
 	waitTick := time.NewTicker(waitLogEvery)
 	defer waitTick.Stop()
 
-	// Poll subscription channels periodically. Needed because select
-	// blocks until a line/timer fires; without this, exported bus
-	// messages and async call replies would sit in subscription channels.
-	exportTick := time.NewTicker(exportTickInterval)
-	defer exportTick.Stop()
+	// Bus subscriptions and pending transfer/updater operations wake the
+	// reactor directly. Timers below cover deadlines and periodic liveness only.
+
+	pendingDeadline := time.NewTimer(time.Hour)
+	if !pendingDeadline.Stop() {
+		<-pendingDeadline.C
+	}
+	defer pendingDeadline.Stop()
 
 	s.publishLinkState("", "")
 	s.log("run start")
 
 	for {
+		pendingAt, pendingOK := s.nextPendingDeadline(time.Now())
+		pendingDeadlineCh := resetOptionalTimer(pendingDeadline, pendingAt, pendingOK)
 		select {
 		case <-ctx.Done():
 			return
@@ -273,23 +223,35 @@ func (s *session) run(ctx context.Context) {
 				return
 			}
 			if res.err != nil {
+				s.releaseReadSlot(freeSlots, res.slot)
+				if errors.Is(res.err, ErrLineTooLong) {
+					s.counters.RXLineTooLong++
+					s.logActiveTransferRXLoss("line_too_long", maxLineLen+1, "", "", res.err.Error())
+					s.requestTransferRetry("line_too_long", false)
+					continue
+				}
 				s.handleLinkDown(reasonTransportDown, res.err.Error())
 				return
 			}
+			s.counters.RXLines++
 			beforeRx := s.lastRxAt
 			s.dispatch(res.line)
+			s.releaseReadSlot(freeSlots, res.slot)
 			if s.lastRxAt.After(beforeRx) {
 				resetTimer(stale, s.cfg.LivenessTimeout)
 			}
 
-		case <-exportTick.C:
-			now := time.Now()
-			s.drainExports()
-			s.drainInbound(now)
-			s.drainOutbound(now)
-			s.checkTransferTimeout(now)
-			s.tickPing(now)
-			s.tickReady(now)
+		case <-pendingDeadlineCh:
+			s.handlePendingDeadline(time.Now())
+
+		case result := <-s.targetCallResults:
+			s.handleTargetCallResult(result)
+
+		case _, ok := <-s.busReady():
+			if !ok {
+				return
+			}
+			s.drainBusEvents(time.Now())
 
 		case <-waitTick.C:
 			s.logWaiting()
@@ -304,12 +266,89 @@ func (s *session) run(ctx context.Context) {
 	}
 }
 
+func (s *session) readLoop(ctx context.Context, lines chan<- readResult, freeSlots <-chan int) {
+	defer close(lines)
+	lastLineAt := time.Now()
+	_ = lastLineAt
+	for {
+		var slot int
+		select {
+		case slot = <-freeSlots:
+		case <-ctx.Done():
+			return
+		}
+		started := time.Now()
+		_ = started
+		buf := s.buffers.RXLines[slot][:]
+		n, err := s.readTransportLine(buf)
+		now := time.Now()
+		_ = now
+		if err != nil {
+			select {
+			case lines <- readResult{slot: slot, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if !errors.Is(err, ErrLineTooLong) {
+				return
+			}
+			continue
+		}
+		lastLineAt = now
+		select {
+		case lines <- readResult{line: buf[:n], slot: slot}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *session) readTransportLine(dst []byte) (int, error) {
+	if tr, ok := s.tr.(boundedLineTransport); ok {
+		return tr.ReadLineInto(dst)
+	}
+	line, err := s.tr.ReadLine()
+	if err != nil {
+		return 0, err
+	}
+	if len(line) > len(dst) {
+		return 0, ErrLineTooLong
+	}
+	copy(dst, line)
+	return len(line), nil
+}
+
+func (s *session) releaseReadSlot(freeSlots chan<- int, slot int) {
+	if slot < 0 {
+		return
+	}
+	freeSlots <- slot
+}
+
 func shouldLogFabricRead(msgType string, _, _ time.Duration) bool {
 	switch msgType {
 	case msgHello, msgHelloAck, msgCall, msgReply, msgXferBegin, msgXferCommit, msgXferAbort:
 		return true
 	}
 	return false
+}
+
+func resetOptionalTimer(t *time.Timer, deadline time.Time, ok bool) <-chan time.Time {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	if !ok || deadline.IsZero() {
+		return nil
+	}
+	d := time.Until(deadline)
+	if d < 0 {
+		d = 0
+	}
+	t.Reset(d)
+	return t.C
 }
 
 func resetTimer(t *time.Timer, d time.Duration) {
@@ -341,11 +380,16 @@ func (s *session) publishLinkState(reason, err string) {
 		return
 	}
 	status := s.currentStatus()
+	counters := s.counters
 	if s.link != linkUp && (reason != "" || err != "") {
 		status = statusDown
 	}
-	s.conn.Publish(s.conn.NewMessage(
-		bus.T("state", "fabric", "link", s.linkID),
+	topic := s.linkStateTopic
+	if topic == nil {
+		topic = bus.T("state", "fabric", "link", s.linkID)
+	}
+	s.conn.PublishValue(
+		topic,
 		linkStatePayload{
 			LinkID:            s.linkID,
 			Status:            status,
@@ -359,21 +403,42 @@ func (s *session) publishLinkState(reason, err string) {
 			LastRxUnixMilli:   unixMilli(s.lastRxAt),
 			LastTxUnixMilli:   unixMilli(s.lastTxAt),
 			LastPongUnixMilli: unixMilli(s.lastPongAt),
-			InboundCalls:      len(s.inboundCalls),
-			OutboundCalls:     len(s.outboundCalls),
 			Reason:            reason,
 			Err:               err,
+			Counters:          counters,
 		},
 		true,
-	))
+	)
 }
 
 func (s *session) markRx() {
 	s.lastRxAt = time.Now()
 }
 
+func (s *session) markFrameRX() {
+	s.counters.RXFrames++
+}
+
+func (s *session) logActiveTransferRXLoss(reason string, lineLen int, frameType, xferID, errStr string) {
+	cur := s.incomingTransfer
+	if cur == nil {
+		return
+	}
+	if frameType == "" {
+		frameType = "-"
+	}
+	if xferID == "" {
+		xferID = "-"
+	}
+	if errStr == "" {
+		errStr = "-"
+	}
+	logFabricRXLoss(reason, cur.bytesWritten, cur.meta.Size, cur.chunksSeen, s.counters.RXLines, s.counters.RXLineTooLong, s.counters.RXBadJSON, lineLen, frameType, xferID, errStr)
+}
+
 func (s *session) markTx() {
 	s.lastTxAt = time.Now()
+	s.counters.TXFrames++
 }
 
 func (s *session) handleLinkDown(reason, err string) {
@@ -386,14 +451,12 @@ func (s *session) handleLinkDown(reason, err string) {
 	s.peerSID = ""
 	s.peerProto = ""
 	s.exportReadyAt = time.Time{}
+	s.exportDrainAt = time.Time{}
 	s.exportsEnabled = false
 	s.rpcReady = false
-	s.transferQuietUntil = time.Time{}
-	s.transferQuietReason = ""
 	s.teardownExports()
-	s.teardownInbound()
-	s.teardownOutbound(pendingReason)
 	s.teardownImportedRetained()
+	s.cancelTargetCall(pendingReason)
 	s.abortTransfer(pendingReason)
 	s.clearCompletedTransfers()
 	s.publishLinkState(reason, err)
@@ -420,10 +483,9 @@ func (s *session) promoteLink(reason string) {
 		if reason == "" {
 			reason = reasonPeerReset
 		}
+		s.cancelTargetCall(reason)
 		s.abortTransfer(reason)
 		s.teardownExports()
-		s.teardownInbound()
-		s.teardownOutbound(reason)
 		s.teardownImportedRetained()
 		s.clearCompletedTransfers()
 	}
@@ -432,6 +494,7 @@ func (s *session) promoteLink(reason string) {
 	s.setupExports()
 	s.exportsEnabled = true
 	s.exportReadyAt = time.Now().Add(exportStartHoldoff)
+	s.exportDrainAt = time.Time{}
 	s.nextPingAt = time.Now().Add(s.cfg.PingInterval)
 	s.log("exports enabled")
 	s.publishLinkState(reason, "")
@@ -465,8 +528,8 @@ func (s *session) untrackImportedRetain(t bus.Topic) {
 }
 
 // tickReady promotes rpcReady once the post-handshake export holdoff has
-// elapsed and the initial exact critical retained replay has been drained.
-// Re-publishes link state so consumers observe the ready edge.
+// elapsed. Retained state replay is handled uniformly by the wildcard export
+// subscriptions; Fabric no longer treats any state/self topic as special.
 func (s *session) tickReady(now time.Time) {
 	if s.link != linkUp || s.rpcReady {
 		return
@@ -474,17 +537,17 @@ func (s *session) tickReady(now time.Time) {
 	if s.exportReadyAt.IsZero() || now.Before(s.exportReadyAt) {
 		return
 	}
-	if !s.criticalExportReplayDrained() {
-		return
-	}
 	s.rpcReady = true
 	s.publishLinkState("", "")
+	s.drainQueuedExports()
 }
 
 // ---- dispatch ----
 
 func (s *session) dispatch(line []byte) {
 	t := protoType(line)
+	if t != "" {
+	}
 	if t == "" {
 		s.logMalformed(line, nil)
 		return
@@ -492,7 +555,13 @@ func (s *session) dispatch(line []byte) {
 
 	switch t {
 	case msgHello:
-		typedDispatch(s, t, line, s.onHello)
+		msg, ok := decodeHelloFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_hello"))
+			return
+		}
+		s.markFrameRX()
+		s.onHello(&msg)
 		return
 	case msgHelloAck:
 		typedDispatch(s, t, line, s.onHelloAck)
@@ -505,29 +574,69 @@ func (s *session) dispatch(line []byte) {
 
 	switch t {
 	case msgPing:
-		typedDispatch(s, t, line, s.onPing)
+		msg, ok := decodePingFast(line, msgPing)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_ping"))
+			return
+		}
+		s.markFrameRX()
+		s.onPing(&msg)
 	case msgPong:
-		typedDispatch(s, t, line, s.onPong)
+		msg, ok := decodePongFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_pong"))
+			return
+		}
+		s.markFrameRX()
+		s.onPong(&msg)
 	case msgPub:
 		typedDispatch(s, t, line, s.onPub)
 	case msgUnretain:
 		typedDispatch(s, t, line, s.onUnretain)
 	case msgCall:
-		typedDispatch(s, t, line, s.onCall)
+		msg, ok := decodeCallFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_call"))
+			return
+		}
+		s.markFrameRX()
+		s.onCall(&msg)
 	case msgReply:
-		typedDispatch(s, t, line, s.onReply)
+		s.markFrameRX()
+		s.log("unexpected reply dropped")
 	case msgXferBegin:
-		otadiag.Event(
-			"[fabric-xfer]", "begin_route_start", protoXferID(line),
-			otadiag.KV("line_len", len(line)),
-		)
-		typedDispatch(s, t, line, s.onTransferBegin)
+		msg, ok := decodeXferBeginFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_begin"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferBegin(&msg)
 	case msgXferChunk:
-		typedDispatch(s, t, line, s.onTransferChunk)
+		msg, ok := decodeXferChunkFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_chunk"))
+			s.retryMalformedTransferFrame(t, line)
+			return
+		}
+		s.markFrameRX()
+		s.onTransferChunk(&msg)
 	case msgXferCommit:
-		typedDispatch(s, t, line, s.onTransferCommit)
+		msg, ok := decodeXferCommitFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_commit"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferCommit(&msg)
 	case msgXferAbort:
-		typedDispatch(s, t, line, s.onTransferAbort)
+		msg, ok := decodeXferAbortFast(line)
+		if !ok {
+			s.logMalformed(line, errors.New("bad_xfer_abort"))
+			return
+		}
+		s.markFrameRX()
+		s.onTransferAbort(&msg)
 	case msgXferReady, msgXferNeed, msgXferDone:
 		s.logKV("echoed transfer control ignored", "type", t)
 	default:
@@ -541,15 +650,8 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&msg); err != nil {
 		if msgType == msgXferBegin {
-			otadiag.Event(
-				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
-				otadiag.KV("err", err.Error()),
-				otadiag.KV("line_len", len(line)),
-			)
-			otadiag.StopUpdateWindow("begin_decode_error")
 		}
 		s.logMalformed(line, err)
-		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
 	var extra any
@@ -558,20 +660,13 @@ func typedDispatch[T any](s *session, msgType string, line []byte, handler func(
 			err = errors.New("trailing_json")
 		}
 		if msgType == msgXferBegin {
-			otadiag.Event(
-				"[fabric-xfer]", "begin_decode_error", protoXferID(line),
-				otadiag.KV("err", err.Error()),
-				otadiag.KV("line_len", len(line)),
-			)
-			otadiag.StopUpdateWindow("begin_decode_error")
 		}
 		s.logMalformed(line, err)
-		s.retryMalformedTransferFrame(msgType, line)
 		return
 	}
+	s.markFrameRX()
 	handler(&msg)
 	if msgType == msgXferBegin {
-		otadiag.Event("[fabric-xfer]", "begin_route_done", protoXferID(line))
 	}
 }
 
@@ -604,25 +699,24 @@ func (s *session) requireLinkUp(t string) bool {
 }
 
 func (s *session) logMalformed(line []byte, err error) {
+	s.counters.RXBadJSON++
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
 	}
-	if fabricTraceEnabled {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"malformed frame dropped",
-			"line_len", strconvx.Itoa(len(line)),
-			"line_xxhash32", traceHash(line),
-			"line_head", tracePreview(line),
-			"line_tail", traceTail(line),
-			"err", errStr,
-		)
-	}
+	frameType := protoType(line)
+	wireXferID := protoXferID(line)
+	s.logActiveTransferRXLoss("bad_json", len(line), frameType, wireXferID, errStr)
 
-	// Transfer retry signaling is handled by typedDispatch only for
-	// malformed active xfer_chunk frames. Other malformed frames are logged
-	// and dropped without consuming the transfer corruption budget.
+	// During an active stop-and-wait transfer, any malformed inbound frame is
+	// treated as evidence that the current expected chunk may have been lost.
+	// Malformed xfer_chunk frames are handled by retryMalformedTransferFrame so
+	// current-transfer chunks are retried promptly and non-current chunks do not
+	// charge the active transfer. Other malformed traffic is rate-limited.
+	if frameType == msgXferChunk {
+		return
+	}
+	s.requestTransferRetry("bad_json", false)
 }
 
 // notePeerIdentity records the remote peer's node, SID, and protocol name.
@@ -738,61 +832,6 @@ func rpcPayloadField(payload json.RawMessage, key string) string {
 	return rawJSONScalar(obj[key])
 }
 
-func (s *session) rpcDiag(event string, msg *protoCall, localTopic bus.Topic, reason string, fields ...otadiag.Field) {
-	if msg == nil || !traceRPCDiagTopic(msg.Topic) {
-		return
-	}
-	base := []otadiag.Field{
-		otadiag.KV("call_id", msg.ID),
-		otadiag.KV("topic", wireTopicString(msg.Topic)),
-		otadiag.KV("local_sid", s.localSID),
-		otadiag.KV("peer_sid", s.peerSID),
-		otadiag.KV("payload_len", len(msg.Payload)),
-	}
-	if local := busTopicPath(localTopic); local != "" {
-		base = append(base, otadiag.KV("local_topic", local))
-	}
-	if jobID := rpcPayloadField(msg.Payload, "job_id"); jobID != "" {
-		base = append(base, otadiag.KV("job_id", jobID))
-	}
-	if imageID := rpcPayloadField(msg.Payload, "expected_image_id"); imageID != "" {
-		base = append(base, otadiag.KV("expected_image_id", imageID))
-	}
-	if reason != "" {
-		base = append(base, otadiag.KV("reason", reason))
-	}
-	base = append(base, fields...)
-	otadiag.Event("[fabric-rpc]", event, otadiag.XferNone, base...)
-}
-
-func (s *session) rpcDiagInbound(event string, call *inboundCall, ok bool, err string, fields ...otadiag.Field) {
-	if call == nil || !traceRPCDiagTopic(call.topic) {
-		return
-	}
-	base := []otadiag.Field{
-		otadiag.KV("call_id", call.id),
-		otadiag.KV("topic", wireTopicString(call.topic)),
-		otadiag.KV("local_sid", s.localSID),
-		otadiag.KV("peer_sid", s.peerSID),
-		otadiag.KV("payload_len", len(call.payload)),
-		otadiag.KV("ok", ok),
-	}
-	if local := busTopicPath(call.localTopic); local != "" {
-		base = append(base, otadiag.KV("local_topic", local))
-	}
-	if jobID := rpcPayloadField(call.payload, "job_id"); jobID != "" {
-		base = append(base, otadiag.KV("job_id", jobID))
-	}
-	if imageID := rpcPayloadField(call.payload, "expected_image_id"); imageID != "" {
-		base = append(base, otadiag.KV("expected_image_id", imageID))
-	}
-	if err != "" {
-		base = append(base, otadiag.KV("err", err))
-	}
-	base = append(base, fields...)
-	otadiag.Event("[fabric-rpc]", event, otadiag.XferNone, base...)
-}
-
 func validWireTopic(topic []string) bool {
 	if len(topic) == 0 {
 		return false
@@ -803,38 +842,6 @@ func validWireTopic(topic []string) bool {
 		}
 	}
 	return true
-}
-
-func (s *session) extendTransferQuiet(reason string, d time.Duration) {
-	now := time.Now()
-	until := now.Add(d)
-	if until.After(s.transferQuietUntil) {
-		s.transferQuietUntil = until
-		s.transferQuietReason = reason
-	}
-}
-
-func (s *session) transferQuiet(now time.Time) (bool, string) {
-	if cur := s.incomingTransfer; cur != nil {
-		return true, "incoming_transfer:" + cur.meta.ID
-	}
-	if !s.transferQuietUntil.IsZero() && now.Before(s.transferQuietUntil) {
-		reason := s.transferQuietReason
-		if reason == "" {
-			reason = "quiet_window"
-		}
-		return true, reason
-	}
-	return false, ""
-}
-
-func quietAllowsCriticalExports(reason string) bool {
-	switch reason {
-	case "xfer_commit_target", "xfer_target_rejected", "xfer_done":
-		return true
-	default:
-		return false
-	}
 }
 
 func (s *session) onHello(msg *protoHello) {
@@ -854,12 +861,7 @@ func (s *session) onHello(msg *protoHello) {
 	reason := s.notePeerIdentity(msg.Node, msg.SID, msg.Proto)
 	s.logKV("hello rx", "peer_sid", msg.SID)
 
-	if !s.sendControl(marshal(protoHelloAck{
-		Type:  msgHelloAck,
-		Proto: protocolName,
-		SID:   s.localSID,
-		Node:  s.nodeID,
-	})) {
+	if !s.sendControl(marshalHelloAck(s.localSID, s.nodeID)) {
 		return
 	}
 	s.log("hello_ack tx")
@@ -903,7 +905,7 @@ func (s *session) onPing(msg *protoPing) {
 	}
 	s.markRx()
 	s.logKV("ping rx", "peer_sid", msg.SID)
-	if !s.sendControl(marshal(protoPong{Type: msgPong, SID: s.localSID})) {
+	if !s.sendControl(marshalPong(s.localSID)) {
 		return
 	}
 	s.log("pong tx")
@@ -916,17 +918,10 @@ func (s *session) tickPing(now time.Time) {
 	if s.link != linkUp {
 		return
 	}
-	if quiet, _ := s.transferQuiet(now); quiet {
-		// Keep the UART quiet while CM5 is preparing or streaming a firmware
-		// image; chunk recovery depends on xfer_need being the only periodic
-		// MCU-originated frame on the fabric link.
-		s.nextPingAt = now.Add(s.cfg.PingInterval)
-		return
-	}
 	if s.nextPingAt.IsZero() || now.Before(s.nextPingAt) {
 		return
 	}
-	if !s.sendControl(marshal(protoPing{Type: msgPing, SID: s.localSID})) {
+	if !s.sendControl(marshalPing(s.localSID)) {
 		return
 	}
 	s.nextPingAt = now.Add(s.cfg.PingInterval)
@@ -988,112 +983,39 @@ func (s *session) onUnretain(msg *protoUnretain) {
 
 func (s *session) onCall(msg *protoCall) {
 	if msg.ID == "" {
-		s.rpcDiag("call_reject", msg, nil, "missing_id")
 		s.log("incoming call dropped: missing_id")
 		return
 	}
 	if !validWireTopic(msg.Topic) {
-		s.rpcDiag("call_reject", msg, nil, "bad_topic")
 		s.log("incoming call dropped: bad_topic")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "bad_topic"}))
+		s.sendRPC(marshalReplyErr(msg.ID, "bad_topic"))
 		return
 	}
-	s.rpcDiag("call_rx", msg, nil, "",
-		otadiag.KV("timeout_ms", strconvx.Itoa(msg.TimeoutMs)),
-	)
-	for _, call := range s.inboundCalls {
-		if call.id == msg.ID {
-			s.rpcDiag("call_reject", msg, nil, "duplicate_call_id")
-			s.logKV("incoming call dropped", "err", "duplicate_call_id")
-			s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: "duplicate_call_id"}))
-			return
-		}
-	}
-	if len(s.inboundCalls) >= s.cfg.MaxInboundHelpers {
-		s.rpcDiag("call_reject", msg, nil, reasonBusy)
-		s.log("incoming call dropped: busy")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonBusy}))
-		return
-	}
-
 	localTopic := importCallTopic(msg.Topic)
 	if localTopic == nil {
-		s.rpcDiag("call_reject", msg, nil, reasonNoRoute)
 		s.log("incoming call dropped: no_route")
-		s.sendRPC(marshal(protoReply{Type: msgReply, Corr: msg.ID, OK: false, Err: reasonNoRoute}))
+		s.sendRPC(marshalReplyErr(msg.ID, reasonNoRoute))
 		return
 	}
-	s.rpcDiag("call_route_ok", msg, localTopic, "")
 
 	s.markRx()
-	isTransferPrepare := wireTopicEquals(msg.Topic, wireUpdaterPrepare)
-	if isTransferPrepare {
-		s.extendTransferQuiet("prepare_call_rx", transferPrepareQuiet)
-	}
-
-	timeout := callTimeoutDef
-	if msg.TimeoutMs > 0 {
-		timeout = time.Duration(msg.TimeoutMs) * time.Millisecond
-	}
-	busMsg := s.conn.NewMessage(localTopic, msg.Payload, false)
-	s.rpcDiag("call_dispatch_start", msg, localTopic, "",
-		otadiag.KV("timeout_ms", strconvx.Itoa(int(timeout/time.Millisecond))),
-	)
-	sub := s.conn.Request(busMsg)
-	topicCopy := append([]string(nil), msg.Topic...)
-	s.inboundCalls = append(s.inboundCalls, &inboundCall{
-		id:              msg.ID,
-		topic:           topicCopy,
-		localTopic:      localTopic,
-		payload:         append(json.RawMessage(nil), msg.Payload...),
-		sub:             sub,
-		deadline:        time.Now().Add(timeout),
-		transferPrepare: isTransferPrepare,
-	})
-}
-
-func (s *session) onReply(msg *protoReply) {
-	if msg.Corr == "" {
-		s.log("reply dropped: missing_id")
-		return
-	}
-	for i, call := range s.outboundCalls {
-		if call.id != msg.Corr {
-			continue
-		}
-		s.markRx()
-		s.outboundCalls = append(s.outboundCalls[:i], s.outboundCalls[i+1:]...)
-		if !call.req.CanReply() {
-			return
-		}
-		if !msg.OK {
-			s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: msg.Err}, false)
-			return
-		}
-		s.conn.Reply(call.req, decodePayload(msg.Payload), false)
-		return
-	}
-
-	s.logKV("unexpected reply dropped", "corr", msg.Corr)
-}
-
-func checkBusError(payload any) string {
-	if e, ok := payload.(types.ErrorReply); ok && !e.OK && e.Error != "" {
-		return e.Error
-	}
-	// Fall back to JSON probe for handlers that reply with ad-hoc structs.
-	b, err := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeoutDef)
+	defer cancel()
+	reply, err := s.conn.Call(ctx, localTopic, msg.Payload)
 	if err != nil {
-		return ""
+		reason := err.Error()
+		if reason == "bus: no_route" {
+			reason = reasonNoRoute
+		}
+		s.sendRPC(marshalReplyErr(msg.ID, reason))
+		return
 	}
-	var probe struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
+	payload, err := marshalPayload(reply)
+	if err != nil {
+		s.sendRPC(marshalReplyErr(msg.ID, "bad_reply_payload"))
+		return
 	}
-	if json.Unmarshal(b, &probe) == nil && !probe.OK && probe.Error != "" {
-		return probe.Error
-	}
-	return ""
+	s.sendRPC(marshalReplyOKRaw(msg.ID, payload))
 }
 
 func topicEquals(t bus.Topic, expected bus.Topic) bool {
@@ -1123,66 +1045,106 @@ func marshalPayload(payload any) (json.RawMessage, error) {
 // Exports are drained inline in the main loop (no extra goroutines)
 // to avoid TinyGo cooperative scheduler mutex panics.
 
+// A wildcard state/self/# subscription can receive a retained replay larger
+// than the main bus queue (production currently uses a queue of three). Use a
+// larger bounded queue for export subscriptions so Fabric can coalesce and send
+// the full retained surface on link establishment rather than silently dropping
+// retained facts in the subscription buffer.
+const exportReplayQueueLen = 32
+
+func (s *session) busReady() <-chan struct{} {
+	if s.busSubs == nil {
+		return nil
+	}
+	return s.busSubs.Ready()
+}
+
+func (s *session) subscribeBus(tp bus.Topic) *bus.Subscription {
+	return s.subscribeBusBuffered(tp, 0)
+}
+
+func (s *session) subscribeBusBuffered(tp bus.Topic, queueLen int) *bus.Subscription {
+	if s.busSubs == nil {
+		return s.conn.SubscribeBuffered(tp, queueLen)
+	}
+	return s.busSubs.SubscribeBuffered(tp, queueLen)
+}
+
+func (s *session) watchRetained(tp bus.Topic, opts bus.RetainedWatchOptions) *bus.RetainedWatch {
+	if s.busSubs == nil {
+		return s.conn.WatchRetained(tp, opts)
+	}
+	return s.busSubs.WatchRetained(tp, opts)
+}
+
+func (s *session) drainBusEvents(now time.Time) {
+	// A single bus readiness edge may cover several subscriptions. Drain each
+	// class without blocking. Export drains collect/coalesce retained facts and
+	// admit only a small number of frames per tick. This keeps the UART writer
+	// event-driven without adding a second writer actor or a transfer-specific
+	// quiet window.
+	s.drainExports()
+	s.tickReady(now)
+}
+
 func (s *session) setupExports() {
 	if s.conn == nil {
 		return
 	}
-	for _, p := range criticalExportTopics {
-		s.criticalExportSubs = append(s.criticalExportSubs, s.conn.Subscribe(p))
-		s.criticalExportReplayPending = append(s.criticalExportReplayPending, true)
+	for _, p := range exportRetainedPatterns() {
+		watch := s.watchRetained(p, bus.RetainedWatchOptions{Replay: true, QueueLen: exportReplayQueueLen})
+		s.exportRetainedWatches = append(s.exportRetainedWatches, watch)
 	}
-	for _, p := range exportPatterns() {
-		s.exportSubs = append(s.exportSubs, s.conn.Subscribe(p))
-	}
-	for _, p := range exportCallPatterns() {
-		s.exportCallSubs = append(s.exportCallSubs, s.conn.Subscribe(p))
+	for _, p := range exportEventPatterns() {
+		sub := s.subscribeBusBuffered(p, exportReplayQueueLen)
+		s.exportEventSubs = append(s.exportEventSubs, sub)
 	}
 }
 
 func (s *session) teardownExports() {
-	for _, sub := range s.criticalExportSubs {
+	s.clearExportPending()
+	for _, watch := range s.exportRetainedWatches {
+		s.conn.UnwatchRetained(watch)
+	}
+	s.exportRetainedWatches = nil
+	for _, sub := range s.exportEventSubs {
 		s.conn.Unsubscribe(sub)
 	}
-	s.criticalExportSubs = nil
-	s.criticalExportReplayPending = nil
-	for _, sub := range s.exportSubs {
-		s.conn.Unsubscribe(sub)
-	}
-	s.exportSubs = nil
-	for _, sub := range s.exportCallSubs {
-		s.conn.Unsubscribe(sub)
-	}
-	s.exportCallSubs = nil
-}
-
-func (s *session) teardownInbound() {
-	for _, call := range s.inboundCalls {
-		if call.sub != nil {
-			s.conn.Unsubscribe(call.sub)
-			call.sub = nil
-		}
-	}
-	s.inboundCalls = nil
-}
-
-func (s *session) teardownOutbound(reason string) {
-	for _, call := range s.outboundCalls {
-		if call.req != nil && call.req.CanReply() {
-			s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reason}, false)
-		}
-	}
-	s.outboundCalls = nil
+	s.exportEventSubs = nil
 }
 
 func (s *session) sendExportMessage(m *bus.Message) (bool, bool) {
 	if m == nil {
 		return false, true
 	}
-	wire := exportTopic(m.Topic)
-	if wire == nil {
+	return s.sendExportItem(exportItem{topic: m.Topic, payload: m.Payload, retained: m.Retained, unset: m.Retained && m.Payload == nil})
+}
+
+func (s *session) sendExportItem(item exportItem) (bool, bool) {
+	if item.topic == nil {
 		return false, true
 	}
-	if m.Retained && m.Payload == nil {
+	if item.unset {
+		if s.writerIdle() {
+			s.fastFrameBuf = s.fastFrameBuf[:0]
+			if frame, ok := appendUnretainTopic(s.fastFrameBuf, item); ok {
+				s.fastFrameBuf = frame
+				if !s.writeFrame(laneRPC, frame) {
+					return false, false
+				}
+				return true, true
+			}
+		}
+		if frame, ok := marshalUnretainTopic(item); ok {
+			if !s.sendRPC(frame) {
+				return false, false
+			}
+			return true, true
+		}
+		wire := exportTopic(item.topic)
+		if wire == nil {
+			return false, true
+		}
 		if !s.sendRPC(marshal(protoUnretain{
 			Type:  msgUnretain,
 			Topic: wire,
@@ -1191,25 +1153,38 @@ func (s *session) sendExportMessage(m *bus.Message) (bool, bool) {
 		}
 		return true, true
 	}
-	payload, err := marshalPayload(m.Payload)
+	if payload, ok := item.payload.(appendJSONPayload); ok {
+		if s.writerIdle() {
+			s.fastFrameBuf = s.fastFrameBuf[:0]
+			if frame, ok := appendPubAppendJSON(s.fastFrameBuf, item, payload); ok {
+				s.fastFrameBuf = frame
+				if !s.writeFrame(laneRPC, frame) {
+					return false, false
+				}
+				return true, true
+			}
+		}
+		if frame, ok := marshalPubAppendJSON(item, payload); ok {
+			if !s.sendRPC(frame) {
+				return false, false
+			}
+			return true, true
+		}
+	}
+	wire := exportTopic(item.topic)
+	if wire == nil {
+		return false, true
+	}
+	payload, err := marshalPayload(item.payload)
 	if err != nil {
 		s.logKV("export payload dropped", "err", err.Error())
 		return false, true
-	}
-	if fabricTraceEnabled {
-		println(
-			"[fabric]", "sid", s.localSID,
-			"export pub tx",
-			"topic", wireTopicString(wire),
-			"retain", m.Retained,
-			"payload_len", strconvx.Itoa(len(payload)),
-		)
 	}
 	if !s.sendRPC(marshal(protoPub{
 		Type:    msgPub,
 		Topic:   wire,
 		Payload: payload,
-		Retain:  m.Retained,
+		Retain:  item.retained,
 	})) {
 		return false, false
 	}
@@ -1224,250 +1199,187 @@ func latestSubscriptionMessage(sub *bus.Subscription) *bus.Message {
 			if !ok {
 				return latest
 			}
-			if m != nil {
-				latest = m
-			}
+			copy := m
+			latest = &copy
 		default:
 			return latest
 		}
 	}
 }
 
-func (s *session) criticalExportReplayDrained() bool {
-	for _, pending := range s.criticalExportReplayPending {
-		if pending {
-			return false
-		}
-	}
-	return true
+func (s *session) exportCanSend(now time.Time) bool {
+	return s.link == linkUp && s.exportsEnabled && (s.exportReadyAt.IsZero() || !now.Before(s.exportReadyAt))
 }
 
-func (s *session) drainCriticalExports(total *int) bool {
-	for i, sub := range s.criticalExportSubs {
-		if *total >= exportMaxPerTick {
-			return true
-		}
-		m := latestSubscriptionMessage(sub)
-		if m == nil {
-			if i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
-				return true
+func (s *session) exportPendingIndex(offset int) int {
+	return (s.exportPendingHead + offset) % maxPendingExports
+}
+
+func (s *session) clearExportPending() {
+	for i := 0; i < s.exportPendingLen; i++ {
+		s.exportPendingItems[s.exportPendingIndex(i)] = exportItem{}
+	}
+	s.exportPendingHead = 0
+	s.exportPendingLen = 0
+}
+
+func (s *session) pushExportBack(item exportItem) {
+	if s.exportPendingLen == maxPendingExports {
+		s.exportPendingItems[s.exportPendingHead] = exportItem{}
+		s.exportPendingHead = s.exportPendingIndex(1)
+		s.exportPendingLen--
+	}
+	idx := s.exportPendingIndex(s.exportPendingLen)
+	s.exportPendingItems[idx] = item
+	s.exportPendingLen++
+}
+
+func (s *session) pushExportFront(item exportItem) {
+	if s.exportPendingLen == maxPendingExports {
+		// Preserve the retried item by dropping the oldest tail entry.
+		tail := s.exportPendingIndex(s.exportPendingLen - 1)
+		s.exportPendingItems[tail] = exportItem{}
+		s.exportPendingLen--
+	}
+	s.exportPendingHead = (s.exportPendingHead + maxPendingExports - 1) % maxPendingExports
+	s.exportPendingItems[s.exportPendingHead] = item
+	s.exportPendingLen++
+}
+
+func (s *session) popExportFront() (exportItem, bool) {
+	if s.exportPendingLen == 0 {
+		return exportItem{}, false
+	}
+	item := s.exportPendingItems[s.exportPendingHead]
+	s.exportPendingItems[s.exportPendingHead] = exportItem{}
+	s.exportPendingHead = s.exportPendingIndex(1)
+	s.exportPendingLen--
+	if s.exportPendingLen == 0 {
+		s.exportPendingHead = 0
+	}
+	return item, true
+}
+
+func (s *session) queueExportMessage(m *bus.Message) {
+	if m == nil {
+		return
+	}
+	s.queueExportItem(exportItem{topic: m.Topic, payload: m.Payload, retained: m.Retained, unset: m.Retained && m.Payload == nil})
+}
+
+func (s *session) queueRetainedExport(ev bus.RetainedEvent) {
+	switch ev.Op {
+	case bus.RetainedSet:
+		s.queueExportItem(exportItem{topic: ev.Topic, payload: ev.Payload, retained: true})
+	case bus.RetainedUnset:
+		s.queueExportItem(exportItem{topic: ev.Topic, retained: true, unset: true})
+	}
+}
+
+func (s *session) queueExportItem(item exportItem) {
+	if item.topic == nil {
+		return
+	}
+	// Retained exports are a cache: when several retained facts for the same
+	// topic arrive before the UART writer has capacity, only the newest value is
+	// useful on the wire. Coalescing here keeps the output path event-driven and
+	// avoids a semantic "pause exports during transfer" policy.
+	if item.retained {
+		for i := 0; i < s.exportPendingLen; i++ {
+			idx := s.exportPendingIndex(i)
+			pending := s.exportPendingItems[idx]
+			if pending.topic != nil && pending.retained && topicEquals(pending.topic, item.topic) {
+				s.exportPendingItems[idx] = item
+				return
 			}
-			continue
-		}
-		sent, ok := s.sendExportMessage(m)
-		if !ok {
-			return false
-		}
-		if sent && i < len(s.criticalExportReplayPending) && s.criticalExportReplayPending[i] {
-			s.criticalExportReplayPending[i] = false
-		}
-		if sent {
-			(*total)++
 		}
 	}
-	return true
+	// Non-retained events are sparse, but keep the FIFO bounded. If the link is
+	// congested, old observations are less valuable than keeping the
+	// reactor and control frames moving.
+	s.pushExportBack(item)
+}
+
+func (s *session) hasExportBacklog() bool {
+	return s.exportPendingLen > 0
+}
+
+func (s *session) handleExportEvent(m *bus.Message) {
+	if m == nil {
+		return
+	}
+	s.queueExportMessage(m)
+	s.scheduleExportDrain(time.Now())
+}
+
+func (s *session) drainQueuedExports() {
+	now := time.Now()
+	if !s.exportCanSend(now) {
+		return
+	}
+	total := 0
+	for total < exportMaxPerTick && s.exportPendingLen > 0 {
+		item, ok := s.popExportFront()
+		if !ok || item.topic == nil {
+			continue
+		}
+		sent, alive := s.sendExportItem(item)
+		if !alive {
+			s.pushExportFront(item)
+			return
+		}
+		if sent {
+			total++
+		}
+	}
+	if s.hasExportBacklog() {
+		s.scheduleExportDrain(now)
+	}
+}
+
+func (s *session) scheduleExportDrain(now time.Time) {
+	when := now.Add(time.Millisecond)
+	if s.exportDrainAt.IsZero() || when.Before(s.exportDrainAt) {
+		s.exportDrainAt = when
+	}
 }
 
 // drainExports does a non-blocking read of each export subscription
 // and writes any messages to the wire. Called from the main loop.
 func (s *session) drainExports() {
-	if s.link != linkUp {
-		return
-	}
 	now := time.Now()
-	quiet, quietReason := s.transferQuiet(now)
-	if !s.exportsEnabled {
+	s.exportDrainAt = time.Time{}
+	if !s.exportCanSend(now) {
 		return
 	}
-	if !s.exportReadyAt.IsZero() && now.Before(s.exportReadyAt) {
-		return
-	}
-	if quiet && !quietAllowsCriticalExports(quietReason) {
-		// Avoid colliding telemetry/state exports with prepare/xfer traffic on
-		// echo-prone links. Post-transfer quiet allows critical facts below so
-		// state=rebooting can reach CM5 before the reboot arm.
-		return
-	}
-	total := 0
-	if !s.drainCriticalExports(&total) {
-		return
-	}
-	if quiet {
-		return
-	}
-	if !s.criticalExportReplayDrained() {
-		return
-	}
-	for _, sub := range s.exportSubs {
+	// Collect all immediately-available export notifications into the session's
+	// coalesced retained queue. Sending is handled by drainQueuedExports below,
+	// with a small per-tick budget. This keeps retained replay fair without
+	// making transfer state a special case.
+	for _, watch := range s.exportRetainedWatches {
 		for {
-			if total >= exportMaxPerTick {
-				return
+			ev, ok := watch.TryNext()
+			if !ok {
+				break
 			}
+			s.queueRetainedExport(ev)
+		}
+	}
+	for _, sub := range s.exportEventSubs {
+		for {
 			select {
 			case m, ok := <-sub.Channel():
-				if !ok || m == nil {
+				if !ok {
 					goto nextSub
 				}
-				if len(s.criticalExportSubs) > 0 && isCriticalExportTopic(m.Topic) {
-					continue
-				}
-				sent, ok := s.sendExportMessage(m)
-				if !ok {
-					return
-				}
-				if sent {
-					total++
-				}
+				s.queueExportMessage(&m)
 			default:
 				goto nextSub
 			}
 		}
 	nextSub:
 	}
-}
-
-func (s *session) drainInbound(now time.Time) {
-	if len(s.inboundCalls) == 0 {
-		return
-	}
-
-	keep := s.inboundCalls[:0]
-	for _, call := range s.inboundCalls {
-		select {
-		case reply, ok := <-call.sub.Channel():
-			s.conn.Unsubscribe(call.sub)
-			call.sub = nil // prevent double-unsubscribe in teardownInbound
-			if !ok || reply == nil {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_timeout", transferPrepareQuiet)
-				}
-				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
-				s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
-				if !sent {
-					return
-				}
-				continue
-			}
-			if errStr := checkBusError(reply.Payload); errStr != "" {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_error", transferPrepareQuiet)
-				}
-				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errStr}))
-				s.rpcDiagInbound("call_reply_tx", call, false, errStr, otadiag.KV("sent", sent))
-				if !sent {
-					return
-				}
-				continue
-			}
-			payload, err := marshalPayload(reply.Payload)
-			if err != nil {
-				if call.transferPrepare {
-					s.extendTransferQuiet("prepare_reply_marshal_failed", transferPrepareQuiet)
-				}
-				sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: errPayloadMarshal}))
-				s.rpcDiagInbound("call_reply_tx", call, false, errPayloadMarshal, otadiag.KV("sent", sent))
-				if !sent {
-					return
-				}
-				continue
-			}
-			if call.transferPrepare {
-				s.extendTransferQuiet("prepare_reply_ok", transferPrepareQuiet)
-			}
-			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: true, Payload: payload}))
-			s.rpcDiagInbound("call_reply_tx", call, true, "", otadiag.KV("sent", sent))
-			if !sent {
-				return
-			}
-			continue
-		default:
-		}
-
-		if !now.Before(call.deadline) {
-			s.conn.Unsubscribe(call.sub)
-			call.sub = nil
-			if call.transferPrepare {
-				s.extendTransferQuiet("prepare_call_timeout", transferPrepareQuiet)
-			}
-			sent := s.sendRPC(marshal(protoReply{Type: msgReply, Corr: call.id, OK: false, Err: reasonTimeout}))
-			s.rpcDiagInbound("call_reply_tx", call, false, reasonTimeout, otadiag.KV("sent", sent))
-			if !sent {
-				return
-			}
-			continue
-		}
-
-		keep = append(keep, call)
-	}
-
-	s.inboundCalls = keep
-}
-
-func (s *session) drainOutbound(now time.Time) {
-	// Forward new outgoing calls from the local bus onto the wire.
-	if s.link == linkUp && len(s.exportCallSubs) > 0 {
-		for _, sub := range s.exportCallSubs {
-			for {
-				select {
-				case msg, ok := <-sub.Channel():
-					if !ok || msg == nil {
-						goto nextSub
-					}
-
-					wireTopic := exportCallTopic(msg.Topic)
-					if wireTopic == nil {
-						continue
-					}
-
-					payload, err := marshalPayload(msg.Payload)
-					if err != nil {
-						s.logKV("outgoing call dropped", "err", err.Error())
-						if msg.CanReply() {
-							s.conn.Reply(msg, types.ErrorReply{OK: false, Error: errPayloadMarshal}, false)
-						}
-						continue
-					}
-					id := s.nextOutboundID
-					s.nextOutboundID++
-					corr := "wire-" + strconvx.Utoa64(id)
-					if msg.CanReply() {
-						s.outboundCalls = append(s.outboundCalls, &outboundCall{
-							id:       corr,
-							req:      msg,
-							deadline: now.Add(callTimeoutDef),
-						})
-					}
-					if !s.sendRPC(marshal(protoCall{
-						Type:      msgCall,
-						ID:        corr,
-						Topic:     wireTopic,
-						Payload:   payload,
-						TimeoutMs: int(callTimeoutDef / time.Millisecond),
-					})) {
-						return
-					}
-				default:
-					goto nextSub
-				}
-			}
-		nextSub:
-		}
-	}
-
-	// Expire outbound calls that have timed out waiting for a remote reply.
-	if len(s.outboundCalls) > 0 {
-		keep := s.outboundCalls[:0]
-		for _, call := range s.outboundCalls {
-			if !now.Before(call.deadline) {
-				if call.req != nil && call.req.CanReply() {
-					s.conn.Reply(call.req, types.ErrorReply{OK: false, Error: reasonTimeout}, false)
-				}
-				continue
-			}
-			keep = append(keep, call)
-		}
-		s.outboundCalls = keep
-	}
+	s.drainQueuedExports()
 }
 
 // ---- transport write ----

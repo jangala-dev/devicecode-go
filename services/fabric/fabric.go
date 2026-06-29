@@ -25,10 +25,10 @@ const defaultLinkID = "mcu-uart0"
 // MCU-facing link. Missing fields fall back to release defaults via
 // applyDefaults so callers can pass `LinkConfig{}` to mean "release".
 type LinkConfig struct {
-	// ChunkSize is the expected raw-byte payload per xfer_chunk. The MCU
-	// is receive-only for transfers, so this is informational/validation
-	// only on the Go side. Release: 2048 bytes.
-	ChunkSize uint32
+	// MaxAcceptedChunkSize is the receive-side upper bound for the raw-byte
+	// payload in one xfer_chunk. The sender owns the actual chunk size; the MCU
+	// must accept at least 2048 bytes for fabric-jsonl/1 v1. Release: 2048 bytes.
+	MaxAcceptedChunkSize uint32
 	// PhaseTimeout is the idle-chunk watchdog: an active inbound transfer
 	// is aborted with reason="timeout" if no xfer_chunk arrives within
 	// this window. Mirrors transfer_mgr.lua's `phase_timeout`.
@@ -43,6 +43,11 @@ type LinkConfig struct {
 	// this window once established. Mirrors session_ctl.lua's
 	// liveness_timeout_s. Release: 30s.
 	LivenessTimeout time.Duration
+	// TargetCallTimeout is the local updater/main stage RPC deadline after
+	// xfer_commit has verified the wire transfer. The Fabric session owns this
+	// as pending operation state; it must not block the reactor loop.
+	// Release: 5s.
+	TargetCallTimeout time.Duration
 	// MaxInboundHelpers caps the number of in-flight inbound RPC calls.
 	// Excess inbound calls reply `{ok=false, err="busy"}` per
 	// rpc_bridge.lua's `spawn_local_call_helper`. Lua default is 64
@@ -57,20 +62,21 @@ type LinkConfig struct {
 
 func DefaultLinkConfig() LinkConfig {
 	return LinkConfig{
-		ChunkSize:         2048,
-		PhaseTimeout:      15 * time.Second,
-		PingInterval:      10 * time.Second,
-		LivenessTimeout:   30 * time.Second,
-		MaxInboundHelpers: 64,
-		RPCQuantum:        4,
-		BulkQuantum:       1,
+		MaxAcceptedChunkSize: MaxAcceptedChunkSize,
+		PhaseTimeout:         15 * time.Second,
+		PingInterval:         10 * time.Second,
+		LivenessTimeout:      30 * time.Second,
+		TargetCallTimeout:    5 * time.Second,
+		MaxInboundHelpers:    64,
+		RPCQuantum:           4,
+		BulkQuantum:          1,
 	}
 }
 
 func (c *LinkConfig) applyDefaults() {
 	d := DefaultLinkConfig()
-	if c.ChunkSize == 0 {
-		c.ChunkSize = d.ChunkSize
+	if c.MaxAcceptedChunkSize == 0 {
+		c.MaxAcceptedChunkSize = d.MaxAcceptedChunkSize
 	}
 	if c.PhaseTimeout == 0 {
 		c.PhaseTimeout = d.PhaseTimeout
@@ -80,6 +86,9 @@ func (c *LinkConfig) applyDefaults() {
 	}
 	if c.LivenessTimeout == 0 {
 		c.LivenessTimeout = d.LivenessTimeout
+	}
+	if c.TargetCallTimeout == 0 {
+		c.TargetCallTimeout = d.TargetCallTimeout
 	}
 	if c.MaxInboundHelpers == 0 {
 		c.MaxInboundHelpers = d.MaxInboundHelpers
@@ -102,6 +111,26 @@ func newLocalSID() string {
 	return "mcu-sid-" + bootID + "-" + strconvx.Utoa64(nextSessionID.Add(1))
 }
 
+// StageController is Fabric's narrow boundary to an updater/main staging
+// owner. Fabric submits transfer bytes and observes command results; it does
+// not own updater state or flash/verifier work.
+type StageController interface {
+	BeginStreamedStage(xferID string, size uint32) (uint64, error)
+	WriteStreamedStage(xferID string, generation uint64, data []byte) error
+	CommitStreamedStage(xferID string, generation uint64) (uint32, error)
+	AbortStreamedStage(xferID string, generation uint64, reason string)
+	CancelStreamedStage(xferID string, generation uint64, reason string)
+}
+
+// RunOptions carries optional dependencies that do not belong in the wire
+// LinkConfig. Keeping the updater staging controller here makes the local
+// Fabric-to-Updater boundary explicit; Fabric no longer locates the updater
+// service through package-global state.
+type RunOptions struct {
+	Buffers         *FabricBuffers
+	StageController StageController
+}
+
 // Run starts the fabric session. Blocks until ctx is cancelled or the
 // transport returns an unrecoverable error. The MCU is a hello
 // responder (CM5 always initiates hello/hello_ack), but otherwise
@@ -110,14 +139,24 @@ func newLocalSID() string {
 // arrives within LivenessTimeout. Mirrors session_ctl.lua at
 // devicecode-lua@2c88090.
 func Run(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID string, cfg LinkConfig) {
+	RunWithBuffers(ctx, tr, conn, nodeID, peerID, cfg, nil)
+}
+
+func RunWithBuffers(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID string, cfg LinkConfig, buffers *FabricBuffers) {
+	RunWithOptions(ctx, tr, conn, nodeID, peerID, cfg, RunOptions{Buffers: buffers})
+}
+
+func RunWithOptions(ctx context.Context, tr Transport, conn *bus.Connection, nodeID, peerID string, cfg LinkConfig, opts RunOptions) {
 	s := session{
-		linkID:   defaultLinkID,
-		nodeID:   nodeID,
-		peerID:   peerID,
-		localSID: newLocalSID(),
-		tr:       tr,
-		conn:     conn,
-		cfg:      cfg,
+		linkID:          defaultLinkID,
+		nodeID:          nodeID,
+		peerID:          peerID,
+		localSID:        newLocalSID(),
+		tr:              tr,
+		conn:            conn,
+		cfg:             cfg,
+		stageController: opts.StageController,
+		buffers:         ensureFabricBuffers(opts.Buffers),
 	}
 	s.run(ctx)
 }

@@ -279,16 +279,25 @@ func (d *Device) DrainAlerts() (AlertEvent, error) {
 	ev.ChgState = csa
 	ev.ChgStatus = css
 
-	// Best-effort clears; do not mask the event on clear failures.
+	// Best-effort clears; do not mask the event on clear failures. Only clear
+	// groups that actually latched; this avoids three redundant writes in the
+	// common "alert line asserted but no LTC latch" case and reduces burst load
+	// during alert storms.
 	var clearErr error
-	if err := d.ClearLimitAlerts(); err != nil {
-		clearErr = err
+	if ev.Limit != 0 {
+		if err := d.ClearLimitAlerts(); err != nil {
+			clearErr = err
+		}
 	}
-	if err := d.ClearChargerStateAlerts(); err != nil && clearErr == nil {
-		clearErr = err
+	if ev.ChgState != 0 {
+		if err := d.ClearChargerStateAlerts(); err != nil && clearErr == nil {
+			clearErr = err
+		}
 	}
-	if err := d.ClearChargeStatusAlerts(); err != nil && clearErr == nil {
-		clearErr = err
+	if ev.ChgStatus != 0 {
+		if err := d.ClearChargeStatusAlerts(); err != nil && clearErr == nil {
+			clearErr = err
+		}
 	}
 	return ev, clearErr
 }

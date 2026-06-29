@@ -2,16 +2,13 @@ package serial_raw
 
 import (
 	"context"
-	"runtime"
 	"sync/atomic"
 	"time"
 
 	"devicecode-go/errcode"
 	"devicecode-go/services/hal/internal/core"
-	"devicecode-go/services/otadiag"
 	"devicecode-go/types"
 	"devicecode-go/x/shmring"
-	"devicecode-go/x/strconvx"
 )
 
 // ---- Parameters ----
@@ -24,12 +21,6 @@ type Params struct {
 	RXSize int // power of two; default 512 if zero in SessionOpen
 	TXSize int // power of two; default 512 if zero in SessionOpen
 }
-
-const (
-	serialRawPumpRXBudget = 256
-	serialRawPumpTXBudget = 256
-	serialRawPumpGapWarn  = 20 * time.Millisecond
-)
 
 // ---- Device ----
 
@@ -58,37 +49,12 @@ type session struct {
 	rxRing   *shmring.Ring
 	txHandle shmring.Handle
 	txRing   *shmring.Ring
-
-	// Reactor-owned observability. Single writer only.
-	rxRingFull      uint32
-	rxLogAt         time.Time
-	rxLogHits       uint32
-	rxPressureAt    time.Time
-	rxPressureHits  uint32
-	rxPumpGapAt     time.Time
-	rxPumpGapHits   uint32
-	lastRXPumpAt    time.Time
-	lastRXPumpMoved int
-	lastRXPumpDurMS int
-	lastRXPumpGapMS int
+	probe    uartxProbe
 
 	// Single worker (reactor) for the port.
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
-}
-
-type serialRXDiagnostics interface {
-	RXBuffered() int
-	RXBufferCap() int
-}
-
-type serialRXErrorDiagnostics interface {
-	RXDropCount() uint32
-	RXOverrunCount() uint32
-	RXBreakCount() uint32
-	RXParityCount() uint32
-	RXFramingCount() uint32
 }
 
 // ---- Builder registration ----
@@ -204,12 +170,6 @@ func (d *Device) Control(_ core.CapAddr, verb string, payload any) (core.Enqueue
 		}
 
 		d.startSession(rxSize, txSize)
-		println(
-			"[serial-raw]", "session_open",
-			"uart", d.a.Name,
-			"rx_size", strconvx.Itoa(rxSize),
-			"tx_size", strconvx.Itoa(txSize),
-		)
 
 		// --- Device-level hygiene: drain spurious RX before signalling link up ---
 		// Discard any pre-existing or immediately-arriving bytes on the UART RX path.
@@ -352,247 +312,131 @@ func (d *Device) stopSession() {
 
 // ---- Reactor (single goroutine) ----
 
-func (d *Device) logRingFullChange(s *session, force bool) {
-	const rxLogMinInterval = 1 * time.Second
-
-	hits := s.rxRingFull
-
-	if !force {
-		now := time.Now()
-		if now.Sub(s.rxLogAt) < rxLogMinInterval {
-			return
-		}
-		if hits == s.rxLogHits {
-			return
-		}
-		s.rxLogAt = now
-	} else {
-		s.rxLogAt = time.Now()
-	}
-
-	println(
-		"[serial-raw]", "rx_ring_full",
-		"uart", d.a.Name,
-		"hits", strconvx.Utoa64(uint64(hits)),
-		"ring_avail", strconvx.Itoa(s.rxRing.Available()),
-		"ring_space", strconvx.Itoa(s.rxRing.Space()),
-		"ring_cap", strconvx.Itoa(s.rxRing.Cap()),
-	)
-	s.rxLogHits = hits
-}
-
-func (d *Device) appendRXPumpFields(s *session, fields []otadiag.Field, now time.Time) []otadiag.Field {
-	if !s.lastRXPumpAt.IsZero() {
-		fields = append(fields, otadiag.KV("since_rx_pump_ms", int(now.Sub(s.lastRXPumpAt)/time.Millisecond)))
-	}
-	fields = append(fields,
-		otadiag.KV("last_pump_moved", s.lastRXPumpMoved),
-		otadiag.KV("last_pump_dur_ms", s.lastRXPumpDurMS),
-	)
-	if s.lastRXPumpGapMS >= 0 {
-		fields = append(fields, otadiag.KV("last_pump_gap_ms", s.lastRXPumpGapMS))
-	}
-	return fields
-}
-
-func appendRXErrorFields(port core.SerialPort, fields []otadiag.Field) []otadiag.Field {
-	diag, ok := port.(serialRXErrorDiagnostics)
-	if !ok {
-		return fields
-	}
-	return append(fields,
-		otadiag.KV("rx_drops", diag.RXDropCount()),
-		otadiag.KV("rx_overrun", diag.RXOverrunCount()),
-		otadiag.KV("rx_break", diag.RXBreakCount()),
-		otadiag.KV("rx_parity", diag.RXParityCount()),
-		otadiag.KV("rx_framing", diag.RXFramingCount()),
-	)
-}
-
-func (d *Device) logDriverPressure(s *session, force bool) {
-	const minInterval = 1 * time.Second
-
-	diag, ok := d.port.(serialRXDiagnostics)
-	if !ok {
-		return
-	}
-	used := diag.RXBuffered()
-	capacity := diag.RXBufferCap()
-	if capacity <= 0 || used < 0 {
-		return
-	}
-	threshold := (capacity * 3) / 4
-	if threshold < 1 {
-		threshold = 1
-	}
-	if !force && used < threshold {
-		return
-	}
-
-	hits := s.rxPressureHits + 1
-	now := time.Now()
-	if !force {
-		if now.Sub(s.rxPressureAt) < minInterval {
-			return
-		}
-	} else {
-		now = time.Now()
-	}
-	s.rxPressureAt = now
-	s.rxPressureHits = hits
-
-	fields := []otadiag.Field{
-		otadiag.KV("uart", d.a.Name),
-		otadiag.KV("hits", strconvx.Utoa64(uint64(hits))),
-		otadiag.KV("driver_used", used),
-		otadiag.KV("driver_cap", capacity),
-		otadiag.KV("ring_avail", s.rxRing.Available()),
-		otadiag.KV("ring_space", s.rxRing.Space()),
-		otadiag.KV("ring_cap", s.rxRing.Cap()),
-	}
-	fields = d.appendRXPumpFields(s, fields, now)
-	fields = appendRXErrorFields(d.port, fields)
-	otadiag.Event("[serial-raw]", "rx_driver_pressure", otadiag.XferNone, fields...)
-
-	if !s.lastRXPumpAt.IsZero() && now.Sub(s.lastRXPumpAt) >= serialRawPumpGapWarn {
-		d.logRXPumpGap(s, used, capacity, now)
-	}
-}
-
-func (d *Device) logRXPumpGap(s *session, used, capacity int, now time.Time) {
-	const minInterval = 1 * time.Second
-
-	if now.Sub(s.rxPumpGapAt) < minInterval {
-		return
-	}
-	s.rxPumpGapAt = now
-	s.rxPumpGapHits++
-	fields := []otadiag.Field{
-		otadiag.KV("uart", d.a.Name),
-		otadiag.KV("hits", strconvx.Utoa64(uint64(s.rxPumpGapHits))),
-		otadiag.KV("driver_used", used),
-		otadiag.KV("driver_cap", capacity),
-		otadiag.KV("ring_avail", s.rxRing.Available()),
-		otadiag.KV("ring_space", s.rxRing.Space()),
-		otadiag.KV("ring_cap", s.rxRing.Cap()),
-		otadiag.KV("since_rx_pump_ms", int(now.Sub(s.lastRXPumpAt)/time.Millisecond)),
-		otadiag.KV("last_pump_moved", s.lastRXPumpMoved),
-		otadiag.KV("last_pump_dur_ms", s.lastRXPumpDurMS),
-		otadiag.KV("last_pump_gap_ms", s.lastRXPumpGapMS),
-	}
-	fields = appendRXErrorFields(d.port, fields)
-	otadiag.Event("[serial-raw]", "rx_pump_gap", otadiag.XferNone, fields...)
-}
-
-func (s *session) noteRXPump(moved int, started time.Time) {
-	if moved <= 0 {
-		return
-	}
-	now := time.Now()
-	gapMS := -1
-	if !s.lastRXPumpAt.IsZero() {
-		gapMS = int(started.Sub(s.lastRXPumpAt) / time.Millisecond)
-	}
-	s.lastRXPumpAt = now
-	s.lastRXPumpMoved = moved
-	s.lastRXPumpDurMS = int(now.Sub(started) / time.Millisecond)
-	s.lastRXPumpGapMS = gapMS
-	if s.lastRXPumpGapMS < 0 {
-		s.lastRXPumpGapMS = 0
-	}
-	if s.lastRXPumpDurMS >= 5 {
-		otadiag.Event(
-			"[serial-raw]", "rx_pump_slow", otadiag.XferNone,
-			otadiag.KV("moved", moved),
-			otadiag.KV("dur_ms", s.lastRXPumpDurMS),
-			otadiag.KV("gap_ms", s.lastRXPumpGapMS),
-		)
-	}
-}
-
-func (d *Device) pumpRX(s *session, u core.SerialPort, rxR *shmring.Ring, budget int) bool {
-	started := time.Now()
-	moved := 0
-
-	defer func() {
-		if moved > 0 {
-			s.noteRXPump(moved, started)
-		}
-	}()
-
-	for moved < budget {
-		d.logDriverPressure(s, false)
-		p1, p2 := rxR.WriteAcquire()
-		if len(p1) == 0 {
-			s.rxRingFull++
-			break
-		}
-
-		remaining := budget - moved
-		p1 = limitSpan(p1, remaining)
-		n1 := u.TryRead(p1)
-		if n1 == 0 {
-			break
-		}
-		n := n1
-		moved += n1
-		if n1 < len(p1) {
-			rxR.WriteCommit(n)
-			break
-		}
-
-		remaining = budget - moved
-		if remaining > 0 && len(p2) > 0 {
-			p2 = limitSpan(p2, remaining)
-			n2 := u.TryRead(p2)
-			n += n2
-			moved += n2
-			if n2 < len(p2) {
-				rxR.WriteCommit(n)
-				break
-			}
-		}
-
-		rxR.WriteCommit(n)
-	}
-
-	return moved > 0
-}
-
 func (d *Device) reactor(s *session) {
 	defer close(s.done)
 
 	u := d.port
 	rxR := s.rxRing // UART -> app
 	txR := s.txRing // app  -> UART
+	s.probe.start(d.id, u, rxR, txR)
 
 	for {
 		made := false
+		rxMade := false
+		rxBackpressure := false
 
-		if d.pumpRX(s, u, rxR, serialRawPumpRXBudget) {
-			made = true
-		}
-
-		if d.pumpTX(u, txR, serialRawPumpTXBudget) {
-			made = true
-		}
-
-		if made {
-			select {
-			case <-s.ctx.Done():
-				d.logRingFullChange(s, true)
-				return
-			default:
+		// UART RX -> rxRing.
+		//
+		// RX is the only lossy edge in this chain. Drain the UARTX software RX
+		// ring until it is empty, or until the session ring applies real
+		// back-pressure. Do not switch to TX merely because some RX bytes were
+		// published: during a peer chunk, the remote UART keeps sending and the
+		// interrupt-side ring only has short-latency elasticity.
+		for {
+			p1, p2 := rxR.WriteAcquire()
+			if len(p1) == 0 {
+				s.probe.rxRingFull(d.id, u, rxR, txR)
+				rxBackpressure = true
+				break
 			}
-			runtime.Gosched()
+			n1 := u.TryRead(p1)
+			if n1 == 0 {
+				break
+			}
+			if n1 < len(p1) {
+				rxR.WriteCommit(n1)
+				s.probe.afterRX(d.id, u, rxR, txR, n1)
+				made = true
+				rxMade = true
+				continue
+			}
+			n2 := 0
+			if len(p2) > 0 {
+				n2 = u.TryRead(p2)
+			}
+			rxR.WriteCommit(n1 + n2)
+			s.probe.afterRX(d.id, u, rxR, txR, n1+n2)
+			made = true
+			rxMade = true
+		}
+
+		if rxBackpressure {
+			// Downstream RX is full. Do not spin on UART readability, and do not rely
+			// on an explicit scheduler yield. If there is no outbound work, block on
+			// the only two edges that can make progress: the protocol consumer freeing
+			// RX space, or the application producing TX work. If outbound work exists,
+			// allow one small TX escape hatch; this lets a writer blocked in writeLine
+			// finish, after which the same application goroutine can read and free
+			// rxRing.
+			made = false
+			if txR.Available() == 0 {
+				select {
+				case <-s.ctx.Done():
+					return
+				case <-rxR.Writable():
+				case <-txR.Readable():
+				}
+				continue
+			}
+		} else if rxMade {
+			// RX made progress and the downstream ring still had room. Re-check RX
+			// immediately before considering TX. This preserves the serial worker
+			// as the short-latency drain for the UARTX ISR ring without involving a
+			// scheduler hint.
 			continue
 		}
 
+		// txRing -> UART TX.  Transmit under a small per-activation budget so
+		// retained publications or diagnostic chatter cannot monopolise this
+		// worker while the peer is sending a long chunk.  Under RX back-pressure,
+		// the same budget also acts as a deadlock escape hatch for a writer whose
+		// reader cannot run until writeLine completes.
+		const txBudgetPerPass = 64
+		txBudget := txBudgetPerPass
+		for txBudget > 0 {
+			p1, p2 := txR.ReadAcquire()
+			if len(p1) == 0 {
+				break
+			}
+			if len(p1) > txBudget {
+				p1 = p1[:txBudget]
+			}
+			n1 := u.TryWrite(p1)
+			if n1 == 0 {
+				break
+			}
+			txBudget -= n1
+			if n1 < len(p1) || txBudget == 0 {
+				txR.ReadRelease(n1)
+				s.probe.afterTX(d.id, u, rxR, txR, n1)
+				made = true
+				break
+			}
+			n2 := 0
+			if len(p2) > 0 && txBudget > 0 {
+				if len(p2) > txBudget {
+					p2 = p2[:txBudget]
+				}
+				n2 = u.TryWrite(p2)
+				txBudget -= n2
+			}
+			txR.ReadRelease(n1 + n2)
+			s.probe.afterTX(d.id, u, rxR, txR, n1+n2)
+			made = true
+			if n2 == 0 || txBudget == 0 {
+				break
+			}
+		}
+
+		if made {
+			continue
+		}
+
+		s.probe.periodic(d.id, u, rxR, txR)
+
 		// Idle: wait for any edge, then re-check.
-		d.logRingFullChange(s, false)
 		select {
 		case <-s.ctx.Done():
-			d.logRingFullChange(s, true)
 			return
 		case <-u.Readable():
 		case <-u.Writable():
@@ -600,56 +444,6 @@ func (d *Device) reactor(s *session) {
 		case <-txR.Readable():
 		}
 	}
-}
-
-func (d *Device) pumpTX(u core.SerialPort, txR *shmring.Ring, budget int) bool {
-	moved := 0
-
-	for moved < budget {
-		p1, p2 := txR.ReadAcquire()
-		if len(p1) == 0 {
-			break
-		}
-
-		remaining := budget - moved
-		p1 = limitSpan(p1, remaining)
-		n1 := u.TryWrite(p1)
-		if n1 == 0 {
-			break
-		}
-		n := n1
-		moved += n1
-		if n1 < len(p1) {
-			txR.ReadRelease(n)
-			break
-		}
-
-		remaining = budget - moved
-		if remaining > 0 && len(p2) > 0 {
-			p2 = limitSpan(p2, remaining)
-			n2 := u.TryWrite(p2)
-			n += n2
-			moved += n2
-			if n2 < len(p2) {
-				txR.ReadRelease(n)
-				break
-			}
-		}
-
-		txR.ReadRelease(n)
-	}
-
-	return moved > 0
-}
-
-func limitSpan(p []byte, max int) []byte {
-	if max <= 0 {
-		return p[:0]
-	}
-	if len(p) > max {
-		return p[:max]
-	}
-	return p
 }
 
 // ---- Helpers ----

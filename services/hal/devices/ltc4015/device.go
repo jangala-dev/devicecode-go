@@ -36,8 +36,16 @@ type Device struct {
 	done   chan struct{}
 	alive  atomic.Bool // guards enqueue/timers after stop
 
-	// Retry timer for SMBALERT# re-service
-	retryTimer *time.Timer
+	// Retry timer for SMBALERT# re-service. Retry backoff is deliberately
+	// stateful so a stuck or noisy alert line cannot monopolise the I2C bus.
+	retryTimer      *time.Timer
+	alertRetryDelay time.Duration
+
+	// Request coalescing: pollers and GPIO edges are level-like signals. Keep at
+	// most one queued read and one queued alert-service request while the worker
+	// is busy, preventing a post-stall I2C burst.
+	pendingRead  atomic.Bool
+	pendingAlert atomic.Bool
 
 	// Last configured windows (for state-aware opposite-edge re-arming)
 	lastVinLo, lastVinHi           int32
@@ -130,16 +138,12 @@ func (d *Device) Init(ctx context.Context) error {
 
 	go d.worker(d.ctx)
 
-	// Apply any boot actions declared in Params via the standard control path.
-	if d.params.Boot != nil {
-		for _, a := range d.params.Boot {
-			// Use the charger capability as the target; Control ignores the CapAddr value.
-			_, _ = d.Control(d.aChg, a.Verb, a.Payload)
-		}
+	// If there are no paced boot actions, seed a first sample as before. When
+	// boot actions exist, the worker performs one coalesced sample after the
+	// deferred configure/enable sequence instead of sampling after each action.
+	if len(d.params.Boot) == 0 {
+		d.enqueue(opRead, nil)
 	}
-
-	// Seed a first sample.
-	d.enqueue(opRead, nil)
 	return nil
 }
 
@@ -341,14 +345,31 @@ func (d *Device) enqueue(op opCode, arg any) {
 	if !d.alive.Load() || d.ctx == nil {
 		return
 	}
+	if op == opRead && !d.pendingRead.CompareAndSwap(false, true) {
+		return
+	}
+	if op == opServiceAlert && !d.pendingAlert.CompareAndSwap(false, true) {
+		return
+	}
 	select {
 	case <-d.ctx.Done():
+		d.clearPending(op)
 		return
 	default:
 	}
 	select {
 	case d.reqCh <- request{op: op, arg: arg}:
 	default:
+		d.clearPending(op)
+	}
+}
+
+func (d *Device) clearPending(op opCode) {
+	switch op {
+	case opRead:
+		d.pendingRead.Store(false)
+	case opServiceAlert:
+		d.pendingAlert.Store(false)
 	}
 }
 
@@ -393,7 +414,7 @@ func (d *Device) worker(ctx context.Context) {
 	d.desiredState = d.desiredChargerStateMask()
 	d.desiredStatus = d.desiredChargeStatusMask()
 
-	// If line already asserted, service now.
+	// If line already asserted, service now. This is bounded by serviceAlertBatch.
 	if d.dev.AlertActive(func() bool { return d.gpio.Get() }) {
 		d.serviceAlertBatch()
 	}
@@ -411,6 +432,54 @@ func (d *Device) worker(ctx context.Context) {
 		evCh = d.es.Events()
 	}
 
+	var bootTimer *time.Timer
+	var bootC <-chan time.Time
+	bootIndex := 0
+	if len(d.params.Boot) > 0 {
+		bootTimer = time.NewTimer(d.bootDelay())
+		bootC = bootTimer.C
+	}
+
+	var postReadTimer *time.Timer
+	var postReadC <-chan time.Time
+	schedulePostConfigureRead := func(delay time.Duration) {
+		if delay <= 0 {
+			d.sampleAndPublish()
+			return
+		}
+		if postReadTimer == nil {
+			postReadTimer = time.NewTimer(delay)
+		} else {
+			if !postReadTimer.Stop() {
+				select {
+				case <-postReadTimer.C:
+				default:
+				}
+			}
+			postReadTimer.Reset(delay)
+		}
+		postReadC = postReadTimer.C
+	}
+	stopTimers := func() {
+		if bootTimer != nil {
+			if !bootTimer.Stop() {
+				select {
+				case <-bootTimer.C:
+				default:
+				}
+			}
+		}
+		if postReadTimer != nil {
+			if !postReadTimer.Stop() {
+				select {
+				case <-postReadTimer.C:
+				default:
+				}
+			}
+		}
+	}
+	defer stopTimers()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -424,9 +493,39 @@ func (d *Device) worker(ctx context.Context) {
 
 		case <-retryC():
 			// Timer fired to revisit a still-asserted ALERT# condition.
-			d.enqueue(opServiceAlert, nil)
+			// We are already on the LTC worker, so service directly rather than
+			// enqueueing a request to ourselves.
+			d.serviceAlertBatch()
+
+		case <-bootC:
+			if bootIndex < len(d.params.Boot) {
+				if cfg, ok := d.bootConfigure(d.params.Boot[bootIndex]); ok {
+					d.applyConfigure(cfg)
+					d.rearm()
+					d.publishConfig()
+				} else {
+					_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, EventTag: "boot_action_unsupported"})
+					_ = d.res.Pub.Emit(core.Event{Addr: d.aChg, Err: string(errcode.Unsupported)})
+				}
+				bootIndex++
+			}
+			if bootIndex < len(d.params.Boot) {
+				bootTimer.Reset(d.bootGap())
+				bootC = bootTimer.C
+			} else {
+				bootC = nil
+				schedulePostConfigureRead(d.postConfigureReadDelay())
+			}
+
+		case <-postReadC:
+			postReadC = nil
+			d.sampleAndPublish()
 
 		case req := <-d.reqCh:
+			// Clear coalescing markers as soon as the worker accepts the request.
+			// This preserves the intended "at most one queued" behaviour without
+			// suppressing all future read/alert requests after the first one.
+			d.clearPending(req.op)
 			switch req.op {
 			case opRead:
 				d.sampleAndPublish()
@@ -434,10 +533,12 @@ func (d *Device) worker(ctx context.Context) {
 			case opConfigure:
 				if c, _ := req.arg.(types.ChargerConfigure); (c != types.ChargerConfigure{}) {
 					d.applyConfigure(c)
-					// After any configure: re-arm (opposite edge) then publish.
+					// After a configure, re-arm and publish charger configuration only.
+					// The expensive full sample is coalesced so configure/enable bursts do
+					// not monopolise the I2C bus and disturb UART0 servicing at startup.
 					d.rearm()
 					d.publishConfig()
-					d.sampleAndPublish()
+					schedulePostConfigureRead(d.postConfigureReadDelay())
 				}
 
 			case opServiceAlert:
@@ -449,6 +550,46 @@ func (d *Device) worker(ctx context.Context) {
 				return
 			}
 		}
+	}
+}
+
+func (d *Device) bootDelay() time.Duration {
+	ms := d.params.BootDelayMs
+	if ms == 0 {
+		ms = 5_000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (d *Device) bootGap() time.Duration {
+	ms := d.params.BootGapMs
+	if ms == 0 {
+		ms = 100
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (d *Device) postConfigureReadDelay() time.Duration {
+	ms := d.params.PostConfigureReadDelayMs
+	if ms == 0 {
+		ms = 250
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (d *Device) bootConfigure(a types.BootAction) (types.ChargerConfigure, bool) {
+	switch a.Verb {
+	case "configure":
+		cfg, code := core.As[types.ChargerConfigure](a.Payload)
+		return cfg, code == ""
+	case "enable":
+		t := true
+		return types.ChargerConfigure{Enable: &t}, true
+	case "disable":
+		f := false
+		return types.ChargerConfigure{Enable: &f}, true
+	default:
+		return types.ChargerConfigure{}, false
 	}
 }
 
@@ -613,8 +754,9 @@ func deref[T any](p *T, zero T) T {
 // ---------- Alert service (ARA + drain + opposite-edge re-arming) ----------
 
 func (d *Device) serviceAlertBatch() {
-	const maxIters = 64
+	const maxIters = 2
 	it := 0
+	hadEvent := false
 
 	// Ensure any pending retry is stopped before processing a fresh batch.
 	if d.retryTimer != nil {
@@ -646,6 +788,7 @@ func (d *Device) serviceAlertBatch() {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
+		hadEvent = true
 
 		// Translate events to tags.
 		if ev.Limit.Has(ltc4015.VINLo) {
@@ -668,28 +811,54 @@ func (d *Device) serviceAlertBatch() {
 			}
 		}
 
-		// State-aware opposite-edge re-arming for ALL groups, then publish snapshot.
-		d.rearm()
-		d.sampleAndPublish()
-
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Still asserted? Arm a short retry. Otherwise, ensure the timer is disarmed.
+	// Coalesce expensive follow-up I2C work. Previously every alert-drain
+	// iteration performed a full opposite-edge re-arm and a full telemetry sample.
+	// A single re-arm/sample after the bounded batch preserves the public model
+	// while avoiding a large I2C burst when SMBALERT# chatters or remains asserted.
+	if hadEvent {
+		d.rearm()
+		d.sampleAndPublish()
+	}
+
+	// Still asserted? Arm a bounded retry with backoff. Otherwise, reset retry
+	// state. A stuck alert line should degrade telemetry, not monopolise i2c1.
 	if d.alive.Load() && d.dev.AlertActive(func() bool { return d.gpio.Get() }) {
+		delay := d.nextAlertRetryDelay()
 		if d.retryTimer == nil {
-			d.retryTimer = time.NewTimer(2 * time.Millisecond)
+			d.retryTimer = time.NewTimer(delay)
 		} else {
-			d.retryTimer.Reset(2 * time.Millisecond)
+			d.retryTimer.Reset(delay)
 		}
-	} else if d.retryTimer != nil {
-		if !d.retryTimer.Stop() {
-			select {
-			case <-d.retryTimer.C:
-			default:
+	} else {
+		d.alertRetryDelay = 0
+		if d.retryTimer != nil {
+			if !d.retryTimer.Stop() {
+				select {
+				case <-d.retryTimer.C:
+				default:
+				}
 			}
 		}
 	}
+}
+
+func (d *Device) nextAlertRetryDelay() time.Duration {
+	const (
+		initial = 10 * time.Millisecond
+		max     = 250 * time.Millisecond
+	)
+	if d.alertRetryDelay <= 0 {
+		d.alertRetryDelay = initial
+	} else {
+		d.alertRetryDelay *= 2
+		if d.alertRetryDelay > max {
+			d.alertRetryDelay = max
+		}
+	}
+	return d.alertRetryDelay
 }
 
 var chgStateTags = []struct {
