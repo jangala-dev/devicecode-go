@@ -10,7 +10,7 @@ import "errors"
 // Lane assignment for outbound MCU frames mirrors protocol.lua's
 // FRAME_CLASS map. The MCU never originates xfer_chunk so the bulk lane
 // is currently unused on the MCU side; it is wired in for symmetry and
-// for future fabric-update telemetry that may want to route bulk frames.
+// for future MCU-originated bulk-frame users.
 
 type lane uint8
 
@@ -43,6 +43,18 @@ func (l *txLane) pop() []byte {
 // (e.g. drainExports + drainOutbound generating frames back-to-back).
 func (s *session) enqueueFrame(l lane, data []byte) bool {
 	s.lane(l).push(data)
+	if fabricTraceEnabled {
+		println(
+			"[fabric]", "sid", s.localSID,
+			"enqueue_frame",
+			"lane", laneName(l),
+			"type", protoType(data),
+			"len", len(data),
+			"q_control", s.txControl.len(),
+			"q_rpc", s.txRPC.len(),
+			"q_bulk", s.txBulk.len(),
+		)
+	}
 	return s.flushWriter()
 }
 
@@ -56,6 +68,19 @@ func (s *session) lane(l lane) *txLane {
 		return &s.txBulk
 	default:
 		return &s.txRPC
+	}
+}
+
+func laneName(l lane) string {
+	switch l {
+	case laneControl:
+		return "control"
+	case laneRPC:
+		return "rpc"
+	case laneBulk:
+		return "bulk"
+	default:
+		return "unknown"
 	}
 }
 
@@ -75,18 +100,18 @@ func (s *session) flushWriter() bool {
 		bulkQ = 1
 	}
 	for s.txControl.len() > 0 {
-		if !s.writeFrame(s.txControl.pop()) {
+		if !s.writeFrame(laneControl, s.txControl.pop()) {
 			return false
 		}
 	}
 	for s.txRPC.len() > 0 || s.txBulk.len() > 0 {
 		for i := 0; i < rpcQ && s.txRPC.len() > 0; i++ {
-			if !s.writeFrame(s.txRPC.pop()) {
+			if !s.writeFrame(laneRPC, s.txRPC.pop()) {
 				return false
 			}
 		}
 		for i := 0; i < bulkQ && s.txBulk.len() > 0; i++ {
-			if !s.writeFrame(s.txBulk.pop()) {
+			if !s.writeFrame(laneBulk, s.txBulk.pop()) {
 				return false
 			}
 		}
@@ -96,9 +121,19 @@ func (s *session) flushWriter() bool {
 
 // writeFrame is the actual transport write. Mirrors what the prior
 // sendFrame did inline; isolated so flushWriter can call it per-frame.
-func (s *session) writeFrame(data []byte) bool {
+func (s *session) writeFrame(l lane, data []byte) bool {
 	if len(data) > 0 && data[len(data)-1] == '\n' {
 		data = data[:len(data)-1]
+	}
+	if fabricTraceEnabled {
+		println(
+			"[fabric]", "sid", s.localSID,
+			"tx_frame",
+			"lane", laneName(l),
+			"type", protoType(data),
+			"len", len(data),
+			"line", tracePreview(data),
+		)
 	}
 	if err := s.tr.WriteLine(data); err != nil {
 		if errors.Is(err, ErrLineTooLong) {
