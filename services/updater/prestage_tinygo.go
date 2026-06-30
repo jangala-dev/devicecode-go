@@ -5,8 +5,8 @@ package updater
 import (
 	"errors"
 
-	"pico2-a-b/abupdate"
-	"pico2-a-b/signedimage"
+	"github.com/jangala-dev/pico2-a-b/abupdate"
+	"github.com/jangala-dev/pico2-a-b/signedimage"
 )
 
 // streamedStage tracks a signed transfer that verified successfully while

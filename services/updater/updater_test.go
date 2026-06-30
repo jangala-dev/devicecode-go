@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"devicecode-go/bus"
-	"pico2-a-b/signedimage"
+	"github.com/jangala-dev/pico2-a-b/signedimage"
 )
 
 // ---- helpers --------------------------------------------------------

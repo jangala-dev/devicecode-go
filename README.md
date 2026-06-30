@@ -1,5 +1,17 @@
 # devicecode-go
 
+This module imports the MCU A/B update support from
+`github.com/jangala-dev/pico2-a-b`. For direct `devicecode-go` builds outside a
+local workspace, configure Go for private Jangala modules, for example:
+
+```sh
+go env -w GOPRIVATE=github.com/jangala-dev/*
+```
+
+When `devicecode-go` is built through `pico2-a-b make package`, the package
+flow writes a local `go.work` so the build uses the current `pico2-a-b`
+checkout.
+
 ## Flashing ISOC Power Board via USB port on Pico
 tinygo flash -stack-size=3KB -monitor -scheduler tasks -target=pico -tags "pico_bb_proto_1" main.go
 

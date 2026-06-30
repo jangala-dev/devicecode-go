@@ -3,8 +3,8 @@
 package updater
 
 import (
-	"pico2-a-b/abupdate"
-	"pico2-a-b/signedimage"
+	"github.com/jangala-dev/pico2-a-b/abupdate"
+	"github.com/jangala-dev/pico2-a-b/signedimage"
 )
 
 func installABUpdateDiagHook(xferID string, generation uint64) {

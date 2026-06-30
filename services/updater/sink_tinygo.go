@@ -5,7 +5,7 @@ package updater
 import (
 	"errors"
 
-	"pico2-a-b/abupdate"
+	"github.com/jangala-dev/pico2-a-b/abupdate"
 )
 
 // sharedUpdater is the package-level abupdate instance. It must persist
